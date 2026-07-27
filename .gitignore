@@ -1,0 +1,15 @@
+*.log
+*.tmp
+*.bak
+*.jsonl
+*.user
+.codex/
+.vscode/
+.idea/
+bin/
+obj/
+TestResults/
+auth.json
+.cockpit_codex_auth.json
+.DS_Store
+Thumbs.db
