@@ -11,6 +11,19 @@ using System.Reflection;
 
 internal static class TokenRaderLauncher
 {
+    private static string FindOnPath(string executable)
+    {
+        string path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        foreach (string rawDirectory in path.Split(Path.PathSeparator))
+        {
+            string directory = rawDirectory.Trim().Trim('"');
+            if (directory.Length == 0) continue;
+            string candidate = Path.Combine(directory, executable);
+            if (File.Exists(candidate)) return candidate;
+        }
+        return null;
+    }
+
     [STAThread]
     private static void Main()
     {
@@ -26,9 +39,20 @@ internal static class TokenRaderLauncher
             return;
         }
 
+        string powerShell = FindOnPath("powershell.exe") ?? FindOnPath("pwsh.exe");
+        if (powerShell == null)
+        {
+            System.Windows.Forms.MessageBox.Show(
+                "Windows PowerShell or PowerShell 7 was not found in PATH.",
+                "Token Rader",
+                System.Windows.Forms.MessageBoxButtons.OK,
+                System.Windows.Forms.MessageBoxIcon.Error);
+            return;
+        }
+
         var startInfo = new ProcessStartInfo
         {
-            FileName = "powershell.exe",
+            FileName = powerShell,
             Arguments = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File \"" + script.Replace("\"", "\\\"") + "\"",
             WorkingDirectory = root,
             UseShellExecute = false,

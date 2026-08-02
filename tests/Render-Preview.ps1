@@ -20,7 +20,7 @@ $session = [pscustomobject]@{
 }
 $project = [pscustomobject]@{
     ProjectName = 'Demo Project'
-    ProjectPath = 'C:\demo\Demo Project'
+    ProjectPath = (Join-Path 'demo' 'Demo Project')
     DisplayName = 'Demo Project  ·  1 个日志'
 }
 $model = 'gpt-5.6-sol'
@@ -44,7 +44,7 @@ $window.Left = 20
 $window.Top = 20
 $window.ShowInTaskbar = $false
 
-$window.FindName('AccountNameText').Text = 'demo@example.local'
+$window.FindName('AccountNameText').Text = '合成演示账号'
 $window.FindName('AccountIdText').Text = 'acct_demo…000001'
 $window.FindName('PlanText').Text = '计划快照：team'
 $window.FindName('AccountHintText').Text = '预览图使用合成数据，不含真实账号或日志内容。'

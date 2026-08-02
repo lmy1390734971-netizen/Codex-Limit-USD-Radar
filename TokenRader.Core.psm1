@@ -655,9 +655,12 @@ function Get-TokenRaderCost {
         $longContextApplied = $true
     }
 
-    $inputCost = ([double]$Usage.Uncached / 1000000.0) * [double]$price.input * $inputMultiplier
-    $cachedCost = ([double]$Usage.Cached / 1000000.0) * [double]$price.cachedInput * $inputMultiplier
-    $outputCost = ([double]$Usage.Output / 1000000.0) * [double]$price.output * $outputMultiplier
+    $unitTokens = if ($null -ne $PricingDocument.PSObject.Properties['unitTokens'] -and [double]$PricingDocument.unitTokens -gt 0) {
+        [double]$PricingDocument.unitTokens
+    } else { 1000000.0 }
+    $inputCost = ([double]$Usage.Uncached / $unitTokens) * [double]$price.input * $inputMultiplier
+    $cachedCost = ([double]$Usage.Cached / $unitTokens) * [double]$price.cachedInput * $inputMultiplier
+    $outputCost = ([double]$Usage.Output / $unitTokens) * [double]$price.output * $outputMultiplier
 
     [pscustomobject]@{
         Known = $true
@@ -954,6 +957,23 @@ function Get-TokenRaderProjectResult {
     return $result
 }
 
+function Get-TokenRaderSessionResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [Parameter(Mandatory = $true)]$PricingDocument
+    )
+
+    if (-not (Test-Path -LiteralPath $FilePath)) { return $null }
+    $baseline = [pscustomobject]@{
+        StartedAt = [DateTimeOffset]::MinValue
+        SessionsRoot = $SessionsRoot
+        Files = @()
+        RateLimits = $null
+    }
+    return Get-TokenRaderIntervalResult -Baseline $baseline -PricingDocument $PricingDocument -IncludedFiles @($FilePath)
+}
+
 function Get-TokenRaderQuotaEstimate {
     param(
         $StartRateLimits,
@@ -995,4 +1015,4 @@ function Format-TokenRaderUsd {
     return ('$' + $Value.ToString('N4'))
 }
 
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderQuotaEstimate, Format-TokenRaderNumber, Format-TokenRaderUsd
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Format-TokenRaderNumber, Format-TokenRaderUsd

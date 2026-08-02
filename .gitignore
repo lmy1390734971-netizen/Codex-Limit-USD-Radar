@@ -1,15 +1,52 @@
+# Environment files and local credentials
+.env
+.env.*
+!.env.example
+auth.json
+.cockpit_codex_auth.json
+credentials.json
+credentials*.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
+id_rsa*
+id_ed25519*
+.npmrc
+.pypirc
+*.tfstate
+*.tfstate.*
+.aws/
+.azure/
+.config/gcloud/
+
+# Editor and IDE state
+.vscode/
+.idea/
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Runtime output and private data
 *.log
 *.tmp
 *.bak
 *.jsonl
-*.user
+data/private/
+outputs/
+checkpoints/
+
+# Local Codex and build state
 .codex/
-.vscode/
-.idea/
+*.user
 bin/
 obj/
 TestResults/
-auth.json
-.cockpit_codex_auth.json
+
+# Operating-system metadata
 .DS_Store
 Thumbs.db

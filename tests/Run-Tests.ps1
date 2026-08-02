@@ -106,8 +106,34 @@ try {
     Assert-Equal 'gpt-5.4-mini' $snapshotPrice.id 'snapshot model price resolution'
     $aliasPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6' -PricingDocument $prices
     Assert-Equal 'gpt-5.6-sol' $aliasPrice.id 'model alias price resolution'
+    Assert-Equal '2026-08-02' ([string]$prices.verifiedAt) 'pricing verification date'
+    $terraPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6-terra' -PricingDocument $prices
+    Assert-Near 2.0 $terraPrice.input 0.0000001 'Terra official input price'
+    Assert-Near 0.2 $terraPrice.cachedInput 0.0000001 'Terra official cached input price'
+    Assert-Near 12.0 $terraPrice.output 0.0000001 'Terra official output price'
+    $lunaPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6-luna' -PricingDocument $prices
+    Assert-Near 0.2 $lunaPrice.input 0.0000001 'Luna official input price'
+    Assert-Near 0.02 $lunaPrice.cachedInput 0.0000001 'Luna official cached input price'
+    Assert-Near 1.2 $lunaPrice.output 0.0000001 'Luna official output price'
+    $customUnitPrices = [pscustomobject]@{ unitTokens = 1000; models = @($prices.models) }
+    $customUnitUsage = [pscustomobject]@{ Input = 1000; Uncached = 1000; Cached = 0; Output = 0 }
+    $customUnitCost = Get-TokenRaderCost -Usage $customUnitUsage -Model 'gpt-5.6-sol' -PricingDocument $customUnitPrices
+    Assert-Near 5.0 $customUnitCost.TotalCost 0.0000001 'pricing document unitTokens is honored'
     $unknownCost = Get-TokenRaderCost -Usage $snapshot.Task -Model 'private-model-without-price' -PricingDocument $prices
     Assert-Equal $false $unknownCost.Known 'unknown models are not treated as free'
+
+    $mixedPath = Join-Path $tempRoot 'rollout-mixed-model.jsonl'
+    $mixedRecords = @(
+        [ordered]@{ timestamp = '2026-07-14T00:00:00Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.6-terra' } },
+        (New-TestTokenRecord -Timestamp '2026-07-14T00:00:01Z' -TotalInput 1000000 -TotalCached 200000 -TotalOutput 100000 -CallInput 1000000 -CallCached 200000 -CallOutput 100000),
+        [ordered]@{ timestamp = '2026-07-14T00:00:02Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.6-luna' } },
+        (New-TestTokenRecord -Timestamp '2026-07-14T00:00:03Z' -TotalInput 2000000 -TotalCached 700000 -TotalOutput 200000 -CallInput 1000000 -CallCached 500000 -CallOutput 100000)
+    )
+    @($mixedRecords | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress }) | Set-Content -LiteralPath $mixedPath -Encoding UTF8
+    $mixedResult = Get-TokenRaderSessionResult -FilePath $mixedPath -SessionsRoot $tempRoot -PricingDocument $prices
+    Assert-Equal 2 @($mixedResult.Models).Count 'task supports per-call mixed-model pricing'
+    Assert-Equal 2 @($mixedResult.Items | Where-Object { $_.LongContext }).Count 'task applies per-call long-context pricing'
+    Assert-Near 5.48 $mixedResult.TotalCost 0.0000001 'task mixed-model API cost'
 
     $measurementRoot = Join-Path $tempRoot 'measurement-sessions'
     New-Item -ItemType Directory -Path $measurementRoot | Out-Null
@@ -186,10 +212,12 @@ try {
     # independent conversation with the same counters must still be counted.
     $dedupeRoot = Join-Path $tempRoot 'dedupe-sessions'
     New-Item -ItemType Directory -Path $dedupeRoot | Out-Null
+    $tokenRaderProjectPath = Join-Path $tempRoot 'Token Rader'
+    $otherProjectPath = Join-Path $tempRoot 'Other Project'
     $parentId = '10000000-0000-0000-0000-000000000001'
     $parentPath = Join-Path $dedupeRoot ('rollout-parent-' + $parentId + '.jsonl')
     $parentInitial = @(
-        [ordered]@{ timestamp = '2026-07-14T02:00:00Z'; type = 'session_meta'; payload = [ordered]@{ id = $parentId; cwd = 'C:\work\Token Rader'; model_provider = 'openai' } },
+        [ordered]@{ timestamp = '2026-07-14T02:00:00Z'; type = 'session_meta'; payload = [ordered]@{ id = $parentId; cwd = $tokenRaderProjectPath; model_provider = 'openai' } },
         [ordered]@{ timestamp = '2026-07-14T02:00:01Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.5' } },
         (New-TestTokenRecord -Timestamp '2026-07-14T02:00:02Z' -TotalInput 1000 -TotalCached 0 -TotalOutput 100 -CallInput 1000 -CallCached 0 -CallOutput 100)
     )
@@ -204,7 +232,7 @@ try {
     foreach ($spec in $childSpecs) {
         $childPath = Join-Path $dedupeRoot ('rollout-child-' + $spec.Id + '.jsonl')
         $childRecords = @(
-            [ordered]@{ timestamp = '2026-07-14T02:01:05Z'; type = 'session_meta'; payload = [ordered]@{ id = $spec.Id; cwd = 'C:\work\Token Rader'; parent_thread_id = $parentId; forked_from_id = $parentId; model_provider = 'openai' } },
+            [ordered]@{ timestamp = '2026-07-14T02:01:05Z'; type = 'session_meta'; payload = [ordered]@{ id = $spec.Id; cwd = $tokenRaderProjectPath; parent_thread_id = $parentId; forked_from_id = $parentId; model_provider = 'openai' } },
             [ordered]@{ timestamp = '2026-07-14T02:01:06Z'; type = 'turn_context'; payload = [ordered]@{ model = $spec.Model } },
             (New-TestTokenRecord -Timestamp '2026-07-14T02:01:07Z' -TotalInput 1000 -TotalCached 0 -TotalOutput 100 -CallInput 1000 -CallCached 0 -CallOutput 100),
             (New-TestTokenRecord -Timestamp '2026-07-14T02:01:08Z' -TotalInput 2000 -TotalCached 0 -TotalOutput 200 -CallInput 1000 -CallCached 0 -CallOutput 100),
@@ -216,7 +244,7 @@ try {
     $independentId = '30000000-0000-0000-0000-000000000001'
     $independentPath = Join-Path $dedupeRoot ('rollout-independent-' + $independentId + '.jsonl')
     $independentRecords = @(
-        [ordered]@{ timestamp = '2026-07-14T02:01:10Z'; type = 'session_meta'; payload = [ordered]@{ id = $independentId; cwd = 'C:\work\Other Project'; model_provider = 'openai' } },
+        [ordered]@{ timestamp = '2026-07-14T02:01:10Z'; type = 'session_meta'; payload = [ordered]@{ id = $independentId; cwd = $otherProjectPath; model_provider = 'openai' } },
         [ordered]@{ timestamp = '2026-07-14T02:01:11Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.4' } },
         (New-TestTokenRecord -Timestamp '2026-07-14T02:01:12Z' -TotalInput 2000 -TotalCached 0 -TotalOutput 200 -CallInput 1000 -CallCached 0 -CallOutput 100)
     )
@@ -234,7 +262,7 @@ try {
     $childMetadata = Get-TokenRaderSessionMetadata -FilePath $childPath
     Assert-Equal $parentId $childMetadata.ParentThreadId 'child metadata exposes parent task id'
     Assert-Equal $parentId $childMetadata.ForkedFromId 'child metadata exposes fork source id'
-    Assert-Equal 'C:\work\Token Rader' $childMetadata.Cwd 'child metadata exposes project cwd'
+    Assert-Equal $tokenRaderProjectPath $childMetadata.Cwd 'child metadata exposes project cwd'
 
     $projects = @(Get-TokenRaderProjects -SessionsRoot $dedupeRoot)
     Assert-Equal 2 $projects.Count 'project discovery groups sessions by cwd'
