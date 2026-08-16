@@ -314,7 +314,7 @@ try {
         $computePs.Dispose()
     }
 
-    # --- Event cache and baseline snapshot cache equivalence ---
+    # --- Baseline snapshot cache and EndOffsets ---
     $cacheRoot = Join-Path $tempRoot 'cache-sessions'
     New-Item -ItemType Directory -Path $cacheRoot | Out-Null
     $cachePath = Join-Path $cacheRoot 'rollout-cache.jsonl'
@@ -328,30 +328,13 @@ try {
     (New-TestTokenRecord -Timestamp '2026-07-14T03:00:02Z' -TotalInput 2000 -TotalCached 400 -TotalOutput 200 -CallInput 1000 -CallCached 200 -CallOutput 100 | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $cachePath -Encoding UTF8
     $twoRecordLength = (Get-Item -LiteralPath $cachePath).Length
 
-    $cacheFirst = Get-TokenRaderIntervalResult -Baseline $cacheBaseline -PricingDocument $prices -BaselineSnapshots @{} -EventCache @{}
+    $cacheFirst = Get-TokenRaderIntervalResult -Baseline $cacheBaseline -PricingDocument $prices -BaselineSnapshots @{}
     Assert-Equal 1 $cacheFirst.CountedEvents 'cache first compute counts the appended call'
     Assert-Equal 1 @($cacheFirst.BaselineSnapshots.Keys).Count 'baseline snapshot cache populated'
-    Assert-Equal 1 @($cacheFirst.EventCache.Keys).Count 'event cache populated'
-
-    (New-TestTokenRecord -Timestamp '2026-07-14T03:00:03Z' -TotalInput 3000 -TotalCached 600 -TotalOutput 300 -CallInput 1000 -CallCached 200 -CallOutput 100 | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $cachePath -Encoding UTF8
-
-    $cacheSecond = Get-TokenRaderIntervalResult -Baseline $cacheBaseline -PricingDocument $prices -BaselineSnapshots $cacheFirst.BaselineSnapshots -EventCache $cacheFirst.EventCache
-    $cacheFresh = Get-TokenRaderIntervalResult -Baseline $cacheBaseline -PricingDocument $prices
-    Assert-Equal $cacheFresh.Usage.Input $cacheSecond.Usage.Input 'cached recompute input equals fresh'
-    Assert-Equal $cacheFresh.Usage.Cached $cacheSecond.Usage.Cached 'cached recompute cached equals fresh'
-    Assert-Equal $cacheFresh.Usage.Output $cacheSecond.Usage.Output 'cached recompute output equals fresh'
-    Assert-Equal $cacheFresh.Usage.Total $cacheSecond.Usage.Total 'cached recompute total equals fresh'
-    Assert-Near $cacheFresh.Usage.CacheHitRate $cacheSecond.Usage.CacheHitRate 0.0001 'cached recompute hit rate equals fresh'
-    Assert-Equal $cacheFresh.CountedEvents $cacheSecond.CountedEvents 'cached recompute events equals fresh'
-    Assert-Equal $cacheFresh.DuplicateEventsDropped $cacheSecond.DuplicateEventsDropped 'cached recompute duplicates equals fresh'
-    Assert-Equal $cacheFresh.InheritedEventsDropped $cacheSecond.InheritedEventsDropped 'cached recompute inherited equals fresh'
-    Assert-Near $cacheFresh.TotalCost $cacheSecond.TotalCost 0.0000001 'cached recompute cost equals fresh'
-    Assert-Equal 2 $cacheSecond.CountedEvents 'cached recompute counts both appended calls'
-
-    $cacheThird = Get-TokenRaderIntervalResult -Baseline $cacheBaseline -PricingDocument $prices -BaselineSnapshots $cacheSecond.BaselineSnapshots -EventCache $cacheSecond.EventCache
-    Assert-Equal $cacheFresh.Usage.Input $cacheThird.Usage.Input 'idempotent cached recompute input'
-    Assert-Equal $cacheFresh.Usage.Total $cacheThird.Usage.Total 'idempotent cached recompute total'
-    Assert-Near $cacheFresh.TotalCost $cacheThird.TotalCost 0.0000001 'idempotent cached recompute cost'
+    $cacheAgain = Get-TokenRaderIntervalResult -Baseline $cacheBaseline -PricingDocument $prices -BaselineSnapshots $cacheFirst.BaselineSnapshots
+    Assert-Equal $cacheFirst.Usage.Input $cacheAgain.Usage.Input 'baseline snapshot reuse yields identical input'
+    Assert-Equal $cacheFirst.CountedEvents $cacheAgain.CountedEvents 'baseline snapshot reuse yields identical events'
+    Assert-Near $cacheFirst.TotalCost $cacheAgain.TotalCost 0.0000001 'baseline snapshot reuse yields identical cost'
 
     # --- EndOffsets freeze equivalence ---
     $frozen = Get-TokenRaderIntervalResult -Baseline $cacheBaseline -PricingDocument $prices -EndOffsets @{ $cachePath = $twoRecordLength }

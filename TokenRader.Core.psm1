@@ -889,7 +889,6 @@ function Get-TokenRaderIntervalResult {
         [Parameter(Mandatory = $true)]$PricingDocument,
         [string[]]$IncludedFiles = @(),
         [hashtable]$BaselineSnapshots = $null,
-        [hashtable]$EventCache = $null,
         [hashtable]$EndOffsets = $null
     )
 
@@ -1025,40 +1024,17 @@ function Get-TokenRaderIntervalResult {
             $effectiveEnd = [Math]::Min($effectiveEnd, [Int64]$EndOffsets[$changePath])
         }
 
-        # Reuse previously parsed events so a recompute only parses the byte
-        # delta. Aggregation below is order-independent (set-based dedup,
-        # additive cost buckets, max-by-ObservedAt rate limits), so cached
-        # events plus the delta produce the same result as a full re-parse.
-        $eventList = New-Object System.Collections.ArrayList
-        $parseOffset = $startOffset
-        if ($null -ne $EventCache -and $EventCache.ContainsKey($changePath)) {
-            $cacheEntry = $EventCache[$changePath]
-            if ([Int64]$cacheEntry.Offset -le $effectiveEnd) {
-                foreach ($cachedEvent in @($cacheEntry.Events)) { [void]$eventList.Add($cachedEvent) }
-                if ([Int64]$cacheEntry.Offset -gt $parseOffset) { $parseOffset = [Int64]$cacheEntry.Offset }
-                $cachedModel = [string]$cacheEntry.LastModel
-                if (-not [string]::IsNullOrWhiteSpace($cachedModel)) { $initialModel = $cachedModel }
-            } else {
-                # The cache is ahead of the visible end (file shrank or was
-                # replaced): discard it and re-parse from the baseline offset.
-                $EventCache.Remove($changePath)
-            }
-        }
-
-        $parsed = Get-TokenRaderUsageEvents -FilePath $change.File.FullName -StartOffset $parseOffset -EndOffset $effectiveEnd -InitialModel $initialModel
+        # Every recompute re-parses the bytes written since the baseline so no
+        # per-event state is retained between calls (memory stays flat during a
+        # measurement). The desktop UI keeps the UI responsive by running this
+        # in a background runspace and skips recomputes entirely when the
+        # session-tree signature is unchanged.
+        $parsed = Get-TokenRaderUsageEvents -FilePath $change.File.FullName -StartOffset $startOffset -EndOffset $effectiveEnd -InitialModel $initialModel
         $bytesRead += [Int64]$parsed.BytesRead
-        foreach ($event in @($parsed.Events)) { [void]$eventList.Add($event) }
-        if ($null -ne $EventCache -and $effectiveEnd -ge $parseOffset) {
-            $EventCache[$changePath] = [pscustomobject]@{
-                Offset = $effectiveEnd
-                LastModel = [string]$parsed.LastModel
-                Events = @($eventList)
-            }
-        }
-        if ($eventList.Count -gt 0) { [void]$activeFiles.Add($changePath) }
+        if (@($parsed.Events).Count -gt 0) { [void]$activeFiles.Add($changePath) }
         $fallbackModel = [string]$parsed.LastModel
 
-        foreach ($event in $eventList) {
+        foreach ($event in @($parsed.Events)) {
             $rawEventCount++
             if ($null -ne $event.RateLimits -and $event.RateLimits.ObservedAt -gt $latestRateObserved -and
                 ($null -ne $event.RateLimits.FiveHour -or $null -ne $event.RateLimits.Weekly)) {
@@ -1178,7 +1154,6 @@ function Get-TokenRaderIntervalResult {
         BytesRead = $bytesRead
         Signature = ConvertTo-TokenRaderSignature -Parts $signatureParts
         BaselineSnapshots = if ($null -ne $BaselineSnapshots) { $BaselineSnapshots } else { @{} }
-        EventCache = if ($null -ne $EventCache) { $EventCache } else { @{} }
     }
 }
 

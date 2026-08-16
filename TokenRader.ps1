@@ -39,14 +39,13 @@ $script:WindowClosing = $false
 $script:ComputePowerShell = $null
 
 # Runs in a background runspace so interval computation never blocks the UI.
-# The baseline and cache tables cross the runspace boundary through PowerShell
-# serialization, which preserves DateTimeOffset, DateTime, Int64 and nested
-# pscustomobject graphs (verified by tests/Run-Tests.ps1).
+# The baseline and snapshot cache cross the runspace boundary through
+# PowerShell serialization, which preserves DateTimeOffset, DateTime, Int64 and
+# nested pscustomobject graphs (verified by tests/Run-Tests.ps1).
 $script:IntervalComputeScript = {
     param(
         $Baseline,
         $Snapshots,
-        $EventCache,
         $EndOffsets,
         [string]$PricingPath,
         [string]$ModulePath,
@@ -57,7 +56,7 @@ $script:IntervalComputeScript = {
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
     $prices = Get-TokenRaderPrices -PricingPath $PricingPath
-    $result = Get-TokenRaderIntervalResult -Baseline $Baseline -PricingDocument $prices -BaselineSnapshots $Snapshots -EventCache $EventCache -EndOffsets $EndOffsets
+    $result = Get-TokenRaderIntervalResult -Baseline $Baseline -PricingDocument $prices -BaselineSnapshots $Snapshots -EndOffsets $EndOffsets
     $latest = $null
     if ($ScanRateLimits) {
         $latest = Get-TokenRaderLatestRateLimits -SessionsRoot $SessionsRoot
@@ -334,10 +333,8 @@ function Start-TokenRaderIntervalComputeAsync {
 
     $baselineStartedAt = [DateTimeOffset]$Baseline.StartedAt
     $snapshots = @{}
-    $eventCache = @{}
     if ($null -ne $script:State.IntervalCache) {
         $snapshots = $script:State.IntervalCache.BaselineSnapshots
-        $eventCache = $script:State.IntervalCache.EventCache
     }
 
     $ps = $null
@@ -350,7 +347,6 @@ function Start-TokenRaderIntervalComputeAsync {
         [void]$ps.AddScript($script:IntervalComputeScript)
         [void]$ps.AddParameter('Baseline', $Baseline)
         [void]$ps.AddParameter('Snapshots', $snapshots)
-        [void]$ps.AddParameter('EventCache', $eventCache)
         [void]$ps.AddParameter('EndOffsets', $EndOffsets)
         [void]$ps.AddParameter('PricingPath', $script:Paths.PricingPath)
         [void]$ps.AddParameter('ModulePath', (Join-Path $PSScriptRoot 'TokenRader.Core.psm1'))
@@ -400,7 +396,7 @@ function Start-TokenRaderIntervalComputeAsync {
         Reset-TokenRaderComputeHost
         $script:State.IntervalComputing = $false
         try {
-            $result = Get-TokenRaderIntervalResult -Baseline $Baseline -PricingDocument $script:Prices -BaselineSnapshots $snapshots -EventCache $eventCache -EndOffsets $EndOffsets
+            $result = Get-TokenRaderIntervalResult -Baseline $Baseline -PricingDocument $script:Prices -BaselineSnapshots $snapshots -EndOffsets $EndOffsets
             $latest = if ($ScanRateLimits) { Get-TokenRaderLatestRateLimits -SessionsRoot $script:Paths.SessionsRoot } else { $null }
             Complete-TokenRaderIntervalCompute -BaselineStartedAt $baselineStartedAt -Payload ([pscustomobject]@{ Result = $result; LatestRateLimits = $latest }) -Final $Final
         } catch {
@@ -436,7 +432,6 @@ function Complete-TokenRaderIntervalCompute {
             Signature = [string]$result.Signature
             Result = $result
             BaselineSnapshots = $result.BaselineSnapshots
-            EventCache = $result.EventCache
         }
         Show-IntervalResult -Result $result -Running ([bool]$script:State.IsMeasuring)
         if ($Final) {
