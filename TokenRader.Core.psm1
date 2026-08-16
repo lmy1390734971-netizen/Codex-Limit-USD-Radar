@@ -263,6 +263,199 @@ function Get-TokenRaderProjects {
     return @($result | Sort-Object LastWriteTimeUtc -Descending)
 }
 
+function ConvertFrom-TokenRaderUsageTextFast {
+    param([Parameter(Mandatory = $true)][string]$InnerText)
+
+    # Builds the same usage object as New-TokenRaderUsage without the
+    # function-call and [Math]::* overhead. Regex-extracted values are already
+    # non-negative, so the original clamping rules reduce to a single check.
+    $inputMatch = [regex]::Match($InnerText, '"input_tokens"\s*:\s*(\d+)')
+    $cachedMatch = [regex]::Match($InnerText, '"cached_input_tokens"\s*:\s*(\d+)')
+    $outputMatch = [regex]::Match($InnerText, '"output_tokens"\s*:\s*(\d+)')
+    if (-not $inputMatch.Success -or -not $cachedMatch.Success -or -not $outputMatch.Success) { return $null }
+    $reasoningMatch = [regex]::Match($InnerText, '"reasoning_output_tokens"\s*:\s*(\d+)')
+
+    $inputTokens = [Int64]$inputMatch.Groups[1].Value
+    $cachedTokens = [Int64]$cachedMatch.Groups[1].Value
+    $outputTokens = [Int64]$outputMatch.Groups[1].Value
+    $reasoningTokens = if ($reasoningMatch.Success) { [Int64]$reasoningMatch.Groups[1].Value } else { 0 }
+    if ($cachedTokens -gt $inputTokens) { $cachedTokens = $inputTokens }
+    $uncachedTokens = $inputTokens - $cachedTokens
+    $totalTokens = $inputTokens + $outputTokens
+    $hitRate = if ($inputTokens -gt 0) { ($cachedTokens * 100.0) / $inputTokens } else { 0.0 }
+
+    [pscustomobject]@{
+        Input = $inputTokens
+        Cached = $cachedTokens
+        Uncached = $uncachedTokens
+        Output = $outputTokens
+        ReasoningOutput = $reasoningTokens
+        Total = $totalTokens
+        CacheHitRate = [double]$hitRate
+    }
+}
+
+function ConvertFrom-TokenRaderRateWindowTextFast {
+    param([Parameter(Mandatory = $true)][string]$InnerText)
+
+    if ([string]::IsNullOrWhiteSpace($InnerText)) { return $null }
+    $used = [regex]::Match($InnerText, '"used_percent"\s*:\s*"?([0-9.]+)"?')
+    $minutes = [regex]::Match($InnerText, '"window_minutes"\s*:\s*"?(\d+)"?')
+    if (-not $used.Success -or -not $minutes.Success) { return $null }
+    $resets = [regex]::Match($InnerText, '"resets_at"\s*:\s*"?(\d+)"?')
+    $usedPercent = [Math]::Max(0.0, [Math]::Min(100.0, [double]$used.Groups[1].Value))
+    $windowMinutes = [int]$minutes.Groups[1].Value
+    $resetsAt = $null
+    if ($resets.Success) {
+        try { $resetsAt = [DateTimeOffset]::FromUnixTimeSeconds([Int64]$resets.Groups[1].Value).ToLocalTime() } catch { }
+    }
+    [pscustomobject]@{
+        UsedPercent = $usedPercent
+        RemainingPercent = 100.0 - $usedPercent
+        WindowMinutes = $windowMinutes
+        ResetsAt = $resetsAt
+    }
+}
+
+function ConvertFrom-TokenRaderTokenLineFast {
+    param(
+        [Parameter(Mandatory = $true)][string]$LineText,
+        [string]$Model
+    )
+
+    # Fast path: extract the fields this program needs from a well-formed
+    # token_count line without a full JSON parse (ConvertFrom-Json is slow on
+    # Windows PowerShell 5.1). Any structural mismatch falls back to the full
+    # JSON parser so behaviour is always identical to the original logic.
+    $structure = [regex]::Match($LineText, '^\{\s*"timestamp"\s*:\s*"([^"]+)"\s*,\s*"type"\s*:\s*"(?:event_msg|token_count)"\s*,\s*"payload"\s*:\s*\{\s*"type"\s*:\s*"token_count"\s*,\s*"info"\s*:\s*\{')
+    if (-not $structure.Success) { return $null }
+
+    $totalMatch = [regex]::Match($LineText, '"total_token_usage"\s*:\s*\{([^{}]*)\}')
+    $lastMatch = [regex]::Match($LineText, '"last_token_usage"\s*:\s*\{([^{}]*)\}')
+    if (-not $totalMatch.Success -or -not $lastMatch.Success) { return $null }
+
+    $totalUsage = ConvertFrom-TokenRaderUsageTextFast -InnerText $totalMatch.Groups[1].Value
+    $callUsage = ConvertFrom-TokenRaderUsageTextFast -InnerText $lastMatch.Groups[1].Value
+    if ($null -eq $totalUsage -or $null -eq $callUsage) { return $null }
+
+    $timestamp = [DateTimeOffset]::Now
+    try { $timestamp = [DateTimeOffset]::Parse($structure.Groups[1].Value).ToLocalTime() } catch { }
+
+    # Events without a rate_limits block carry no rate-limit snapshot; the
+    # interval aggregation treats that exactly like a snapshot with empty
+    # windows, so a plain $null is equivalent and much cheaper.
+    $rateLimits = $null
+    if ($LineText.Contains('rate_limits')) {
+        $planMatch = [regex]::Match($LineText, '"plan_type"\s*:\s*"([^"]*)"')
+        $primaryMatch = [regex]::Match($LineText, '"primary"\s*:\s*\{([^{}]*)\}')
+        $secondaryMatch = [regex]::Match($LineText, '"secondary"\s*:\s*\{([^{}]*)\}')
+        $primaryWindow = if ($primaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $primaryMatch.Groups[1].Value } else { $null }
+        $secondaryWindow = if ($secondaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $secondaryMatch.Groups[1].Value } else { $null }
+        if (($primaryMatch.Success -and $null -eq $primaryWindow) -or ($secondaryMatch.Success -and $null -eq $secondaryWindow)) { return $null }
+
+        # Inline equivalent of ConvertTo-TokenRaderRateLimits over the two
+        # windows in the original primary-then-secondary order.
+        $fiveHour = $null
+        $weekly = $null
+        if ($null -ne $primaryWindow) {
+            if ($primaryWindow.WindowMinutes -ge 240 -and $primaryWindow.WindowMinutes -le 360) { $fiveHour = $primaryWindow }
+            elseif ($primaryWindow.WindowMinutes -ge 9000) { $weekly = $primaryWindow }
+        }
+        if ($null -ne $secondaryWindow) {
+            if ($secondaryWindow.WindowMinutes -ge 240 -and $secondaryWindow.WindowMinutes -le 360) { $fiveHour = $secondaryWindow }
+            elseif ($secondaryWindow.WindowMinutes -ge 9000) { $weekly = $secondaryWindow }
+        }
+        $rateLimits = [pscustomobject]@{
+            ObservedAt = $timestamp
+            PlanType = if ($planMatch.Success) { $planMatch.Groups[1].Value } else { '' }
+            FiveHour = $fiveHour
+            Weekly = $weekly
+        }
+    }
+
+    $fingerprint = @(
+        $totalUsage.Input, $totalUsage.Cached, $totalUsage.Output, $totalUsage.ReasoningOutput,
+        $callUsage.Input, $callUsage.Cached, $callUsage.Output, $callUsage.ReasoningOutput
+    ) -join ':'
+    return [pscustomobject]@{
+        Timestamp = $timestamp
+        Model = $Model
+        Total = $totalUsage
+        Call = $callUsage
+        Fingerprint = $fingerprint
+        RateLimits = $rateLimits
+    }
+}
+
+function Add-TokenRaderLineEvent {
+    param(
+        [Parameter(Mandatory = $true)][string]$LineText,
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)]$Events
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LineText)) { return }
+    $trimmed = $LineText.TrimStart([char]0xFEFF)
+    $hasTurnContext = $trimmed.Contains('turn_context')
+    $hasTokenCount = $trimmed.Contains('token_count')
+    if (-not $hasTurnContext -and -not $hasTokenCount) { return }
+
+    # Fast paths only apply to complete JSON object lines; anything else falls
+    # back to the original full JSON parsing below.
+    $completeObject = $trimmed.EndsWith('}')
+
+    if ($hasTurnContext -and $completeObject) {
+        $turnMatch = [regex]::Match($trimmed, '^\{\s*"timestamp"\s*:\s*"[^"]*"\s*,\s*"type"\s*:\s*"turn_context"\s*,\s*"payload"\s*:\s*\{[^{}]*"model"\s*:\s*"([^"]+)"[^{}]*\}\s*\}$')
+        if ($turnMatch.Success) {
+            $State.Model = $turnMatch.Groups[1].Value
+            return
+        }
+    }
+
+    if ($hasTokenCount -and $completeObject) {
+        $event = ConvertFrom-TokenRaderTokenLineFast -LineText $trimmed -Model ([string]$State.Model)
+        if ($null -ne $event) {
+            [void]$Events.Add($event)
+            return
+        }
+    }
+
+    # Fallback: full JSON parsing with the original dispatch rules.
+    try {
+        $record = $trimmed | ConvertFrom-Json
+    } catch { return }
+
+    if ($record.type -eq 'turn_context') {
+        if ($null -ne $record.payload -and $null -ne $record.payload.PSObject.Properties['model']) {
+            $candidate = [string]$record.payload.model
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) { $State.Model = $candidate }
+        }
+        return
+    }
+
+    $isTokenRecord = ($record.type -eq 'event_msg' -and $record.payload.type -eq 'token_count') -or ($record.type -eq 'token_count')
+    if (-not $isTokenRecord -or $null -eq $record.payload -or $null -eq $record.payload.info) { return }
+    $info = $record.payload.info
+    if ($null -eq $info.total_token_usage -or $null -eq $info.last_token_usage) { return }
+    $totalUsage = ConvertTo-TokenRaderUsage $info.total_token_usage
+    $callUsage = ConvertTo-TokenRaderUsage $info.last_token_usage
+    $timestamp = [DateTimeOffset]::Now
+    try { $timestamp = [DateTimeOffset]::Parse([string]$record.timestamp).ToLocalTime() } catch { }
+    $rateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $(if ($null -ne $record.payload.PSObject.Properties['rate_limits']) { $record.payload.rate_limits } else { $null }) -ObservedAt $timestamp
+    $fingerprint = @(
+        $totalUsage.Input, $totalUsage.Cached, $totalUsage.Output, $totalUsage.ReasoningOutput,
+        $callUsage.Input, $callUsage.Cached, $callUsage.Output, $callUsage.ReasoningOutput
+    ) -join ':'
+    [void]$Events.Add([pscustomobject]@{
+        Timestamp = $timestamp
+        Model = [string]$State.Model
+        Total = $totalUsage
+        Call = $callUsage
+        Fingerprint = $fingerprint
+        RateLimits = $rateLimits
+    })
+}
+
 function Get-TokenRaderUsageEvents {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -276,45 +469,6 @@ function Get-TokenRaderUsageEvents {
     $state = [pscustomobject]@{ Model = $InitialModel }
     if (-not (Test-Path -LiteralPath $FilePath)) {
         return [pscustomobject]@{ Events = @(); LastModel = $InitialModel; BytesRead = 0 }
-    }
-
-    $processLine = {
-        param([string]$LineText)
-        if ([string]::IsNullOrWhiteSpace($LineText)) { return }
-        $hasTurnContext = $LineText.IndexOf('turn_context', [System.StringComparison]::Ordinal) -ge 0
-        $hasTokenCount = $LineText.IndexOf('token_count', [System.StringComparison]::Ordinal) -ge 0
-        if (-not $hasTurnContext -and -not $hasTokenCount) { return }
-        try { $record = $LineText.TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { return }
-
-        if ($record.type -eq 'turn_context') {
-            if ($null -ne $record.payload -and $null -ne $record.payload.PSObject.Properties['model']) {
-                $candidate = [string]$record.payload.model
-                if (-not [string]::IsNullOrWhiteSpace($candidate)) { $state.Model = $candidate }
-            }
-            return
-        }
-
-        $isTokenRecord = ($record.type -eq 'event_msg' -and $record.payload.type -eq 'token_count') -or ($record.type -eq 'token_count')
-        if (-not $isTokenRecord -or $null -eq $record.payload -or $null -eq $record.payload.info) { return }
-        $info = $record.payload.info
-        if ($null -eq $info.total_token_usage -or $null -eq $info.last_token_usage) { return }
-        $totalUsage = ConvertTo-TokenRaderUsage $info.total_token_usage
-        $callUsage = ConvertTo-TokenRaderUsage $info.last_token_usage
-        $timestamp = [DateTimeOffset]::Now
-        try { $timestamp = [DateTimeOffset]::Parse([string]$record.timestamp).ToLocalTime() } catch { }
-        $rateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $(if ($null -ne $record.payload.PSObject.Properties['rate_limits']) { $record.payload.rate_limits } else { $null }) -ObservedAt $timestamp
-        $fingerprint = @(
-            $totalUsage.Input, $totalUsage.Cached, $totalUsage.Output, $totalUsage.ReasoningOutput,
-            $callUsage.Input, $callUsage.Cached, $callUsage.Output, $callUsage.ReasoningOutput
-        ) -join ':'
-        [void]$events.Add([pscustomobject]@{
-            Timestamp = $timestamp
-            Model = [string]$state.Model
-            Total = $totalUsage
-            Call = $callUsage
-            Fingerprint = $fingerprint
-            RateLimits = $rateLimits
-        })
     }
 
     $stream = $null
@@ -364,7 +518,7 @@ function Get-TokenRaderUsageEvents {
                 if ($newLine -lt 0) { break }
                 if (-not $discardLine -and $lineBuffer.Length -gt 0) {
                     $lineText = [Text.Encoding]::UTF8.GetString($lineBuffer.ToArray()).TrimEnd("`r")
-                    & $processLine $lineText
+                    Add-TokenRaderLineEvent -LineText $lineText -State $state -Events $events
                 }
                 $lineBuffer.SetLength(0)
                 $discardLine = $false
@@ -373,7 +527,7 @@ function Get-TokenRaderUsageEvents {
         }
         if (-not $discardLine -and $lineBuffer.Length -gt 0) {
             $lineText = [Text.Encoding]::UTF8.GetString($lineBuffer.ToArray()).TrimEnd("`r")
-            & $processLine $lineText
+            Add-TokenRaderLineEvent -LineText $lineText -State $state -Events $events
         }
     } catch {
         return [pscustomobject]@{ Events = @($events); LastModel = [string]$state.Model; BytesRead = $bytesReadTotal }
@@ -701,11 +855,42 @@ function New-TokenRaderMeasurementBaseline {
     }
 }
 
+function ConvertTo-TokenRaderSignature {
+    param([string[]]$Parts)
+
+    # Deterministic content hash over "path|length|lastWriteTicks" lines. The
+    # newline separator cannot appear inside Windows file names, so the joined
+    # string is unambiguous.
+    $joined = @($Parts) -join "`n"
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($joined))
+        return ([BitConverter]::ToString($hash)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-TokenRaderSessionTreeSignature {
+    param([Parameter(Mandatory = $true)][string]$SessionsRoot)
+
+    $parts = @()
+    if (Test-Path -LiteralPath $SessionsRoot) {
+        $parts = @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue | ForEach-Object {
+            '{0}|{1}|{2}' -f $_.FullName, [Int64]$_.Length, $_.LastWriteTimeUtc.Ticks
+        })
+    }
+    return ConvertTo-TokenRaderSignature -Parts $parts
+}
+
 function Get-TokenRaderIntervalResult {
     param(
         [Parameter(Mandatory = $true)]$Baseline,
         [Parameter(Mandatory = $true)]$PricingDocument,
-        [string[]]$IncludedFiles = @()
+        [string[]]$IncludedFiles = @(),
+        [hashtable]$BaselineSnapshots = $null,
+        [hashtable]$EventCache = $null,
+        [hashtable]$EndOffsets = $null
     )
 
     $baselineMap = @{}
@@ -736,11 +921,21 @@ function Get-TokenRaderIntervalResult {
     $loadBaselineSnapshot = {
         param($Entry)
         if ($null -eq $Entry) { return $null }
+        $snapshotPath = [string]$Entry.FilePath
+        if ($null -ne $BaselineSnapshots -and $BaselineSnapshots.ContainsKey($snapshotPath)) {
+            return $BaselineSnapshots[$snapshotPath].Task
+        }
         if (-not [bool]$Entry.BaselineLoaded) {
-            $snapshot = Get-TokenRaderUsageSnapshot -FilePath ([string]$Entry.FilePath) -EndOffset ([Int64]$Entry.Length)
+            $snapshot = Get-TokenRaderUsageSnapshot -FilePath $snapshotPath -EndOffset ([Int64]$Entry.Length)
             $Entry.BaselineTask = if ($null -ne $snapshot) { $snapshot.Task } else { $null }
             $Entry.BaselineModel = if ($null -ne $snapshot) { [string]$snapshot.Model } else { '' }
             $Entry.BaselineLoaded = $true
+            if ($null -ne $BaselineSnapshots) {
+                $BaselineSnapshots[$snapshotPath] = [pscustomobject]@{
+                    Task = $Entry.BaselineTask
+                    Model = $Entry.BaselineModel
+                }
+            }
         }
         return $Entry.BaselineTask
     }
@@ -748,7 +943,11 @@ function Get-TokenRaderIntervalResult {
     $changed = New-Object System.Collections.ArrayList
     foreach ($file in $currentFiles) {
         $baselineEntry = if ($baselineMap.ContainsKey($file.FullName)) { $baselineMap[$file.FullName] } else { $null }
-        if ($null -ne $baselineEntry -and [Int64]$file.Length -eq [Int64]$baselineEntry.Length) { continue }
+        $visibleLength = [Int64]$file.Length
+        if ($null -ne $EndOffsets -and $EndOffsets.ContainsKey([string]$file.FullName)) {
+            $visibleLength = [Math]::Min($visibleLength, [Int64]$EndOffsets[[string]$file.FullName])
+        }
+        if ($null -ne $baselineEntry -and $visibleLength -eq [Int64]$baselineEntry.Length) { continue }
         $metadata = & $loadMetadata $file.FullName
         [void]$changed.Add([pscustomobject]@{
             File = $file
@@ -803,10 +1002,14 @@ function Get-TokenRaderIntervalResult {
     $models = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $unknownModels = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $costBuckets = @{}
+    # Price resolution is deterministic per model string; Resolve-TokenRaderPrice
+    # sorts the pricing table on every call, so memoize per call.
+    $priceCache = @{}
     $latestRateLimits = $null
     $latestRateObserved = [DateTimeOffset]::MinValue
 
     foreach ($change in @($changed | Sort-Object Depth, @{ Expression = { $_.File.CreationTimeUtc } })) {
+        $changePath = [string]$change.File.FullName
         $baselineTask = $null
         $initialModel = ''
         $startOffset = 0
@@ -816,12 +1019,46 @@ function Get-TokenRaderIntervalResult {
             $startOffset = [Int64]$change.BaselineEntry.Length
         }
         $ancestorTask = if ($change.IsNew -and $null -ne $change.BaselineAncestor) { & $loadBaselineSnapshot $change.BaselineAncestor } else { $null }
-        $parsed = Get-TokenRaderUsageEvents -FilePath $change.File.FullName -StartOffset $startOffset -InitialModel $initialModel
+
+        $effectiveEnd = [Int64]$change.File.Length
+        if ($null -ne $EndOffsets -and $EndOffsets.ContainsKey($changePath)) {
+            $effectiveEnd = [Math]::Min($effectiveEnd, [Int64]$EndOffsets[$changePath])
+        }
+
+        # Reuse previously parsed events so a recompute only parses the byte
+        # delta. Aggregation below is order-independent (set-based dedup,
+        # additive cost buckets, max-by-ObservedAt rate limits), so cached
+        # events plus the delta produce the same result as a full re-parse.
+        $eventList = New-Object System.Collections.ArrayList
+        $parseOffset = $startOffset
+        if ($null -ne $EventCache -and $EventCache.ContainsKey($changePath)) {
+            $cacheEntry = $EventCache[$changePath]
+            if ([Int64]$cacheEntry.Offset -le $effectiveEnd) {
+                foreach ($cachedEvent in @($cacheEntry.Events)) { [void]$eventList.Add($cachedEvent) }
+                if ([Int64]$cacheEntry.Offset -gt $parseOffset) { $parseOffset = [Int64]$cacheEntry.Offset }
+                $cachedModel = [string]$cacheEntry.LastModel
+                if (-not [string]::IsNullOrWhiteSpace($cachedModel)) { $initialModel = $cachedModel }
+            } else {
+                # The cache is ahead of the visible end (file shrank or was
+                # replaced): discard it and re-parse from the baseline offset.
+                $EventCache.Remove($changePath)
+            }
+        }
+
+        $parsed = Get-TokenRaderUsageEvents -FilePath $change.File.FullName -StartOffset $parseOffset -EndOffset $effectiveEnd -InitialModel $initialModel
         $bytesRead += [Int64]$parsed.BytesRead
-        if (@($parsed.Events).Count -gt 0) { [void]$activeFiles.Add([string]$change.File.FullName) }
+        foreach ($event in @($parsed.Events)) { [void]$eventList.Add($event) }
+        if ($null -ne $EventCache -and $effectiveEnd -ge $parseOffset) {
+            $EventCache[$changePath] = [pscustomobject]@{
+                Offset = $effectiveEnd
+                LastModel = [string]$parsed.LastModel
+                Events = @($eventList)
+            }
+        }
+        if ($eventList.Count -gt 0) { [void]$activeFiles.Add($changePath) }
         $fallbackModel = [string]$parsed.LastModel
 
-        foreach ($event in @($parsed.Events)) {
+        foreach ($event in $eventList) {
             $rawEventCount++
             if ($null -ne $event.RateLimits -and $event.RateLimits.ObservedAt -gt $latestRateObserved -and
                 ($null -ne $event.RateLimits.FiveHour -or $null -ne $event.RateLimits.Weekly)) {
@@ -848,7 +1085,10 @@ function Get-TokenRaderIntervalResult {
 
             $model = if (-not [string]::IsNullOrWhiteSpace([string]$event.Model)) { [string]$event.Model } else { $fallbackModel }
             if (-not [string]::IsNullOrWhiteSpace($model)) { [void]$models.Add($model) }
-            $price = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument
+            if (-not $priceCache.ContainsKey($model)) {
+                $priceCache[$model] = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument
+            }
+            $price = $priceCache[$model]
             $longContext = $false
             if ($null -ne $price -and $null -ne $price.PSObject.Properties['longContextThreshold']) {
                 $longContext = ([Int64]$price.longContextThreshold -gt 0 -and [Int64]$call.Input -gt [Int64]$price.longContextThreshold)
@@ -912,6 +1152,10 @@ function Get-TokenRaderIntervalResult {
                     elseif ($modelList.Count -eq 1) { $modelList[0] }
                     else { ('{0} 个模型' -f $modelList.Count) }
 
+    $signatureParts = foreach ($file in $currentFiles) {
+        '{0}|{1}|{2}' -f $file.FullName, [Int64]$file.Length, $file.LastWriteTimeUtc.Ticks
+    }
+
     [pscustomobject]@{
         StartedAt = $Baseline.StartedAt
         EndedAt = [DateTimeOffset]::Now
@@ -932,6 +1176,9 @@ function Get-TokenRaderIntervalResult {
         DuplicateEventsDropped = $duplicateEventCount
         InheritedEventsDropped = $inheritedEventCount
         BytesRead = $bytesRead
+        Signature = ConvertTo-TokenRaderSignature -Parts $signatureParts
+        BaselineSnapshots = if ($null -ne $BaselineSnapshots) { $BaselineSnapshots } else { @{} }
+        EventCache = if ($null -ne $EventCache) { $EventCache } else { @{} }
     }
 }
 
@@ -1015,4 +1262,4 @@ function Format-TokenRaderUsd {
     return ('$' + $Value.ToString('N4'))
 }
 
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Format-TokenRaderNumber, Format-TokenRaderUsd
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd

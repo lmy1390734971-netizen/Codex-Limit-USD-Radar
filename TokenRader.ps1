@@ -24,11 +24,48 @@ $script:State = @{
     IsMeasuring = $false
     IntervalBaseline = $null
     IntervalResult = $null
+    IntervalComputing = $false
+    IntervalComputePending = $false
+    IntervalComputePendingRequest = $null
+    IntervalCache = $null
     RateLimits = $null
     QuotaEstimates = $null
     QuotaCalibrationMessage = '美元总额需通过一次使额度百分比上升的时间段测量进行反推。'
     Projects = @()
     ProjectCache = @{}
+}
+
+$script:WindowClosing = $false
+$script:ComputePowerShell = $null
+
+# Runs in a background runspace so interval computation never blocks the UI.
+# The baseline and cache tables cross the runspace boundary through PowerShell
+# serialization, which preserves DateTimeOffset, DateTime, Int64 and nested
+# pscustomobject graphs (verified by tests/Run-Tests.ps1).
+$script:IntervalComputeScript = {
+    param(
+        $Baseline,
+        $Snapshots,
+        $EventCache,
+        $EndOffsets,
+        [string]$PricingPath,
+        [string]$ModulePath,
+        [string]$SessionsRoot,
+        [bool]$ScanRateLimits
+    )
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+    Import-Module $ModulePath -Force
+    $prices = Get-TokenRaderPrices -PricingPath $PricingPath
+    $result = Get-TokenRaderIntervalResult -Baseline $Baseline -PricingDocument $prices -BaselineSnapshots $Snapshots -EventCache $EventCache -EndOffsets $EndOffsets
+    $latest = $null
+    if ($ScanRateLimits) {
+        $latest = Get-TokenRaderLatestRateLimits -SessionsRoot $SessionsRoot
+    }
+    [pscustomobject]@{
+        Result = $result
+        LatestRateLimits = $latest
+    }
 }
 
 [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $PSScriptRoot 'MainWindow.xaml')
@@ -262,12 +299,181 @@ function Show-IntervalResult {
     Update-QuotaCards
 }
 
+function Reset-TokenRaderComputeHost {
+    if ($null -ne $script:ComputePowerShell) {
+        try { $script:ComputePowerShell.Dispose() } catch { }
+        $script:ComputePowerShell = $null
+    }
+}
+
+function Start-TokenRaderIntervalComputeAsync {
+    param(
+        [Parameter(Mandatory = $true)]$Baseline,
+        [hashtable]$EndOffsets = $null,
+        [bool]$Final = $false,
+        [bool]$ScanRateLimits = $false
+    )
+
+    if ($script:WindowClosing) { return }
+    if ([bool]$script:State.IntervalComputing) {
+        # A computation is already running; coalesce one follow-up request that
+        # carries the latest request parameters for the same baseline.
+        $script:State.IntervalComputePending = $true
+        $script:State.IntervalComputePendingRequest = @{
+            BaselineStartedAt = [DateTimeOffset]$Baseline.StartedAt
+            EndOffsets = $EndOffsets
+            Final = $Final
+            ScanRateLimits = $ScanRateLimits
+        }
+        return
+    }
+
+    $script:State.IntervalComputing = $true
+    if ($Final) { $script:StatusText.Text = '正在后台结算指定时间段…' }
+    else { $script:StatusText.Text = '正在后台计算指定时间段消耗…' }
+
+    $baselineStartedAt = [DateTimeOffset]$Baseline.StartedAt
+    $snapshots = @{}
+    $eventCache = @{}
+    if ($null -ne $script:State.IntervalCache) {
+        $snapshots = $script:State.IntervalCache.BaselineSnapshots
+        $eventCache = $script:State.IntervalCache.EventCache
+    }
+
+    $ps = $null
+    try {
+        if ($null -eq $script:ComputePowerShell) {
+            $script:ComputePowerShell = [powershell]::Create()
+        }
+        $ps = $script:ComputePowerShell
+        $ps.Commands.Clear()
+        [void]$ps.AddScript($script:IntervalComputeScript)
+        [void]$ps.AddParameter('Baseline', $Baseline)
+        [void]$ps.AddParameter('Snapshots', $snapshots)
+        [void]$ps.AddParameter('EventCache', $eventCache)
+        [void]$ps.AddParameter('EndOffsets', $EndOffsets)
+        [void]$ps.AddParameter('PricingPath', $script:Paths.PricingPath)
+        [void]$ps.AddParameter('ModulePath', (Join-Path $PSScriptRoot 'TokenRader.Core.psm1'))
+        [void]$ps.AddParameter('SessionsRoot', $script:Paths.SessionsRoot)
+        [void]$ps.AddParameter('ScanRateLimits', $ScanRateLimits)
+
+        $wasFinal = $Final
+        $wasStartedAt = $baselineStartedAt
+        $null = $ps.BeginInvoke([System.AsyncCallback]{
+            param($AsyncResult)
+            $callbackPs = $ps
+            try {
+                $output = @($callbackPs.EndInvoke($AsyncResult))
+                $payload = if ($output.Count -gt 0) { $output[0] } else { $null }
+                if (-not $script:WindowClosing -and -not $script:Window.Dispatcher.HasShutdownStarted) {
+                    $script:Window.Dispatcher.Invoke([action]{
+                        Complete-TokenRaderIntervalCompute -BaselineStartedAt $wasStartedAt -Payload $payload -Final $wasFinal
+                    })
+                } else {
+                    $script:State.IntervalComputing = $false
+                }
+            } catch {
+                try {
+                    if ($null -ne $script:ComputePowerShell) {
+                        try { $script:ComputePowerShell.Dispose() } catch { }
+                        $script:ComputePowerShell = $null
+                    }
+                    if (-not $script:WindowClosing -and -not $script:Window.Dispatcher.HasShutdownStarted) {
+                        $script:Window.Dispatcher.Invoke([action]{
+                            $script:State.IntervalComputing = $false
+                            $script:StatusText.Text = '时间段后台计算失败，请稍后重试。'
+                        })
+                    } else {
+                        $script:State.IntervalComputing = $false
+                    }
+                } catch {
+                    $script:State.IntervalComputing = $false
+                }
+            }
+        }, $null)
+    } catch {
+        # Fallback: run the computation synchronously so the feature keeps
+        # working even if a background runspace cannot be created here.
+        if ($null -ne $ps) {
+            try { $ps.Dispose() } catch { }
+        }
+        Reset-TokenRaderComputeHost
+        $script:State.IntervalComputing = $false
+        try {
+            $result = Get-TokenRaderIntervalResult -Baseline $Baseline -PricingDocument $script:Prices -BaselineSnapshots $snapshots -EventCache $eventCache -EndOffsets $EndOffsets
+            $latest = if ($ScanRateLimits) { Get-TokenRaderLatestRateLimits -SessionsRoot $script:Paths.SessionsRoot } else { $null }
+            Complete-TokenRaderIntervalCompute -BaselineStartedAt $baselineStartedAt -Payload ([pscustomobject]@{ Result = $result; LatestRateLimits = $latest }) -Final $Final
+        } catch {
+            $script:State.IntervalComputing = $false
+            $script:StatusText.Text = '时间段计算失败：' + $_.Exception.Message
+        }
+    }
+}
+
+function Complete-TokenRaderIntervalCompute {
+    param(
+        [Parameter(Mandatory = $true)][DateTimeOffset]$BaselineStartedAt,
+        $Payload,
+        [bool]$Final = $false
+    )
+
+    try {
+        if ($null -eq $Payload -or $null -eq $Payload.Result) {
+            if (-not $script:WindowClosing) { $script:StatusText.Text = '时间段后台计算未返回结果。' }
+            return
+        }
+        $currentBaseline = $script:State.IntervalBaseline
+        if ($null -eq $currentBaseline -or [DateTimeOffset]$currentBaseline.StartedAt -ne $BaselineStartedAt) {
+            return  # result belongs to a previous measurement; discard it
+        }
+        $result = $Payload.Result
+        $script:State.IntervalResult = $result
+        Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits
+        Merge-LatestRateLimits -Candidate $result.RateLimits
+        Update-QuotaEstimatesFromInterval -Result $result -Final $Final
+        $script:State.IntervalCache = [pscustomobject]@{
+            BaselineStartedAt = $BaselineStartedAt
+            Signature = [string]$result.Signature
+            Result = $result
+            BaselineSnapshots = $result.BaselineSnapshots
+            EventCache = $result.EventCache
+        }
+        Show-IntervalResult -Result $result -Running ([bool]$script:State.IsMeasuring)
+        if ($Final) {
+            $script:IntervalStatusText.Text = '已完成'
+            $script:IntervalStatusText.Foreground = [Windows.Media.Brushes]::LightSkyBlue
+        }
+    } catch {
+        if (-not $script:WindowClosing) { $script:StatusText.Text = '时间段结果更新失败：' + $_.Exception.Message }
+    } finally {
+        $script:State.IntervalComputing = $false
+        if (-not $script:WindowClosing -and $script:State.IntervalComputePending -and $null -ne $script:State.IntervalBaseline) {
+            $request = $script:State.IntervalComputePendingRequest
+            $script:State.IntervalComputePending = $false
+            $script:State.IntervalComputePendingRequest = $null
+            if ([DateTimeOffset]$request.BaselineStartedAt -eq [DateTimeOffset]$script:State.IntervalBaseline.StartedAt) {
+                Start-TokenRaderIntervalComputeAsync -Baseline $script:State.IntervalBaseline -EndOffsets $request.EndOffsets -Final ([bool]$request.Final) -ScanRateLimits ([bool]$request.ScanRateLimits)
+            }
+        }
+    }
+}
+
 function Update-IntervalView {
     if ($null -eq $script:State.IntervalBaseline) { return }
     if ([bool]$script:State.IsMeasuring) {
-        $script:State.IntervalResult = Get-TokenRaderIntervalResult -Baseline $script:State.IntervalBaseline -PricingDocument $script:Prices
-        Merge-LatestRateLimits -Candidate $script:State.IntervalResult.RateLimits
-        Update-QuotaEstimatesFromInterval -Result $script:State.IntervalResult
+        if ([bool]$script:State.IntervalComputing) { return }
+        $cacheHit = $false
+        $cache = $script:State.IntervalCache
+        if ($null -ne $cache -and [DateTimeOffset]$cache.BaselineStartedAt -eq [DateTimeOffset]$script:State.IntervalBaseline.StartedAt) {
+            $signature = Get-TokenRaderSessionTreeSignature -SessionsRoot $script:Paths.SessionsRoot
+            if ([string]$signature -eq [string]$cache.Signature) {
+                $cacheHit = $true
+                $script:State.IntervalResult = $cache.Result
+            }
+        }
+        if (-not $cacheHit) {
+            Start-TokenRaderIntervalComputeAsync -Baseline $script:State.IntervalBaseline
+        }
     }
     if ($null -ne $script:State.IntervalResult) {
         Show-IntervalResult -Result $script:State.IntervalResult -Running ([bool]$script:State.IsMeasuring)
@@ -373,6 +579,7 @@ function Start-IntervalMeasurement {
     $script:State.IntervalBaseline = New-TokenRaderMeasurementBaseline -SessionsRoot $script:Paths.SessionsRoot
     Merge-LatestRateLimits -Candidate $script:State.IntervalBaseline.RateLimits
     $script:State.IntervalResult = $null
+    $script:State.IntervalCache = $null
     $script:State.IsMeasuring = $true
     $script:State.ViewMode = 'interval'
     $script:StartMeasureButton.IsEnabled = $false
@@ -383,16 +590,23 @@ function Start-IntervalMeasurement {
     $script:ScopeComboBox.IsEnabled = $false
     $script:IntervalStatusText.Text = '计算中'
     $script:IntervalStatusText.Foreground = [Windows.Media.Brushes]::Aquamarine
-    Update-IntervalView
+    Start-TokenRaderIntervalComputeAsync -Baseline $script:State.IntervalBaseline
 }
 
 function Stop-IntervalMeasurement {
     if (-not [bool]$script:State.IsMeasuring -or $null -eq $script:State.IntervalBaseline) { return }
-    $script:StatusText.Text = '正在结算指定时间段…'
-    $script:State.IntervalResult = Get-TokenRaderIntervalResult -Baseline $script:State.IntervalBaseline -PricingDocument $script:Prices
-    $endRateLimits = Get-TokenRaderLatestRateLimits -SessionsRoot $script:Paths.SessionsRoot
-    Merge-LatestRateLimits -Candidate $endRateLimits
-    Update-QuotaEstimatesFromInterval -Result $script:State.IntervalResult -Final $true
+    $script:StatusText.Text = '正在冻结并结算指定时间段…'
+
+    # Capture end offsets synchronously (metadata only) so the final result
+    # counts exactly the data written up to this click, even though the actual
+    # computation runs in the background afterwards.
+    $endOffsets = @{}
+    if (Test-Path -LiteralPath $script:Paths.SessionsRoot) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $script:Paths.SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)) {
+            $endOffsets[[string]$file.FullName] = [Int64]$file.Length
+        }
+    }
+
     $script:State.IsMeasuring = $false
     $script:State.ViewMode = 'interval'
     $script:StartMeasureButton.IsEnabled = $true
@@ -401,9 +615,10 @@ function Stop-IntervalMeasurement {
     $script:SessionListBox.IsEnabled = $true
     $script:ProjectComboBox.IsEnabled = $true
     $script:ScopeComboBox.IsEnabled = $true
-    $script:IntervalStatusText.Text = '已完成'
+    $script:IntervalStatusText.Text = '结算中'
     $script:IntervalStatusText.Foreground = [Windows.Media.Brushes]::LightSkyBlue
-    Show-IntervalResult -Result $script:State.IntervalResult -Running $false
+
+    Start-TokenRaderIntervalComputeAsync -Baseline $script:State.IntervalBaseline -EndOffsets $endOffsets -Final $true -ScanRateLimits $true
 }
 
 function Set-PricingTable {
@@ -691,7 +906,11 @@ $script:Timer.Add_Tick({
         Refresh-Application
     }
 })
-$script:Window.Add_Closing({ $script:Timer.Stop() })
+$script:Window.Add_Closing({
+    $script:WindowClosing = $true
+    $script:Timer.Stop()
+    Reset-TokenRaderComputeHost
+})
 
 Set-PricingTable
 Refresh-Application
