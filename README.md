@@ -28,6 +28,7 @@ Token Rader 在本机解析这些日志，不要求 API Key，也不会上传提
 - 按每次调用判断 272K 长上下文价格倍率。
 - 显示 5 小时和周额度百分比、重置时间及可校准的美元等价额度。
 - 每 5 分钟自动刷新，并保留“立即刷新”和“查看结果”。
+- 时间段统计在后台线程计算，日志解析不会卡住界面；日志无新增时重复“查看结果”直接使用缓存结果。
 - 所有计算在本机完成，不修改 Codex 日志。
 
 ## 软件和硬件环境
@@ -340,6 +341,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Render-Prev
 
 ```text
 Codex-Limit-USD-Radar/
+├─ .gitattributes                   # 行尾与编码约定
+├─ .gitignore                       # 忽略规则
 ├─ .github/workflows/test.yml       # Windows CI
 ├─ artifacts/
 │  └─ token-rader-preview.png       # 合成数据界面预览
@@ -349,6 +352,7 @@ Codex-Limit-USD-Radar/
 │  ├─ Run-Tests.ps1                 # 回归测试与可选 Live 检查
 │  └─ Render-Preview.ps1             # 合成预览图生成
 ├─ Build.ps1                         # 构建 TokenRader.exe
+├─ LICENSE                           # MIT 许可证
 ├─ MainWindow.xaml                   # WPF 布局与样式
 ├─ pricing.json                      # 模型价格、阈值和官方来源
 ├─ Start-TokenRader.cmd              # PowerShell 宿主回退启动脚本
@@ -397,7 +401,7 @@ Codex-Limit-USD-Radar/
 
 ## 许可证状态
 
-仓库目前没有项目自身的 `LICENSE` 文件。公开发布前应由项目所有者选择并确认许可证；`THIRD_PARTY_NOTICES.md` 中的 MIT 声明只适用于所参考的上游项目，不会自动成为 Token Rader 自身的许可证。
+本项目以 [MIT License](LICENSE) 发布（Copyright (c) 2026 lmy1390734971-netizen）。`THIRD_PARTY_NOTICES.md` 中的声明只适用于所参考的上游项目，与本项目自身的 MIT 许可证互不影响。
 
 ## 联系方式
 
