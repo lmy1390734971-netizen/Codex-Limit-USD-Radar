@@ -60,6 +60,9 @@ $prices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.jso
 
 $tempRoot = Join-Path $env:TEMP ('token-rader-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
+# Resolve to the canonical long path: $env:TEMP may contain an 8.3 short name
+# (e.g. RUNNER~1) on CI runners, while Get-ChildItem returns the long form.
+$tempRoot = (Get-Item -LiteralPath $tempRoot).FullName
 try {
     $fixturePath = Join-Path $tempRoot 'rollout-2026-07-14T00-00-00-00000000-0000-0000-0000-000000000001.jsonl'
     $records = @(

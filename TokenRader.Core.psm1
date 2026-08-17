@@ -883,6 +883,16 @@ function Get-TokenRaderSessionTreeSignature {
     return ConvertTo-TokenRaderSignature -Parts $parts
 }
 
+function ConvertTo-TokenRaderCanonicalPath {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+
+    # Expands 8.3 short names (e.g. RUNNER~1 -> runneradmin) and normalizes
+    # separators so path keys match regardless of which form the string came
+    # from ($env:TEMP can resolve to a short form on CI runners while
+    # Get-ChildItem returns the long form).
+    try { return [IO.Path]::GetFullPath($Path) } catch { return $Path }
+}
+
 function Get-TokenRaderIntervalResult {
     param(
         [Parameter(Mandatory = $true)]$Baseline,
@@ -892,11 +902,11 @@ function Get-TokenRaderIntervalResult {
         [hashtable]$EndOffsets = $null
     )
 
-    # Windows file paths are case-insensitive, but enumeration and Join-Path can
-    # surface different casing (e.g. under D:\a\_temp on CI runners), so every
-    # path-keyed lookup below uses an OrdinalIgnoreCase comparer.
+    # Windows file paths are case-insensitive and may be expressed as 8.3 short
+    # names, so every path-keyed lookup below uses canonical full paths in an
+    # OrdinalIgnoreCase comparer.
     $baselineMap = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($entry in @($Baseline.Files)) { $baselineMap[[string]$entry.FilePath] = $entry }
+    foreach ($entry in @($Baseline.Files)) { $baselineMap[(ConvertTo-TokenRaderCanonicalPath -Path ([string]$entry.FilePath))] = $entry }
 
     $currentFiles = @()
     if (@($IncludedFiles).Count -gt 0) {
@@ -907,16 +917,16 @@ function Get-TokenRaderIntervalResult {
         $currentFiles = @(Get-ChildItem -LiteralPath ([string]$Baseline.SessionsRoot) -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
     }
     $fileBySessionId = @{}
-    foreach ($file in $currentFiles) { $fileBySessionId[(Get-TokenRaderSessionIdFromPath -FilePath $file.FullName)] = $file.FullName }
+    foreach ($file in $currentFiles) { $fileBySessionId[(Get-TokenRaderSessionIdFromPath -FilePath $file.FullName)] = (ConvertTo-TokenRaderCanonicalPath -Path ([string]$file.FullName)) }
 
     $endOffsetMap = $null
     if ($null -ne $EndOffsets) {
         $endOffsetMap = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($key in @($EndOffsets.Keys)) { $endOffsetMap[[string]$key] = $EndOffsets[$key] }
+        foreach ($key in @($EndOffsets.Keys)) { $endOffsetMap[(ConvertTo-TokenRaderCanonicalPath -Path ([string]$key))] = $EndOffsets[$key] }
     }
     if ($null -ne $BaselineSnapshots) {
         $normalizedSnapshots = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($key in @($BaselineSnapshots.Keys)) { $normalizedSnapshots[[string]$key] = $BaselineSnapshots[$key] }
+        foreach ($key in @($BaselineSnapshots.Keys)) { $normalizedSnapshots[(ConvertTo-TokenRaderCanonicalPath -Path ([string]$key))] = $BaselineSnapshots[$key] }
         $BaselineSnapshots = $normalizedSnapshots
     }
 
@@ -924,17 +934,18 @@ function Get-TokenRaderIntervalResult {
     $metadataBySessionId = @{}
     $loadMetadata = {
         param([string]$FilePath)
-        if ($metadataByPath.ContainsKey($FilePath)) { return $metadataByPath[$FilePath] }
+        $canonicalPath = ConvertTo-TokenRaderCanonicalPath -Path $FilePath
+        if ($metadataByPath.ContainsKey($canonicalPath)) { return $metadataByPath[$canonicalPath] }
         $metadata = Get-TokenRaderSessionMetadata -FilePath $FilePath
-        $metadataByPath[$FilePath] = $metadata
+        $metadataByPath[$canonicalPath] = $metadata
         $metadataBySessionId[[string]$metadata.SessionId] = $metadata
-        if (-not $fileBySessionId.ContainsKey([string]$metadata.SessionId)) { $fileBySessionId[[string]$metadata.SessionId] = $FilePath }
+        if (-not $fileBySessionId.ContainsKey([string]$metadata.SessionId)) { $fileBySessionId[[string]$metadata.SessionId] = $canonicalPath }
         return $metadata
     }
     $loadBaselineSnapshot = {
         param($Entry)
         if ($null -eq $Entry) { return $null }
-        $snapshotPath = [string]$Entry.FilePath
+        $snapshotPath = ConvertTo-TokenRaderCanonicalPath -Path ([string]$Entry.FilePath)
         if ($null -ne $BaselineSnapshots -and $BaselineSnapshots.ContainsKey($snapshotPath)) {
             return $BaselineSnapshots[$snapshotPath].Task
         }
@@ -955,15 +966,17 @@ function Get-TokenRaderIntervalResult {
 
     $changed = New-Object System.Collections.ArrayList
     foreach ($file in $currentFiles) {
-        $baselineEntry = if ($baselineMap.ContainsKey($file.FullName)) { $baselineMap[$file.FullName] } else { $null }
+        $fullPath = ConvertTo-TokenRaderCanonicalPath -Path ([string]$file.FullName)
+        $baselineEntry = if ($baselineMap.ContainsKey($fullPath)) { $baselineMap[$fullPath] } else { $null }
         $visibleLength = [Int64]$file.Length
-        if ($null -ne $endOffsetMap -and $endOffsetMap.ContainsKey([string]$file.FullName)) {
-            $visibleLength = [Math]::Min($visibleLength, [Int64]$endOffsetMap[[string]$file.FullName])
+        if ($null -ne $endOffsetMap -and $endOffsetMap.ContainsKey($fullPath)) {
+            $visibleLength = [Math]::Min($visibleLength, [Int64]$endOffsetMap[$fullPath])
         }
         if ($null -ne $baselineEntry -and $visibleLength -eq [Int64]$baselineEntry.Length) { continue }
-        $metadata = & $loadMetadata $file.FullName
+        $metadata = & $loadMetadata $fullPath
         [void]$changed.Add([pscustomobject]@{
             File = $file
+            FullPath = $fullPath
             BaselineEntry = $baselineEntry
             Metadata = $metadata
             IsNew = ($null -eq $baselineEntry)
@@ -1022,7 +1035,7 @@ function Get-TokenRaderIntervalResult {
     $latestRateObserved = [DateTimeOffset]::MinValue
 
     foreach ($change in @($changed | Sort-Object Depth, @{ Expression = { $_.File.CreationTimeUtc } })) {
-        $changePath = [string]$change.File.FullName
+        $changePath = [string]$change.FullPath
         $baselineTask = $null
         $initialModel = ''
         $startOffset = 0
@@ -1043,7 +1056,7 @@ function Get-TokenRaderIntervalResult {
         # measurement). The desktop UI keeps the UI responsive by running this
         # in a background runspace and skips recomputes entirely when the
         # session-tree signature is unchanged.
-        $parsed = Get-TokenRaderUsageEvents -FilePath $change.File.FullName -StartOffset $startOffset -EndOffset $effectiveEnd -InitialModel $initialModel
+        $parsed = Get-TokenRaderUsageEvents -FilePath $changePath -StartOffset $startOffset -EndOffset $effectiveEnd -InitialModel $initialModel
         $bytesRead += [Int64]$parsed.BytesRead
         if (@($parsed.Events).Count -gt 0) { [void]$activeFiles.Add($changePath) }
         $fallbackModel = [string]$parsed.LastModel
