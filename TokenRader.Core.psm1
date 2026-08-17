@@ -892,7 +892,10 @@ function Get-TokenRaderIntervalResult {
         [hashtable]$EndOffsets = $null
     )
 
-    $baselineMap = @{}
+    # Windows file paths are case-insensitive, but enumeration and Join-Path can
+    # surface different casing (e.g. under D:\a\_temp on CI runners), so every
+    # path-keyed lookup below uses an OrdinalIgnoreCase comparer.
+    $baselineMap = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($entry in @($Baseline.Files)) { $baselineMap[[string]$entry.FilePath] = $entry }
 
     $currentFiles = @()
@@ -906,7 +909,18 @@ function Get-TokenRaderIntervalResult {
     $fileBySessionId = @{}
     foreach ($file in $currentFiles) { $fileBySessionId[(Get-TokenRaderSessionIdFromPath -FilePath $file.FullName)] = $file.FullName }
 
-    $metadataByPath = @{}
+    $endOffsetMap = $null
+    if ($null -ne $EndOffsets) {
+        $endOffsetMap = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in @($EndOffsets.Keys)) { $endOffsetMap[[string]$key] = $EndOffsets[$key] }
+    }
+    if ($null -ne $BaselineSnapshots) {
+        $normalizedSnapshots = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in @($BaselineSnapshots.Keys)) { $normalizedSnapshots[[string]$key] = $BaselineSnapshots[$key] }
+        $BaselineSnapshots = $normalizedSnapshots
+    }
+
+    $metadataByPath = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
     $metadataBySessionId = @{}
     $loadMetadata = {
         param([string]$FilePath)
@@ -943,8 +957,8 @@ function Get-TokenRaderIntervalResult {
     foreach ($file in $currentFiles) {
         $baselineEntry = if ($baselineMap.ContainsKey($file.FullName)) { $baselineMap[$file.FullName] } else { $null }
         $visibleLength = [Int64]$file.Length
-        if ($null -ne $EndOffsets -and $EndOffsets.ContainsKey([string]$file.FullName)) {
-            $visibleLength = [Math]::Min($visibleLength, [Int64]$EndOffsets[[string]$file.FullName])
+        if ($null -ne $endOffsetMap -and $endOffsetMap.ContainsKey([string]$file.FullName)) {
+            $visibleLength = [Math]::Min($visibleLength, [Int64]$endOffsetMap[[string]$file.FullName])
         }
         if ($null -ne $baselineEntry -and $visibleLength -eq [Int64]$baselineEntry.Length) { continue }
         $metadata = & $loadMetadata $file.FullName
@@ -1020,8 +1034,8 @@ function Get-TokenRaderIntervalResult {
         $ancestorTask = if ($change.IsNew -and $null -ne $change.BaselineAncestor) { & $loadBaselineSnapshot $change.BaselineAncestor } else { $null }
 
         $effectiveEnd = [Int64]$change.File.Length
-        if ($null -ne $EndOffsets -and $EndOffsets.ContainsKey($changePath)) {
-            $effectiveEnd = [Math]::Min($effectiveEnd, [Int64]$EndOffsets[$changePath])
+        if ($null -ne $endOffsetMap -and $endOffsetMap.ContainsKey($changePath)) {
+            $effectiveEnd = [Math]::Min($effectiveEnd, [Int64]$endOffsetMap[$changePath])
         }
 
         # Every recompute re-parses the bytes written since the baseline so no

@@ -353,9 +353,15 @@ try {
     Assert-Equal 1 $frozen.CountedEvents 'end offsets freeze counted events'
     Assert-Equal $cacheFirst.Usage.Input $frozen.Usage.Input 'end offsets freeze input'
     Assert-Near $cacheFirst.TotalCost $frozen.TotalCost 0.0000001 'end offsets freeze cost'
-    $baselineLength = [Int64]$cacheBaseline.Files[0].Length
+    $baselineEntryForPath = @($cacheBaseline.Files | Where-Object { [string]$_.FilePath -eq $cachePath } | Select-Object -First 1)
+    $baselineLength = if ($baselineEntryForPath.Count -gt 0) { [Int64]$baselineEntryForPath[0].Length } else { [Int64]$cacheBaseline.Files[0].Length }
     $frozenZero = Get-TokenRaderIntervalResult -Baseline $cacheBaseline -PricingDocument $prices -EndOffsets @{ $cachePath = $baselineLength }
-    Assert-Equal 0 $frozenZero.CountedEvents 'end offsets at baseline freeze counts nothing'
+    if ($frozenZero.CountedEvents -ne 0) {
+        throw ("ENDDBG baselineLength={0} twoRecordLength={1} currentLength={2} baselineFilesCount={3} firstFilePath={4} cachePath={5} counted={6} raw={7} changed={8}" -f
+            $baselineLength, $twoRecordLength, (Get-Item -LiteralPath $cachePath).Length,
+            @($cacheBaseline.Files).Count, [string]$cacheBaseline.Files[0].FilePath, $cachePath,
+            $frozenZero.CountedEvents, $frozenZero.RawEvents, $frozenZero.ChangedSessions)
+    }
 
     # --- Session tree signature stability ---
     $sigBefore = Get-TokenRaderSessionTreeSignature -SessionsRoot $cacheRoot
