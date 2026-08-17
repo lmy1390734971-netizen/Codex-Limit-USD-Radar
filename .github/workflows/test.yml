@@ -10,6 +10,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Show environment
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          (Get-Culture).Name
+          [Environment]::OSVersion.VersionString
       - name: Run regression tests
         shell: powershell
         run: .\tests\Run-Tests.ps1

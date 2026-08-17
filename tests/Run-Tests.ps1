@@ -1,6 +1,18 @@
 ﻿[CmdletBinding()]
 param([switch]$Live)
 
+# The XAML regression check instantiates WPF controls, which behave
+# consistently only on a single-threaded apartment. Relaunch ourselves in an
+# STA host exactly like the documented app command so CI and local runs share
+# the same apartment model (GitHub Actions invokes the script without -STA).
+if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"' + $PSCommandPath + '"'))
+    if ($Live) { $arguments += '-Live' }
+    $hostExecutable = if ($PSVersionTable.PSEdition -eq 'Core') { Join-Path $PSHOME 'pwsh.exe' } else { Join-Path $PSHOME 'powershell.exe' }
+    Start-Process -FilePath $hostExecutable -ArgumentList $arguments -Wait -NoNewWindow
+    exit $LASTEXITCODE
+}
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
