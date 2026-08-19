@@ -899,15 +899,25 @@ $script:Timer.Add_Tick({
         Update-IntervalView
     } else {
         Refresh-Application
+        # 后台同步索引（如果 Indexer DLL 可用）
+        try { Sync-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null } catch { }
     }
 })
 $script:Window.Add_Closing({
     $script:WindowClosing = $true
     $script:Timer.Stop()
+    Clear-TokenRaderIndex
     Reset-TokenRaderComputeHost
 })
 
 Set-PricingTable
 Refresh-Application
+# 构建 C# 内存索引（首次启动一次性解析，后续增量同步）
+try {
+    $indexerPath = Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.dll'
+    if (Test-Path -LiteralPath $indexerPath) {
+        Build-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
+    }
+} catch { }
 $script:Timer.Start()
 [void]$script:Window.ShowDialog()

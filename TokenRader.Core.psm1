@@ -1264,4 +1264,219 @@ function Format-TokenRaderUsd {
     return ('$' + $Value.ToString('N4'))
 }
 
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd
+# ── C# 索引引擎（零外部依赖，仅 .NET Framework 内置类型） ────────────────
+
+$script:TokenRaderIndex = $null
+
+function Get-TokenRaderIndexerPath {
+    return Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.dll'
+}
+
+function Get-TokenRaderIndexerTempDir {
+    $dir = Join-Path $env:TEMP 'TokenRader'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return $dir
+}
+
+function Get-TokenRaderIndexerMetaPath {
+    return Join-Path (Get-TokenRaderIndexerTempDir) 'metadata.json'
+}
+
+<#
+.SYNOPSIS
+    加载 C# Indexer DLL 并返回是否成功。
+#>
+function Initialize-TokenRaderIndexer {
+    $dllPath = Get-TokenRaderIndexerPath
+    if (-not (Test-Path -LiteralPath $dllPath)) { return $false }
+    try {
+        Add-Type -Path $dllPath -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+<#
+.SYNOPSIS
+    构建索引：扫描所有 JSONL 文件，用 C# 解析后返回 TokenRecord 列表和文件元数据。
+.PARAMETER SessionsRoot
+    Codex 会话日志根目录。
+.PARAMETER Force
+    强制重建（忽略缓存的元数据）。
+#>
+function Build-TokenRaderIndex {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [switch]$Force
+    )
+
+    if (-not (Initialize-TokenRaderIndexer)) {
+        Write-Error 'C# Indexer DLL 不可用，请先运行 Build.ps1'
+        return $null
+    }
+
+    $index = [pscustomobject]@{
+        Records = New-Object System.Collections.ArrayList
+        FileMeta = @{}
+        SessionsRoot = $SessionsRoot
+        LastSync = [DateTimeOffset]::Now
+    }
+
+    $metaPath = Get-TokenRaderIndexerMetaPath
+    $existingMeta = @{}
+    if (-not $Force -and (Test-Path -LiteralPath $metaPath)) {
+        try {
+            $loaded = [TokenRaderIndexer]::LoadFileMeta($metaPath)
+            foreach ($kv in $loaded.GetEnumerator()) { $existingMeta[$kv.Key] = $kv.Value }
+        } catch { }
+    }
+
+    $sessionFiles = @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
+    $currentMeta = @{}
+    $totalFiles = 0
+    $totalRecords = 0
+
+    foreach ($file in $sessionFiles) {
+        $path = $file.FullName
+        $canonical = [IO.Path]::GetFullPath($path)
+        $length = [Int64]$file.Length
+        $lastWrite = $file.LastWriteTimeUtc.Ticks
+
+        $known = $null
+        $isChanged = $true
+        if ($existingMeta.ContainsKey($canonical)) {
+            $known = $existingMeta[$canonical]
+            if ($known.Length -eq $length -and $known.LastWriteTicks -eq $lastWrite) {
+                $isChanged = $false
+                # 文件未变，重用已解析的记录（但需要重新解析？不——我们只保留当前会话的记录）
+                # 实际上，如果没有持久化记录，我们必须重新解析。
+                # 这里我们只记录元数据，记录在后续的同步中重新解析。
+                $isChanged = $true
+            }
+        }
+
+        if ($isChanged) {
+            $totalFiles++
+            $records = $null
+            $newOffset = 0
+            try {
+                [TokenRaderIndexer]::ParseFile($path, 0, $canonical, [ref]$records, [ref]$newOffset)
+                if ($null -ne $records -and $records.Count -gt 0) {
+                    foreach ($rec in $records) { [void]$index.Records.Add($rec) }
+                    $totalRecords += $records.Count
+                }
+            } catch {
+                # 跳过无法解析的文件
+                continue
+            }
+        }
+
+        $currentMeta[$canonical] = [pscustomobject]@{
+            Path = $canonical
+            Length = $length
+            LastWriteTicks = $lastWrite
+            ParsedOffset = $newOffset
+        }
+    }
+
+    $index.FileMeta = $currentMeta
+
+    # 保存元数据（用于增量同步，但关闭时删除）
+    try {
+        $metaList = foreach ($kv in $currentMeta.GetEnumerator()) {
+            $m = $kv.Value
+            @{ path = $m.Path; length = $m.Length; last_write_ticks = $m.LastWriteTicks; parsed_offset = $m.ParsedOffset }
+        }
+        $metaDir = Split-Path $metaPath -Parent
+        if (-not (Test-Path -LiteralPath $metaDir)) { New-Item -ItemType Directory -Path $metaDir -Force | Out-Null }
+        @($metaList) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $metaPath -Encoding UTF8
+    } catch { }
+
+    $script:TokenRaderIndex = $index
+    Write-Output ('TokenRaderIndex: {0} 个文件，{1} 条记录，{2} 秒' -f $totalFiles, $totalRecords, [Math]::Round(([DateTimeOffset]::Now - $index.LastSync).TotalSeconds, 1))
+    return $index
+}
+
+<#
+.SYNOPSIS
+    增量同步：检查文件变化，只解析新增/变更部分，更新索引。
+#>
+function Sync-TokenRaderIndex {
+    param([Parameter(Mandatory = $true)][string]$SessionsRoot)
+
+    $index = $script:TokenRaderIndex
+    if ($null -eq $index) {
+        return Build-TokenRaderIndex -SessionsRoot $SessionsRoot
+    }
+
+    $sessionFiles = @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
+    $existingMeta = $index.FileMeta
+    $added = 0
+
+    foreach ($file in $sessionFiles) {
+        $path = $file.FullName
+        $canonical = [IO.Path]::GetFullPath($path)
+        $length = [Int64]$file.Length
+        $lastWrite = $file.LastWriteTimeUtc.Ticks
+
+        $known = $null
+        $isNew = $false
+        if ($existingMeta.ContainsKey($canonical)) {
+            $known = $existingMeta[$canonical]
+            if ($known.Length -eq $length -and $known.LastWriteTicks -eq $lastWrite) {
+                continue  # 无变化
+            }
+        } else {
+            $isNew = $true
+        }
+
+        $startOffset = if ($isNew) { 0 } else { [Int64]$known.ParsedOffset }
+        $records = $null
+        $newOffset = 0
+        try {
+            [TokenRaderIndexer]::ParseFile($path, $startOffset, $canonical, [ref]$records, [ref]$newOffset)
+            if ($null -ne $records -and $records.Count -gt 0) {
+                foreach ($rec in $records) { [void]$index.Records.Add($rec) }
+                $added += $records.Count
+            }
+        } catch { continue }
+
+        $existingMeta[$canonical] = [pscustomobject]@{
+            Path = $canonical
+            Length = $length
+            LastWriteTicks = $lastWrite
+            ParsedOffset = $newOffset
+        }
+    }
+
+    $index.LastSync = [DateTimeOffset]::Now
+
+    # 更新元数据文件
+    $metaPath = Get-TokenRaderIndexerMetaPath
+    try {
+        $metaList = foreach ($kv in $existingMeta.GetEnumerator()) {
+            $m = $kv.Value
+            @{ path = $m.Path; length = $m.Length; last_write_ticks = $m.LastWriteTicks; parsed_offset = $m.ParsedOffset }
+        }
+        $metaDir = Split-Path $metaPath -Parent
+        if (-not (Test-Path -LiteralPath $metaDir)) { New-Item -ItemType Directory -Path $metaDir -Force | Out-Null }
+        @($metaList) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $metaPath -Encoding UTF8
+    } catch { }
+
+    Write-Output ('Sync-TokenRaderIndex: 新增 {0} 条记录' -f $added)
+    return $index
+}
+
+<#
+.SYNOPSIS
+    清理索引及临时文件。
+#>
+function Clear-TokenRaderIndex {
+    $script:TokenRaderIndex = $null
+    [GC]::Collect()
+    $metaPath = Get-TokenRaderIndexerMetaPath
+    if (Test-Path -LiteralPath $metaPath) {
+        try { Remove-Item -LiteralPath $metaPath -Force } catch { }
+    }
+}
+
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Build-TokenRaderIndex, Sync-TokenRaderIndex, Clear-TokenRaderIndex

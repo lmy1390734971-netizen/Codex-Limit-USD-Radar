@@ -46,6 +46,11 @@ checkpoints/
 bin/
 obj/
 TestResults/
+*.db
+*.idx
+
+# Build artifacts
+indexer/TokenRader.Indexer.dll
 
 # Operating-system metadata
 .DS_Store
