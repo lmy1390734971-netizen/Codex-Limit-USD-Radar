@@ -648,7 +648,21 @@ function Update-UsageView {
     }
 
     $script:StatusText.Text = '正在读取本地 token 计数…'
-    $snapshot = Get-TokenRaderUsageSnapshot -FilePath ([string]$selected.FilePath)
+
+    # 尝试从 C# 索引获取会话数据（秒级 → 毫秒级）
+    $snapshot = $null
+    $index = Get-TokenRaderIndex
+    if ($null -ne $index) {
+        $sessionId = [string]$selected.SessionId
+        $indexRecords = Get-TokenRaderIndexRecords -SessionId $sessionId
+        if ($null -ne $indexRecords -and $indexRecords.Count -gt 0) {
+            $latest = $indexRecords | Sort-Object Timestamp -Descending | Select-Object -First 1
+            $snapshot = ConvertFrom-TokenRaderIndexRecord -Record $latest -FilePath ([string]$selected.FilePath)
+        }
+    }
+    if ($null -eq $snapshot) {
+        $snapshot = Get-TokenRaderUsageSnapshot -FilePath ([string]$selected.FilePath)
+    }
     $script:State.LastSnapshot = $snapshot
     if ($null -eq $snapshot) {
         $script:SelectedSessionText.Text = ('会话 {0}' -f [string]$selected.ShortId)

@@ -1479,4 +1479,120 @@ function Clear-TokenRaderIndex {
     }
 }
 
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Build-TokenRaderIndex, Sync-TokenRaderIndex, Clear-TokenRaderIndex
+function Get-TokenRaderIndex {
+    return $script:TokenRaderIndex
+}
+
+<#
+.SYNOPSIS
+    从索引中获取指定会话的 token 记录。
+#>
+function Get-TokenRaderIndexRecords {
+    param(
+        [string]$SessionId = '',
+        [string]$StartTimestamp = '',
+        [string]$EndTimestamp = ''
+    )
+
+    $index = $script:TokenRaderIndex
+    if ($null -eq $index) { return @() }
+
+    $records = $index.Records
+
+    if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
+        $records = @($records | Where-Object { $_.SessionId -eq $SessionId })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($StartTimestamp)) {
+        $records = @($records | Where-Object { $_.Timestamp -ge $StartTimestamp })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($EndTimestamp)) {
+        $records = @($records | Where-Object { $_.Timestamp -le $EndTimestamp })
+    }
+
+    return $records
+}
+
+<#
+.SYNOPSIS
+    将 C# TokenRecord 对象转换为 UI 可用的 pscustomobject 格式。
+#>
+function ConvertFrom-TokenRaderIndexRecord {
+    param(
+        [Parameter(Mandatory = $true)]$Record,
+        [string]$FilePath = ''
+    )
+
+    $totalInput = [Int64]$Record.TotalInput
+    $totalCached = [Int64]$Record.TotalCached
+    $totalOutput = [Int64]$Record.TotalOutput
+    $totalUncached = $totalInput - $totalCached
+    $totalTotal = $totalInput + $totalOutput
+    $totalHitRate = if ($totalInput -gt 0) { ($totalCached * 100.0) / $totalInput } else { 0.0 }
+
+    $callInput = [Int64]$Record.CallInput
+    $callCached = [Int64]$Record.CallCached
+    $callOutput = [Int64]$Record.CallOutput
+    $callUncached = $callInput - $callCached
+    $callTotal = $callInput + $callOutput
+    $callHitRate = if ($callInput -gt 0) { ($callCached * 100.0) / $callInput } else { 0.0 }
+
+    $timestamp = [DateTimeOffset]::Now
+    try { $timestamp = [DateTimeOffset]::Parse([string]$Record.Timestamp).ToLocalTime() } catch { }
+
+    $fiveHour = $null
+    $weekly = $null
+    if ($null -ne $Record.FiveHourUsed) {
+        $fiveHour = [pscustomobject]@{
+            UsedPercent = [double]$Record.FiveHourUsed
+            RemainingPercent = 100.0 - [double]$Record.FiveHourUsed
+            WindowMinutes = [int]$Record.FiveHourWindow
+            ResetsAt = if ($null -ne $Record.FiveHourResets) { [DateTimeOffset]::FromUnixTimeSeconds([Int64]$Record.FiveHourResets).ToLocalTime() } else { $null }
+        }
+    }
+    if ($null -ne $Record.WeeklyUsed) {
+        $weekly = [pscustomobject]@{
+            UsedPercent = [double]$Record.WeeklyUsed
+            RemainingPercent = 100.0 - [double]$Record.WeeklyUsed
+            WindowMinutes = [int]$Record.WeeklyWindow
+            ResetsAt = if ($null -ne $Record.WeeklyResets) { [DateTimeOffset]::FromUnixTimeSeconds([Int64]$Record.WeeklyResets).ToLocalTime() } else { $null }
+        }
+    }
+
+    $rateLimits = [pscustomobject]@{
+        ObservedAt = $timestamp
+        PlanType = [string]$Record.PlanType
+        FiveHour = $fiveHour
+        Weekly = $weekly
+    }
+
+    [pscustomobject]@{
+        FilePath = $FilePath
+        Timestamp = $timestamp
+        Model = [string]$Record.Model
+        PlanType = [string]$Record.PlanType
+        RateLimits = $rateLimits
+        Task = [pscustomobject]@{
+            Input = $totalInput
+            Cached = $totalCached
+            Uncached = $totalUncached
+            Output = $totalOutput
+            ReasoningOutput = [Int64]$Record.TotalReasoning
+            Total = $totalTotal
+            CacheHitRate = $totalHitRate
+        }
+        Call = [pscustomobject]@{
+            Input = $callInput
+            Cached = $callCached
+            Uncached = $callUncached
+            Output = $callOutput
+            ReasoningOutput = [Int64]$Record.CallReasoning
+            Total = $callTotal
+            CacheHitRate = $callHitRate
+        }
+        ContextWindow = [Int64]0
+        TailLinesRead = 0
+        TokenRecordIndex = 0
+    }
+}
+
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Build-TokenRaderIndex, Sync-TokenRaderIndex, Clear-TokenRaderIndex, Get-TokenRaderIndex, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord
