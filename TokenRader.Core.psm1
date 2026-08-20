@@ -1305,7 +1305,7 @@ function Initialize-TokenRaderIndexer {
 .PARAMETER Force
     强制重建（删除已有数据库）。
 #>
-function Build-TokenRaderIndex {
+function New-TokenRaderIndex {
     param(
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
         [switch]$Force
@@ -1378,12 +1378,12 @@ function Build-TokenRaderIndex {
 .SYNOPSIS
     增量同步：检查文件变化，只解析新增/变更部分。
 #>
-function Sync-TokenRaderIndex {
+function Update-TokenRaderIndex {
     param([Parameter(Mandatory = $true)][string]$SessionsRoot)
 
     $index = $script:TokenRaderIndex
     if ($null -eq $index -or $null -eq $index.Connection) {
-        return Build-TokenRaderIndex -SessionsRoot $SessionsRoot
+        return New-TokenRaderIndex -SessionsRoot $SessionsRoot
     }
 
     $conn = $index.Connection
@@ -1424,7 +1424,7 @@ function Sync-TokenRaderIndex {
     }
 
     $index.LastSync = [DateTimeOffset]::Now
-    Write-Output ('Sync-TokenRaderIndex: 新增 {0} 条记录' -f $added)
+    Write-Output ('Update-TokenRaderIndex: 新增 {0} 条记录' -f $added)
     return $index
 }
 
@@ -1562,4 +1562,4 @@ function ConvertFrom-TokenRaderIndexRecord {
     }
 }
 
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Build-TokenRaderIndex, Sync-TokenRaderIndex, Clear-TokenRaderIndex, Get-TokenRaderIndex, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Get-TokenRaderIndex, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord

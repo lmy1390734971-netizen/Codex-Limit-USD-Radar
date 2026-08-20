@@ -913,7 +913,7 @@ $script:Timer.Add_Tick({
     } else {
         Refresh-Application
         # 后台同步索引（如果 Indexer DLL 可用）
-        try { Sync-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null } catch { }
+        try { Update-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null } catch { }
     }
 })
 $script:Window.Add_Closing({
@@ -925,11 +925,11 @@ $script:Window.Add_Closing({
 
 Set-PricingTable
 Refresh-Application
-# 构建 C# 内存索引（首次启动一次性解析，后续增量同步）
+# 构建 SQLite 索引（首次启动一次性导入，后续增量同步）
 try {
     $indexerPath = Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.dll'
     if (Test-Path -LiteralPath $indexerPath) {
-        Build-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
+        New-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
     }
 } catch { }
 $script:Timer.Start()
