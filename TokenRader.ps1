@@ -649,15 +649,14 @@ function Update-UsageView {
 
     $script:StatusText.Text = '正在读取本地 token 计数…'
 
-    # 尝试从 C# 索引获取会话数据（秒级 → 毫秒级）
+    # 尝试从 SQLite 索引获取会话数据（秒级 → 毫秒级）
     $snapshot = $null
     $index = Get-TokenRaderIndex
     if ($null -ne $index) {
         $sessionId = [string]$selected.SessionId
-        $indexRecords = Get-TokenRaderIndexRecords -SessionId $sessionId
-        if ($null -ne $indexRecords -and $indexRecords.Count -gt 0) {
-            $latest = $indexRecords | Sort-Object Timestamp -Descending | Select-Object -First 1
-            $snapshot = ConvertFrom-TokenRaderIndexRecord -Record $latest -FilePath ([string]$selected.FilePath)
+        $indexTable = Get-TokenRaderIndexRecords -SessionId $sessionId
+        if ($null -ne $indexTable -and $indexTable.Rows.Count -gt 0) {
+            $snapshot = ConvertFrom-TokenRaderIndexRecord -Row $indexTable.Rows[0] -FilePath ([string]$selected.FilePath)
         }
     }
     if ($null -eq $snapshot) {

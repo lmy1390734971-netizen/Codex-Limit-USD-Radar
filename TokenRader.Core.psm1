@@ -1264,7 +1264,7 @@ function Format-TokenRaderUsd {
     return ('$' + $Value.ToString('N4'))
 }
 
-# ── C# 索引引擎（零外部依赖，仅 .NET Framework 内置类型） ────────────────
+# ── SQLite 索引引擎（磁盘数据库，sub2api 式，内存恒定） ─────────────────
 
 $script:TokenRaderIndex = $null
 
@@ -1278,18 +1278,20 @@ function Get-TokenRaderIndexerTempDir {
     return $dir
 }
 
-function Get-TokenRaderIndexerMetaPath {
-    return Join-Path (Get-TokenRaderIndexerTempDir) 'metadata.json'
+function Get-TokenRaderIndexerDbPath {
+    return Join-Path (Get-TokenRaderIndexerTempDir) 'index.db'
 }
 
 <#
 .SYNOPSIS
-    加载 C# Indexer DLL 并返回是否成功。
+    加载 C# 和 SQLite DLL，返回是否成功。
 #>
 function Initialize-TokenRaderIndexer {
     $dllPath = Get-TokenRaderIndexerPath
-    if (-not (Test-Path -LiteralPath $dllPath)) { return $false }
+    $sqlitePath = Join-Path $PSScriptRoot 'indexer\System.Data.SQLite.dll'
+    if (-not (Test-Path -LiteralPath $dllPath) -or -not (Test-Path -LiteralPath $sqlitePath)) { return $false }
     try {
+        Add-Type -Path $sqlitePath -ErrorAction Stop
         Add-Type -Path $dllPath -ErrorAction Stop
         return $true
     } catch { return $false }
@@ -1297,11 +1299,11 @@ function Initialize-TokenRaderIndexer {
 
 <#
 .SYNOPSIS
-    构建索引：扫描所有 JSONL 文件，用 C# 解析后返回 TokenRecord 列表和文件元数据。
+    构建索引：扫描所有 JSONL 文件，导入 SQLite 磁盘数据库。
 .PARAMETER SessionsRoot
     Codex 会话日志根目录。
 .PARAMETER Force
-    强制重建（忽略缓存的元数据）。
+    强制重建（删除已有数据库）。
 #>
 function Build-TokenRaderIndex {
     param(
@@ -1314,24 +1316,16 @@ function Build-TokenRaderIndex {
         return $null
     }
 
-    $index = [pscustomobject]@{
-        Records = New-Object System.Collections.ArrayList
-        FileMeta = @{}
-        SessionsRoot = $SessionsRoot
-        LastSync = [DateTimeOffset]::Now
+    $dbPath = Get-TokenRaderIndexerDbPath
+    if ($Force -and (Test-Path -LiteralPath $dbPath)) {
+        try { Remove-Item -LiteralPath $dbPath -Force } catch { }
     }
 
-    $metaPath = Get-TokenRaderIndexerMetaPath
-    $existingMeta = @{}
-    if (-not $Force -and (Test-Path -LiteralPath $metaPath)) {
-        try {
-            $loaded = [TokenRaderIndexer]::LoadFileMeta($metaPath)
-            foreach ($kv in $loaded.GetEnumerator()) { $existingMeta[$kv.Key] = $kv.Value }
-        } catch { }
-    }
+    $conn = New-Object System.Data.SQLite.SQLiteConnection ('Data Source=' + $dbPath + ';Version=3;')
+    $conn.Open()
+    [TokenRaderIndexer]::CreateSchema($conn)
 
     $sessionFiles = @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
-    $currentMeta = @{}
     $totalFiles = 0
     $totalRecords = 0
 
@@ -1341,75 +1335,59 @@ function Build-TokenRaderIndex {
         $length = [Int64]$file.Length
         $lastWrite = $file.LastWriteTimeUtc.Ticks
 
-        $known = $null
+        # 检查是否已有记录
+        $knownMeta = $null
+        $metaTable = [TokenRaderIndexer]::GetFileMetadata($conn)
+        foreach ($row in $metaTable.Rows) {
+            if ([string]$row['path'] -eq $canonical) { $knownMeta = $row; break }
+        }
+
         $isChanged = $true
-        if ($existingMeta.ContainsKey($canonical)) {
-            $known = $existingMeta[$canonical]
-            if ($known.Length -eq $length -and $known.LastWriteTicks -eq $lastWrite) {
+        $startOffset = 0
+        if ($null -ne $knownMeta) {
+            if ([Int64]$knownMeta['length'] -eq $length -and [Int64]$knownMeta['last_write_ticks'] -eq $lastWrite) {
                 $isChanged = $false
-                # 文件未变，重用已解析的记录（但需要重新解析？不——我们只保留当前会话的记录）
-                # 实际上，如果没有持久化记录，我们必须重新解析。
-                # 这里我们只记录元数据，记录在后续的同步中重新解析。
-                $isChanged = $true
+            } else {
+                $startOffset = [Int64]$knownMeta['parsed_offset']
             }
         }
 
         if ($isChanged) {
             $totalFiles++
-            $records = $null
-            $newOffset = 0
+            $n = 0
             try {
-                [TokenRaderIndexer]::ParseFile($path, 0, $canonical, [ref]$records, [ref]$newOffset)
-                if ($null -ne $records -and $records.Count -gt 0) {
-                    foreach ($rec in $records) { [void]$index.Records.Add($rec) }
-                    $totalRecords += $records.Count
-                }
-            } catch {
-                # 跳过无法解析的文件
-                continue
-            }
+                $n = [TokenRaderIndexer]::ImportFile($conn, $path, $startOffset)
+                $totalRecords += $n
+            } catch { continue }
         }
 
-        $currentMeta[$canonical] = [pscustomobject]@{
-            Path = $canonical
-            Length = $length
-            LastWriteTicks = $lastWrite
-            ParsedOffset = $newOffset
-        }
+        [TokenRaderIndexer]::UpdateFileMetadata($conn, $canonical, $length, $lastWrite, $startOffset)
     }
 
-    $index.FileMeta = $currentMeta
-
-    # 保存元数据（用于增量同步，但关闭时删除）
-    try {
-        $metaList = foreach ($kv in $currentMeta.GetEnumerator()) {
-            $m = $kv.Value
-            @{ path = $m.Path; length = $m.Length; last_write_ticks = $m.LastWriteTicks; parsed_offset = $m.ParsedOffset }
-        }
-        $metaDir = Split-Path $metaPath -Parent
-        if (-not (Test-Path -LiteralPath $metaDir)) { New-Item -ItemType Directory -Path $metaDir -Force | Out-Null }
-        @($metaList) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $metaPath -Encoding UTF8
-    } catch { }
-
-    $script:TokenRaderIndex = $index
-    Write-Output ('TokenRaderIndex: {0} 个文件，{1} 条记录，{2} 秒' -f $totalFiles, $totalRecords, [Math]::Round(([DateTimeOffset]::Now - $index.LastSync).TotalSeconds, 1))
-    return $index
+    $script:TokenRaderIndex = [pscustomobject]@{
+        DbPath = $dbPath
+        Connection = $conn
+        SessionsRoot = $SessionsRoot
+        LastSync = [DateTimeOffset]::Now
+    }
+    Write-Output ('TokenRaderIndex: {0} 个文件，{1} 条记录，{2} 秒' -f $totalFiles, $totalRecords, [Math]::Round(([DateTimeOffset]::Now - $script:TokenRaderIndex.LastSync).TotalSeconds, 1))
+    return $script:TokenRaderIndex
 }
 
 <#
 .SYNOPSIS
-    增量同步：检查文件变化，只解析新增/变更部分，更新索引。
+    增量同步：检查文件变化，只解析新增/变更部分。
 #>
 function Sync-TokenRaderIndex {
     param([Parameter(Mandatory = $true)][string]$SessionsRoot)
 
     $index = $script:TokenRaderIndex
-    if ($null -eq $index) {
+    if ($null -eq $index -or $null -eq $index.Connection) {
         return Build-TokenRaderIndex -SessionsRoot $SessionsRoot
     }
 
+    $conn = $index.Connection
     $sessionFiles = @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
-    $existingMeta = $index.FileMeta
     $added = 0
 
     foreach ($file in $sessionFiles) {
@@ -1418,65 +1396,53 @@ function Sync-TokenRaderIndex {
         $length = [Int64]$file.Length
         $lastWrite = $file.LastWriteTimeUtc.Ticks
 
-        $known = $null
-        $isNew = $false
-        if ($existingMeta.ContainsKey($canonical)) {
-            $known = $existingMeta[$canonical]
-            if ($known.Length -eq $length -and $known.LastWriteTicks -eq $lastWrite) {
-                continue  # 无变化
-            }
-        } else {
-            $isNew = $true
+        $knownMeta = $null
+        $metaTable = [TokenRaderIndexer]::GetFileMetadata($conn)
+        foreach ($row in $metaTable.Rows) {
+            if ([string]$row['path'] -eq $canonical) { $knownMeta = $row; break }
         }
 
-        $startOffset = if ($isNew) { 0 } else { [Int64]$known.ParsedOffset }
-        $records = $null
-        $newOffset = 0
-        try {
-            [TokenRaderIndexer]::ParseFile($path, $startOffset, $canonical, [ref]$records, [ref]$newOffset)
-            if ($null -ne $records -and $records.Count -gt 0) {
-                foreach ($rec in $records) { [void]$index.Records.Add($rec) }
-                $added += $records.Count
+        $isChanged = $true
+        $startOffset = 0
+        if ($null -ne $knownMeta) {
+            if ([Int64]$knownMeta['length'] -eq $length -and [Int64]$knownMeta['last_write_ticks'] -eq $lastWrite) {
+                $isChanged = $false
+            } else {
+                $startOffset = [Int64]$knownMeta['parsed_offset']
             }
-        } catch { continue }
-
-        $existingMeta[$canonical] = [pscustomobject]@{
-            Path = $canonical
-            Length = $length
-            LastWriteTicks = $lastWrite
-            ParsedOffset = $newOffset
         }
+
+        if ($isChanged) {
+            try {
+                $n = [TokenRaderIndexer]::ImportFile($conn, $path, $startOffset)
+                $added += $n
+            } catch { continue }
+        }
+
+        $newParsedOffset = if ($isChanged) { (Get-Item -LiteralPath $path).Length } else { $startOffset }
+        [TokenRaderIndexer]::UpdateFileMetadata($conn, $canonical, $length, $lastWrite, $newParsedOffset)
     }
 
     $index.LastSync = [DateTimeOffset]::Now
-
-    # 更新元数据文件
-    $metaPath = Get-TokenRaderIndexerMetaPath
-    try {
-        $metaList = foreach ($kv in $existingMeta.GetEnumerator()) {
-            $m = $kv.Value
-            @{ path = $m.Path; length = $m.Length; last_write_ticks = $m.LastWriteTicks; parsed_offset = $m.ParsedOffset }
-        }
-        $metaDir = Split-Path $metaPath -Parent
-        if (-not (Test-Path -LiteralPath $metaDir)) { New-Item -ItemType Directory -Path $metaDir -Force | Out-Null }
-        @($metaList) | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $metaPath -Encoding UTF8
-    } catch { }
-
     Write-Output ('Sync-TokenRaderIndex: 新增 {0} 条记录' -f $added)
     return $index
 }
 
 <#
 .SYNOPSIS
-    清理索引及临时文件。
+    清理索引：关闭数据库连接，删除临时文件。
 #>
 function Clear-TokenRaderIndex {
-    $script:TokenRaderIndex = $null
-    [GC]::Collect()
-    $metaPath = Get-TokenRaderIndexerMetaPath
-    if (Test-Path -LiteralPath $metaPath) {
-        try { Remove-Item -LiteralPath $metaPath -Force } catch { }
+    $index = $script:TokenRaderIndex
+    if ($null -ne $index -and $null -ne $index.Connection) {
+        try { $index.Connection.Close(); $index.Connection.Dispose() } catch { }
     }
+    $script:TokenRaderIndex = $null
+    $dbPath = Get-TokenRaderIndexerDbPath
+    if (Test-Path -LiteralPath $dbPath) {
+        try { Remove-Item -LiteralPath $dbPath -Force } catch { }
+    }
+    [GC]::Collect()
 }
 
 function Get-TokenRaderIndex {
@@ -1485,7 +1451,7 @@ function Get-TokenRaderIndex {
 
 <#
 .SYNOPSIS
-    从索引中获取指定会话的 token 记录。
+    从 SQLite 索引中查询 token 记录，返回 DataTable。
 #>
 function Get-TokenRaderIndexRecords {
     param(
@@ -1495,72 +1461,73 @@ function Get-TokenRaderIndexRecords {
     )
 
     $index = $script:TokenRaderIndex
-    if ($null -eq $index) { return @() }
+    if ($null -eq $index -or $null -eq $index.Connection) { return $null }
 
-    $records = $index.Records
-
+    $conn = $index.Connection
     if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
-        $records = @($records | Where-Object { $_.SessionId -eq $SessionId })
+        return [TokenRaderIndexer]::QuerySessionSnapshot($conn, $SessionId)
     }
-    if (-not [string]::IsNullOrWhiteSpace($StartTimestamp)) {
-        $records = @($records | Where-Object { $_.Timestamp -ge $StartTimestamp })
+    if (-not [string]::IsNullOrWhiteSpace($StartTimestamp) -or -not [string]::IsNullOrWhiteSpace($EndTimestamp)) {
+        $start = if ([string]::IsNullOrWhiteSpace($StartTimestamp)) { '0000-01-01' } else { $StartTimestamp }
+        $end = if ([string]::IsNullOrWhiteSpace($EndTimestamp)) { '9999-12-31' } else { $EndTimestamp }
+        return [TokenRaderIndexer]::QueryTimeRange($conn, $start, $end)
     }
-    if (-not [string]::IsNullOrWhiteSpace($EndTimestamp)) {
-        $records = @($records | Where-Object { $_.Timestamp -le $EndTimestamp })
-    }
-
-    return $records
+    return $null
 }
 
 <#
 .SYNOPSIS
-    将 C# TokenRecord 对象转换为 UI 可用的 pscustomobject 格式。
+    将 SQLite 查询结果行（DataRow）转换为 UI 可用的 pscustomobject 格式。
+.PARAMETER Row
+    DataRow，来自 Get-TokenRaderIndexRecords 返回的 DataTable。
 #>
 function ConvertFrom-TokenRaderIndexRecord {
     param(
-        [Parameter(Mandatory = $true)]$Record,
+        [Parameter(Mandatory = $true)]$Row,
         [string]$FilePath = ''
     )
 
-    $totalInput = [Int64]$Record.TotalInput
-    $totalCached = [Int64]$Record.TotalCached
-    $totalOutput = [Int64]$Record.TotalOutput
+    $totalInput = [Int64]$Row['total_input']
+    $totalCached = [Int64]$Row['total_cached']
+    $totalOutput = [Int64]$Row['total_output']
     $totalUncached = $totalInput - $totalCached
     $totalTotal = $totalInput + $totalOutput
     $totalHitRate = if ($totalInput -gt 0) { ($totalCached * 100.0) / $totalInput } else { 0.0 }
 
-    $callInput = [Int64]$Record.CallInput
-    $callCached = [Int64]$Record.CallCached
-    $callOutput = [Int64]$Record.CallOutput
+    $callInput = [Int64]$Row['call_input']
+    $callCached = [Int64]$Row['call_cached']
+    $callOutput = [Int64]$Row['call_output']
     $callUncached = $callInput - $callCached
     $callTotal = $callInput + $callOutput
     $callHitRate = if ($callInput -gt 0) { ($callCached * 100.0) / $callInput } else { 0.0 }
 
     $timestamp = [DateTimeOffset]::Now
-    try { $timestamp = [DateTimeOffset]::Parse([string]$Record.Timestamp).ToLocalTime() } catch { }
+    try { $timestamp = [DateTimeOffset]::Parse([string]$Row['timestamp']).ToLocalTime() } catch { }
 
     $fiveHour = $null
     $weekly = $null
-    if ($null -ne $Record.FiveHourUsed) {
+    $fhUsed = $Row['five_hour_used']
+    if ($null -ne $fhUsed -and -not [DBNull]::Value.Equals($fhUsed)) {
         $fiveHour = [pscustomobject]@{
-            UsedPercent = [double]$Record.FiveHourUsed
-            RemainingPercent = 100.0 - [double]$Record.FiveHourUsed
-            WindowMinutes = [int]$Record.FiveHourWindow
-            ResetsAt = if ($null -ne $Record.FiveHourResets) { [DateTimeOffset]::FromUnixTimeSeconds([Int64]$Record.FiveHourResets).ToLocalTime() } else { $null }
+            UsedPercent = [double]$fhUsed
+            RemainingPercent = 100.0 - [double]$fhUsed
+            WindowMinutes = [int]$Row['five_hour_window']
+            ResetsAt = if ($null -ne $Row['five_hour_resets'] -and -not [DBNull]::Value.Equals($Row['five_hour_resets'])) { [DateTimeOffset]::FromUnixTimeSeconds([Int64]$Row['five_hour_resets']).ToLocalTime() } else { $null }
         }
     }
-    if ($null -ne $Record.WeeklyUsed) {
+    $wkUsed = $Row['weekly_used']
+    if ($null -ne $wkUsed -and -not [DBNull]::Value.Equals($wkUsed)) {
         $weekly = [pscustomobject]@{
-            UsedPercent = [double]$Record.WeeklyUsed
-            RemainingPercent = 100.0 - [double]$Record.WeeklyUsed
-            WindowMinutes = [int]$Record.WeeklyWindow
-            ResetsAt = if ($null -ne $Record.WeeklyResets) { [DateTimeOffset]::FromUnixTimeSeconds([Int64]$Record.WeeklyResets).ToLocalTime() } else { $null }
+            UsedPercent = [double]$wkUsed
+            RemainingPercent = 100.0 - [double]$wkUsed
+            WindowMinutes = [int]$Row['weekly_window']
+            ResetsAt = if ($null -ne $Row['weekly_resets'] -and -not [DBNull]::Value.Equals($Row['weekly_resets'])) { [DateTimeOffset]::FromUnixTimeSeconds([Int64]$Row['weekly_resets']).ToLocalTime() } else { $null }
         }
     }
 
     $rateLimits = [pscustomobject]@{
         ObservedAt = $timestamp
-        PlanType = [string]$Record.PlanType
+        PlanType = [string]$Row['plan_type']
         FiveHour = $fiveHour
         Weekly = $weekly
     }
@@ -1568,15 +1535,15 @@ function ConvertFrom-TokenRaderIndexRecord {
     [pscustomobject]@{
         FilePath = $FilePath
         Timestamp = $timestamp
-        Model = [string]$Record.Model
-        PlanType = [string]$Record.PlanType
+        Model = [string]$Row['model']
+        PlanType = [string]$Row['plan_type']
         RateLimits = $rateLimits
         Task = [pscustomobject]@{
             Input = $totalInput
             Cached = $totalCached
             Uncached = $totalUncached
             Output = $totalOutput
-            ReasoningOutput = [Int64]$Record.TotalReasoning
+            ReasoningOutput = [Int64]$Row['total_reasoning']
             Total = $totalTotal
             CacheHitRate = $totalHitRate
         }
@@ -1585,7 +1552,7 @@ function ConvertFrom-TokenRaderIndexRecord {
             Cached = $callCached
             Uncached = $callUncached
             Output = $callOutput
-            ReasoningOutput = [Int64]$Record.CallReasoning
+            ReasoningOutput = [Int64]$Row['call_reasoning']
             Total = $callTotal
             CacheHitRate = $callHitRate
         }

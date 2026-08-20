@@ -21,6 +21,7 @@ Write-Output "Built $launcherOutput"
 # Build the JSONL indexer library (used by TokenRader.Core.psm1)
 $indexerSource = Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.cs'
 $indexerOutput = Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.dll'
-& $compiler /nologo /target:library /reference:System.Web.Extensions.dll /optimize+ /out:$indexerOutput $indexerSource
+$sqliteRef = Join-Path $PSScriptRoot 'indexer\System.Data.SQLite.dll'
+& $compiler /nologo /target:library /reference:System.Web.Extensions.dll /reference:$sqliteRef /optimize+ /out:$indexerOutput $indexerSource
 if ($LASTEXITCODE -ne 0) { throw "Indexer build failed with exit code $LASTEXITCODE" }
 Write-Output "Built $indexerOutput"
