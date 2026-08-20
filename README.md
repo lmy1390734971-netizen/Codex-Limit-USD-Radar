@@ -29,6 +29,7 @@ Token Rader 在本机解析这些日志，不要求 API Key，也不会上传提
 - 显示 5 小时和周额度百分比、重置时间及可校准的美元等价额度。
 - 每 5 分钟自动刷新，并保留“立即刷新”和“查看结果”。
 - 时间段统计在后台线程计算，日志解析不会卡住界面；日志无新增时重复“查看结果”直接使用缓存结果。
+- 内置 C# + SQLite 索引引擎，首次启动把日志记录导入临时 SQLite 索引，会话/项目查看毫秒级响应。
 - 所有计算在本机完成，不修改 Codex 日志。
 
 ## 软件和硬件环境
@@ -346,6 +347,9 @@ Codex-Limit-USD-Radar/
 ├─ .github/workflows/test.yml       # Windows CI
 ├─ artifacts/
 │  └─ token-rader-preview.png       # 合成数据界面预览
+├─ indexer/
+│  ├─ TokenRader.Indexer.cs         # C# JSONL→SQLite 索引引擎源码
+│  └─ System.Data.SQLite.dll        # SQLite 提供程序（构建依赖）
 ├─ launcher/
 │  └─ TokenRader.Launcher.cs        # 无控制台启动器源码
 ├─ tests/
@@ -380,7 +384,7 @@ Codex-Limit-USD-Radar/
 - 所有解析和计算都在本机完成；运行时没有网络请求代码。
 - 不读取 `~/.codex/auth.json`，不接触 API Key 或访问令牌。
 - 不保存、不显示、不上传提示词、回复正文或工具输出。
-- 不创建自己的历史数据库或持久缓存。
+- 会在 `%TEMP%\TokenRader\` 下创建**临时 SQLite 索引**（仅存 token 数值与模型名，不含提示词/回复），程序关闭时自动删除，不保留持久数据库。
 - 不修改、删除或重写任何 Codex 日志。
 - 仓库通过 `.gitignore` 排除环境文件、凭据、IDE 配置、日志、临时输出和私有数据目录。
 
