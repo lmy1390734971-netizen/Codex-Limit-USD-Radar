@@ -833,20 +833,28 @@ function Refresh-Application {
         $script:ProjectComboBox.ItemsSource = $projects
 
         $projectIndex = 0
-        $preferredProjectPath = if (-not [string]::IsNullOrWhiteSpace($previousProjectPath)) { $previousProjectPath } else { $PSScriptRoot }
-        for ($i = 0; $i -lt $projects.Count; $i++) {
-            if ([string]$projects[$i].ProjectPath -eq $preferredProjectPath) { $projectIndex = $i; break }
+        if (-not [string]::IsNullOrWhiteSpace($previousProjectPath)) {
+            $preferredProjectPath = $previousProjectPath
+            for ($i = 0; $i -lt $projects.Count; $i++) {
+                if ([string]$projects[$i].ProjectPath -eq $preferredProjectPath) { $projectIndex = $i; break }
+            }
+            if ($projects.Count -gt 0) { $script:ProjectComboBox.SelectedIndex = $projectIndex }
+        } elseif ($projects.Count -gt 0) {
+            # 首次打开：不自动选中项目，保持闲置（用户操作后才计算）
+            $script:ProjectComboBox.SelectedIndex = -1
         }
-        if ($projects.Count -gt 0) { $script:ProjectComboBox.SelectedIndex = $projectIndex }
 
-        $targetIndex = 0
         if (-not [string]::IsNullOrWhiteSpace($previousPath)) {
+            $targetIndex = 0
             for ($i = 0; $i -lt $sessions.Count; $i++) {
                 if ([string]$sessions[$i].FilePath -eq $previousPath) { $targetIndex = $i; break }
             }
-        }
-        if ($sessions.Count -gt 0) {
-            $script:SessionListBox.SelectedIndex = $targetIndex
+            if ($sessions.Count -gt 0) { $script:SessionListBox.SelectedIndex = $targetIndex }
+        } elseif ($sessions.Count -gt 0) {
+            # 首次打开：不自动选中会话，等待用户点击（不对任何会话计算）
+            $script:SelectedSessionText.Text = '请选择一个会话开始查看'
+            $script:UpdatedText.Text = '等待选择'
+            Set-EmptyMetrics
         } else {
             $script:SelectedSessionText.Text = '未找到 Codex 会话日志'
             $script:UpdatedText.Text = [string]$script:Paths.SessionsRoot
@@ -858,7 +866,17 @@ function Refresh-Application {
     Update-UsageView
 }
 
-$script:RefreshButton.Add_Click({ Refresh-Application })
+$script:RefreshButton.Add_Click({
+    Refresh-Application
+    # 用户显式刷新：按需构建或增量同步 SQLite 索引（打开时默认不构建）
+    try {
+        if ($null -eq (Get-TokenRaderIndex)) {
+            New-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
+        } else {
+            Update-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
+        }
+    } catch { }
+})
 $script:SessionListBox.Add_SelectionChanged({
     if (-not $script:State.Refreshing -and -not [bool]$script:State.IsMeasuring) {
         $script:State.ViewMode = 'session'
@@ -912,8 +930,10 @@ $script:Timer.Add_Tick({
         Update-IntervalView
     } else {
         Refresh-Application
-        # 后台同步索引（如果 Indexer DLL 可用）
-        try { Update-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null } catch { }
+        # 增量同步索引（仅在索引已存在时；缺失时保持闲置，由“立即刷新”按钮按需构建）
+        if ($null -ne (Get-TokenRaderIndex)) {
+            try { Update-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null } catch { }
+        }
     }
 })
 $script:Window.Add_Closing({
@@ -925,12 +945,6 @@ $script:Window.Add_Closing({
 
 Set-PricingTable
 Refresh-Application
-# 构建 SQLite 索引（首次启动一次性导入，后续增量同步）
-try {
-    $indexerPath = Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.dll'
-    if (Test-Path -LiteralPath $indexerPath) {
-        New-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
-    }
-} catch { }
+# 默认打开不对任何会话/项目进行计算；SQLite 索引由“立即刷新”按钮按需构建。
 $script:Timer.Start()
 [void]$script:Window.ShowDialog()
