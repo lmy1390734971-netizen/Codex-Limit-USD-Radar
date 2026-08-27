@@ -312,15 +312,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Render-Prev
 
 ## 官方价格与计价边界
 
-`pricing.json` 保存标准 API 处理价格，最近核对日期为 **2026-08-02**：
+`pricing.json` 保存标准 API 处理价格，最近核对日期为 **2026-08-28**：
 
 | 模型 | 输入 | 缓存输入 | 输出 |
 |---|---:|---:|---:|
-| GPT-5.6 Sol | $5.00 | $0.50 | $30.00 |
+| GPT-5.6 Sol | $4.00 | $0.40 | $20.00 |
 | GPT-5.6 Terra | $2.00 | $0.20 | $12.00 |
 | GPT-5.6 Luna | $0.20 | $0.02 | $1.20 |
 
-单位均为每百万 token。完整模型表及来源 URL 见 `pricing.json`。
+单位均为每百万 token。GPT-5.6 Sol 当前为官方促销价，官方说明至少持续至 **2026-11-21**；到期后应重新核验，程序不会擅自恢复旧价。完整模型表及来源 URL 见 `pricing.json`。
 
 主要官方来源：
 
@@ -336,7 +336,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Render-Prev
 - [GPT-5-Codex](https://developers.openai.com/api/docs/models/gpt-5-codex)
 - [GPT-5](https://developers.openai.com/api/docs/models/gpt-5)
 
-金额是标准 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单。估算不包含工具调用费、区域处理加价、Priority/Batch/Flex 差异，以及日志无法区分的 GPT-5.6 API 缓存写入加价。
+金额是标准 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单。估算不包含工具调用费、区域处理加价和 Priority/Batch/Flex 差异。GPT-5.6 缓存写入按未缓存输入价格的 1.25 倍计费，但 Codex JSONL 无法区分缓存写入 token，因此本地估算不含该项。
 
 ## 项目目录结构
 

@@ -755,7 +755,7 @@ function Update-UsageView {
         $longCalls = @($taskResult.Items | Where-Object { $_.LongContext })
         $script:LongContextText.Text = if ($longCalls.Count -gt 0) { ('逐调用长上下文加价：{0} 组' -f $longCalls.Count) } else { '逐调用标准上下文费率' }
         $script:FormulaText.Text = '整次任务按每次调用的实际模型分别计价，再汇总未缓存输入、缓存输入和输出金额。'
-        $script:CaveatText.Text = '整次任务已逐调用识别模型和 272K 长上下文；金额仍是标准 API 等价估算，不含工具调用、区域处理、Priority/Batch/Flex 或 GPT-5.6 缓存写入附加价。账号切换前的历史日志仍无法仅凭日志可靠归属。'
+        $script:CaveatText.Text = '整次任务已逐调用识别模型和 272K 长上下文；金额仍是标准 API 等价估算，不含工具调用、区域处理或 Priority/Batch/Flex。GPT-5.6 缓存写入按未缓存输入价的 1.25 倍计费，但日志无法区分写入量，因此未计入。账号切换前的历史日志仍无法仅凭日志可靠归属。'
         $script:StatusText.Text = ('已读取 {0:N0} 次唯一调用 · {1} · 本地处理完成' -f $taskResult.CountedEvents, $scopeLabel)
         Update-QuotaCards
         return
@@ -794,7 +794,7 @@ function Update-UsageView {
         $script:FormulaText.Text = '费用 = 未缓存输入 × 输入价 + 缓存输入 × 缓存价 + 输出 × 输出价；输入计数本身已包含缓存输入。'
     }
 
-    $script:CaveatText.Text = '最后一次调用使用 last_token_usage；若该次输入超过模型公布的 272K 阈值，会应用官方长上下文倍率。估算不包含工具调用、区域处理、Priority/Batch/Flex 或 GPT-5.6 缓存写入附加价。'
+    $script:CaveatText.Text = '最后一次调用使用 last_token_usage；若该次输入超过模型公布的 272K 阈值，会应用官方长上下文倍率。估算不包含工具调用、区域处理或 Priority/Batch/Flex。GPT-5.6 缓存写入按未缓存输入价的 1.25 倍计费，但日志无法区分写入量，因此未计入。'
     $script:StatusText.Text = ('已读取 {0} · {1} · 本地处理完成' -f $model, $scopeLabel)
     Update-QuotaCards
 }

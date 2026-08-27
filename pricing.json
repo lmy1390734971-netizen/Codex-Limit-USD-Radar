@@ -1,16 +1,18 @@
 {
   "currency": "USD",
   "unitTokens": 1000000,
-  "verifiedAt": "2026-08-02",
+  "verifiedAt": "2026-08-28",
   "priceType": "OpenAI API Standard processing",
   "models": [
     {
       "id": "gpt-5.6-sol",
       "displayName": "GPT-5.6 Sol",
       "aliases": ["gpt-5.6"],
-      "input": 5.00,
-      "cachedInput": 0.50,
-      "output": 30.00,
+      "input": 4.00,
+      "cachedInput": 0.40,
+      "output": 20.00,
+      "pricingStatus": "Promotional",
+      "promotionalPriceValidThroughAtLeast": "2026-11-21",
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,

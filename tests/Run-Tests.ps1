@@ -111,17 +111,19 @@ try {
     $taskCost = Get-TokenRaderCost -Usage $snapshot.Task -Model $snapshot.Model -PricingDocument $prices -Scope task
     Assert-Equal $true $taskCost.Known 'known official price'
     Assert-Equal $false $taskCost.LongContextApplied 'task aggregate does not infer long context'
-    Assert-Near 1.21 $taskCost.TotalCost 0.0000001 'task API equivalent cost'
+    Assert-Near 0.908 $taskCost.TotalCost 0.0000001 'task API equivalent cost'
 
     $callCost = Get-TokenRaderCost -Usage $snapshot.Call -Model $snapshot.Model -PricingDocument $prices -Scope call
     Assert-Equal $true $callCost.LongContextApplied 'call long-context rule'
-    Assert-Near 1.65 $callCost.TotalCost 0.0000001 'call cost with long-context multipliers'
+    Assert-Near 1.26 $callCost.TotalCost 0.0000001 'call cost with long-context multipliers'
 
     $snapshotPrice = Resolve-TokenRaderPrice -Model 'gpt-5.4-mini-2026-03-17' -PricingDocument $prices
     Assert-Equal 'gpt-5.4-mini' $snapshotPrice.id 'snapshot model price resolution'
     $aliasPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6' -PricingDocument $prices
     Assert-Equal 'gpt-5.6-sol' $aliasPrice.id 'model alias price resolution'
-    Assert-Equal '2026-08-02' ([string]$prices.verifiedAt) 'pricing verification date'
+    Assert-Equal '2026-08-28' ([string]$prices.verifiedAt) 'pricing verification date'
+    Assert-Equal 'Promotional' ([string]$aliasPrice.pricingStatus) 'Sol promotional price status'
+    Assert-Equal '2026-11-21' ([string]$aliasPrice.promotionalPriceValidThroughAtLeast) 'Sol promotional price minimum validity'
     $terraPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6-terra' -PricingDocument $prices
     Assert-Near 2.0 $terraPrice.input 0.0000001 'Terra official input price'
     Assert-Near 0.2 $terraPrice.cachedInput 0.0000001 'Terra official cached input price'
@@ -133,7 +135,7 @@ try {
     $customUnitPrices = [pscustomobject]@{ unitTokens = 1000; models = @($prices.models) }
     $customUnitUsage = [pscustomobject]@{ Input = 1000; Uncached = 1000; Cached = 0; Output = 0 }
     $customUnitCost = Get-TokenRaderCost -Usage $customUnitUsage -Model 'gpt-5.6-sol' -PricingDocument $customUnitPrices
-    Assert-Near 5.0 $customUnitCost.TotalCost 0.0000001 'pricing document unitTokens is honored'
+    Assert-Near 4.0 $customUnitCost.TotalCost 0.0000001 'pricing document unitTokens is honored'
     $unknownCost = Get-TokenRaderCost -Usage $snapshot.Task -Model 'private-model-without-price' -PricingDocument $prices
     Assert-Equal $false $unknownCost.Known 'unknown models are not treated as free'
 
@@ -214,13 +216,13 @@ try {
     Assert-Equal 3500 $intervalResult.Usage.Total 'interval total delta across sessions'
     Assert-Near 50.0 $intervalResult.Usage.CacheHitRate 0.0001 'interval cache hit rate'
     Assert-Equal 2 $intervalResult.ChangedSessions 'interval changed session count'
-    Assert-Near 0.02325 $intervalResult.TotalCost 0.0000001 'interval multi-session API cost'
+    Assert-Near 0.0166 $intervalResult.TotalCost 0.0000001 'interval multi-session API cost'
     Assert-Equal $true $intervalResult.CostComplete 'interval cost completeness'
     Assert-Near 12.0 $intervalResult.RateLimits.FiveHour.UsedPercent 0.0001 'interval ending five-hour usage'
     Assert-Near 21.0 $intervalResult.RateLimits.Weekly.UsedPercent 0.0001 'interval ending weekly usage'
     $quotaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $measurementBaseline.RateLimits -EndRateLimits $intervalResult.RateLimits -IntervalCost $intervalResult.TotalCost -CostComplete $intervalResult.CostComplete
-    Assert-Near 1.1625 $quotaEstimate.FiveHour.TotalUsd 0.0000001 'five-hour inferred USD quota'
-    Assert-Near 2.325 $quotaEstimate.Weekly.TotalUsd 0.0000001 'weekly inferred USD quota'
+    Assert-Near 0.83 $quotaEstimate.FiveHour.TotalUsd 0.0000001 'five-hour inferred USD quota'
+    Assert-Near 1.66 $quotaEstimate.Weekly.TotalUsd 0.0000001 'weekly inferred USD quota'
 
     # A real Codex task tree copies parent token_count history into sibling subagent
     # logs. Only exact copies within the same root task may be deduplicated; an
@@ -273,7 +275,7 @@ try {
     Assert-Equal 2 $dedupeResult.InheritedEventsDropped 'pre-baseline inherited events dropped in children'
     Assert-Equal 4 $dedupeResult.ChangedSessions 'active files retained after deduplication'
     Assert-Equal 3 @($dedupeResult.Models).Count 'per-call model attribution across task tree'
-    Assert-Near 0.0208 $dedupeResult.TotalCost 0.0000001 'deduplicated per-model API cost'
+    Assert-Near 0.0198 $dedupeResult.TotalCost 0.0000001 'deduplicated per-model API cost'
     $childMetadata = Get-TokenRaderSessionMetadata -FilePath $childPath
     Assert-Equal $parentId $childMetadata.ParentThreadId 'child metadata exposes parent task id'
     Assert-Equal $parentId $childMetadata.ForkedFromId 'child metadata exposes fork source id'
@@ -289,7 +291,7 @@ try {
     Assert-Equal 4 $projectResult.CountedEvents 'project unique event count'
     Assert-Equal 4 $projectResult.DuplicateEventsDropped 'project duplicated inherited event count'
     Assert-Equal 2 @($projectResult.Models).Count 'project per-call models'
-    Assert-Near 0.0248 $projectResult.TotalCost 0.0000001 'project multi-model API cost'
+    Assert-Near 0.0238 $projectResult.TotalCost 0.0000001 'project multi-model API cost'
 
     # --- Runspace round-trip equivalence ---
     # The desktop UI runs interval computation in a background runspace; the
@@ -433,7 +435,7 @@ try {
     Assert-Equal 4500000 $largeResult.Usage.Uncached 'large fixture uncached'
     Assert-Equal 50000 $largeResult.Usage.Output 'large fixture output'
     Assert-Equal 5050000 $largeResult.Usage.Total 'large fixture total'
-    Assert-Near 24.25 $largeResult.TotalCost 0.0000001 'large fixture API cost'
+    Assert-Near 19.2 $largeResult.TotalCost 0.0000001 'large fixture API cost'
     Assert-Equal $true $largeResult.CostComplete 'large fixture cost completeness'
     Write-Output ('LARGE_OK events={0} ms={1}' -f $largeCount, $largeStopwatch.ElapsedMilliseconds)
 

@@ -48,6 +48,7 @@ obj/
 TestResults/
 *.db
 *.idx
+_v_*.txt
 
 # Build artifacts
 indexer/TokenRader.Indexer.dll
