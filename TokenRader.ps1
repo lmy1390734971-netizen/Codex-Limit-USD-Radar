@@ -29,6 +29,7 @@ $script:State = @{
     IntervalComputePendingRequest = $null
     IntervalCache = $null
     RateLimits = $null
+    RateLimitSnapshotCache = @{}
     QuotaEstimates = $null
     QuotaCalibrationMessage = '美元总额需通过一次使额度百分比上升的时间段测量进行反推。'
     Projects = @()
@@ -59,7 +60,7 @@ $script:IntervalComputeScript = {
     $result = Get-TokenRaderIntervalResult -Baseline $Baseline -PricingDocument $prices -BaselineSnapshots $Snapshots -EndOffsets $EndOffsets
     $latest = $null
     if ($ScanRateLimits) {
-        $latest = Get-TokenRaderLatestRateLimits -SessionsRoot $SessionsRoot
+        $latest = Get-TokenRaderLatestRateLimits -SessionsRoot $SessionsRoot -EndOffsets $EndOffsets
     }
     [pscustomobject]@{
         Result = $result
@@ -72,7 +73,7 @@ $reader = New-Object System.Xml.XmlNodeReader $xaml
 $script:Window = [Windows.Markup.XamlReader]::Load($reader)
 
 $controlNames = @(
-    'AutoRefreshCheckBox', 'RefreshButton', 'AccountNameText', 'PlanText', 'AccountIdText', 'AccountHintText',
+    'AutoRefreshCheckBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'AccountNameText', 'PlanText', 'AccountIdText', 'AccountHintText',
     'SessionCountText', 'OpenLogsButton', 'ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'SelectedSessionText', 'UpdatedText',
     'ScopeBadgeText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText',
     'TotalMetricText', 'HitRateMetricText', 'HitRateProgress', 'UsdCostText', 'CostBreakdownText',
@@ -102,6 +103,15 @@ function Get-SelectedScope {
         if ($tag -eq 'call' -or $tag -eq 'project') { return $tag }
     }
     return 'task'
+}
+
+function Get-SelectedHistoryDays {
+    $item = $script:HistoryRangeComboBox.SelectedItem
+    if ($null -ne $item -and $null -ne $item.Tag) {
+        $days = 0
+        if ([int]::TryParse([string]$item.Tag, [ref]$days) -and $days -ge 0) { return $days }
+    }
+    return 30
 }
 
 function Set-EmptyMetrics {
@@ -150,12 +160,25 @@ function Merge-LatestRateLimits {
         $script:State.RateLimits = $Candidate
         return
     }
-    $candidateIsNewer = $Candidate.ObservedAt -ge $current.ObservedAt
-    $fiveHour = if ($null -ne $Candidate.FiveHour -and ($candidateIsNewer -or $null -eq $current.FiveHour)) { $Candidate.FiveHour } else { $current.FiveHour }
-    $weekly = if ($null -ne $Candidate.Weekly -and ($candidateIsNewer -or $null -eq $current.Weekly)) { $Candidate.Weekly } else { $current.Weekly }
-    $planType = if (-not [string]::IsNullOrWhiteSpace([string]$Candidate.PlanType)) { [string]$Candidate.PlanType } else { [string]$current.PlanType }
+    $candidateFiveObserved = if ($null -ne $Candidate.FiveHour -and $null -ne $Candidate.FiveHour.PSObject.Properties['ObservedAt']) { [DateTimeOffset]$Candidate.FiveHour.ObservedAt } else { [DateTimeOffset]$Candidate.ObservedAt }
+    $currentFiveObserved = if ($null -ne $current.FiveHour -and $null -ne $current.FiveHour.PSObject.Properties['ObservedAt']) { [DateTimeOffset]$current.FiveHour.ObservedAt } else { [DateTimeOffset]$current.ObservedAt }
+    $candidateWeeklyObserved = if ($null -ne $Candidate.Weekly -and $null -ne $Candidate.Weekly.PSObject.Properties['ObservedAt']) { [DateTimeOffset]$Candidate.Weekly.ObservedAt } else { [DateTimeOffset]$Candidate.ObservedAt }
+    $currentWeeklyObserved = if ($null -ne $current.Weekly -and $null -ne $current.Weekly.PSObject.Properties['ObservedAt']) { [DateTimeOffset]$current.Weekly.ObservedAt } else { [DateTimeOffset]$current.ObservedAt }
+    $useCandidateFive = ($null -ne $Candidate.FiveHour -and ($null -eq $current.FiveHour -or $candidateFiveObserved -ge $currentFiveObserved))
+    $useCandidateWeekly = ($null -ne $Candidate.Weekly -and ($null -eq $current.Weekly -or $candidateWeeklyObserved -ge $currentWeeklyObserved))
+    $fiveHour = if ($useCandidateFive) { $Candidate.FiveHour } else { $current.FiveHour }
+    $weekly = if ($useCandidateWeekly) { $Candidate.Weekly } else { $current.Weekly }
+    $fiveObserved = if ($null -ne $fiveHour -and $null -ne $fiveHour.PSObject.Properties['ObservedAt']) { [DateTimeOffset]$fiveHour.ObservedAt } else { [DateTimeOffset]::MinValue }
+    $weeklyObserved = if ($null -ne $weekly -and $null -ne $weekly.PSObject.Properties['ObservedAt']) { [DateTimeOffset]$weekly.ObservedAt } else { [DateTimeOffset]::MinValue }
+    $fivePlanType = if ($null -ne $fiveHour -and $null -ne $fiveHour.PSObject.Properties['PlanType']) { [string]$fiveHour.PlanType } else { '' }
+    $weeklyPlanType = if ($null -ne $weekly -and $null -ne $weekly.PSObject.Properties['PlanType']) { [string]$weekly.PlanType } else { '' }
+    $planType = if ($fiveObserved -ge $weeklyObserved -and -not [string]::IsNullOrWhiteSpace($fivePlanType)) {
+        $fivePlanType
+    } elseif (-not [string]::IsNullOrWhiteSpace($weeklyPlanType)) {
+        $weeklyPlanType
+    } elseif (-not [string]::IsNullOrWhiteSpace([string]$Candidate.PlanType)) { [string]$Candidate.PlanType } else { [string]$current.PlanType }
     $script:State.RateLimits = [pscustomobject]@{
-        ObservedAt = if ($candidateIsNewer) { $Candidate.ObservedAt } else { $current.ObservedAt }
+        ObservedAt = if ($fiveObserved -gt $weeklyObserved) { $fiveObserved } else { $weeklyObserved }
         PlanType = $planType
         FiveHour = $fiveHour
         Weekly = $weekly
@@ -211,15 +234,22 @@ function Update-QuotaEstimatesFromInterval {
     )
 
     if ($null -eq $script:State.IntervalBaseline -or $null -eq $Result) { return }
+    $accountUnchanged = $true
+    if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['AccountIdentity']) {
+        $currentAccount = Get-TokenRaderAccount -CodexRoot $script:Paths.CodexRoot
+        $accountUnchanged = ([string]$script:State.IntervalBaseline.AccountIdentity -eq [string]$currentAccount.AccountId)
+    }
+    $startRateLimits = if ($null -ne $Result.PSObject.Properties['StartRateLimits']) { $Result.StartRateLimits } else { $script:State.IntervalBaseline.RateLimits }
+    $endRateLimits = if ($null -ne $Result.PSObject.Properties['EndRateLimits']) { $Result.EndRateLimits } else { $Result.RateLimits }
+    $pricingComplete = if ($null -ne $Result.PSObject.Properties['PricingComplete']) { [bool]$Result.PricingComplete } else { [bool]$Result.CostComplete }
     $newEstimates = Get-TokenRaderQuotaEstimate `
-        -StartRateLimits $script:State.IntervalBaseline.RateLimits `
-        -EndRateLimits $script:State.RateLimits `
+        -StartRateLimits $(if ($accountUnchanged) { $startRateLimits } else { $null }) `
+        -EndRateLimits $(if ($accountUnchanged) { $endRateLimits } else { $null }) `
         -IntervalCost ([double]$Result.TotalCost) `
-        -CostComplete ([bool]$Result.CostComplete)
-    $previousEstimates = $script:State.QuotaEstimates
+        -CostComplete $pricingComplete
     $script:State.QuotaEstimates = [pscustomobject]@{
-        FiveHour = if ($null -ne $newEstimates.FiveHour) { $newEstimates.FiveHour } elseif ($null -ne $previousEstimates) { $previousEstimates.FiveHour } else { $null }
-        Weekly = if ($null -ne $newEstimates.Weekly) { $newEstimates.Weekly } elseif ($null -ne $previousEstimates) { $previousEstimates.Weekly } else { $null }
+        FiveHour = $newEstimates.FiveHour
+        Weekly = $newEstimates.Weekly
     }
 
     $calibrated = @()
@@ -228,14 +258,14 @@ function Update-QuotaEstimatesFromInterval {
     $phase = if ($Final) { '最终' } else { '实时' }
     $script:State.QuotaCalibrationMessage = if ($calibrated.Count -gt 0) {
         ('{0}反推已同步：{1}。' -f $phase, ($calibrated -join '，'))
-    } elseif (-not [bool]$Result.CostComplete) {
+    } elseif (-not $accountUnchanged) {
+        '测量期间账号标签发生变化，本次不反推美金额度。'
+    } elseif (-not $pricingComplete) {
         '存在未收录价格的模型，暂时无法反推完整美金额度。'
     } elseif ([double]$Result.TotalCost -le 0) {
         '当前时间段尚无可计价消耗，点击“查看结果”会再次检查。'
-    } elseif ($null -ne $previousEstimates) {
-        '本次额度百分比尚未继续上升；继续显示最近一次反推结果。'
     } else {
-        '开始与当前额度百分比尚无增量；额度上升后点击“查看结果”即可同步反推。'
+        '开始与当前额度窗口不一致、缺少重置时间或百分比尚无增量，暂不显示反推结果。'
     }
     Update-QuotaCards
 }
@@ -397,7 +427,7 @@ function Start-TokenRaderIntervalComputeAsync {
         $script:State.IntervalComputing = $false
         try {
             $result = Get-TokenRaderIntervalResult -Baseline $Baseline -PricingDocument $script:Prices -BaselineSnapshots $snapshots -EndOffsets $EndOffsets
-            $latest = if ($ScanRateLimits) { Get-TokenRaderLatestRateLimits -SessionsRoot $script:Paths.SessionsRoot } else { $null }
+            $latest = if ($ScanRateLimits) { Get-TokenRaderLatestRateLimits -SessionsRoot $script:Paths.SessionsRoot -EndOffsets $EndOffsets } else { $null }
             Complete-TokenRaderIntervalCompute -BaselineStartedAt $baselineStartedAt -Payload ([pscustomobject]@{ Result = $result; LatestRateLimits = $latest }) -Final $Final
         } catch {
             $script:State.IntervalComputing = $false
@@ -422,10 +452,13 @@ function Complete-TokenRaderIntervalCompute {
         if ($null -eq $currentBaseline -or [DateTimeOffset]$currentBaseline.StartedAt -ne $BaselineStartedAt) {
             return  # result belongs to a previous measurement; discard it
         }
+        if (-not $Final -and -not [bool]$script:State.IsMeasuring) {
+            return  # a frozen final request superseded this live computation
+        }
         $result = $Payload.Result
         $script:State.IntervalResult = $result
         Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits
-        Merge-LatestRateLimits -Candidate $result.RateLimits
+        Merge-LatestRateLimits -Candidate $(if ($null -ne $result.PSObject.Properties['EndRateLimits']) { $result.EndRateLimits } else { $result.RateLimits })
         Update-QuotaEstimatesFromInterval -Result $result -Final $Final
         $script:State.IntervalCache = [pscustomobject]@{
             BaselineStartedAt = $BaselineStartedAt
@@ -571,10 +604,17 @@ function Update-ProjectView {
 function Start-IntervalMeasurement {
     if ([bool]$script:State.IsMeasuring) { return }
     $script:StatusText.Text = '正在记录开始位置…'
-    $script:State.IntervalBaseline = New-TokenRaderMeasurementBaseline -SessionsRoot $script:Paths.SessionsRoot
+    $measurementAccount = Get-TokenRaderAccount -CodexRoot $script:Paths.CodexRoot
+    $script:State.IntervalBaseline = New-TokenRaderMeasurementBaseline `
+        -SessionsRoot $script:Paths.SessionsRoot `
+        -RateLimitSnapshotCache $script:State.RateLimitSnapshotCache `
+        -AccountIdentity ([string]$measurementAccount.AccountId)
     Merge-LatestRateLimits -Candidate $script:State.IntervalBaseline.RateLimits
     $script:State.IntervalResult = $null
     $script:State.IntervalCache = $null
+    $script:State.QuotaEstimates = $null
+    $script:State.QuotaCalibrationMessage = '美元总额需通过一次使额度百分比上升的时间段测量进行反推。'
+    Update-QuotaCards
     $script:State.IsMeasuring = $true
     $script:State.ViewMode = 'interval'
     $script:StartMeasureButton.IsEnabled = $false
@@ -583,6 +623,9 @@ function Start-IntervalMeasurement {
     $script:SessionListBox.IsEnabled = $false
     $script:ProjectComboBox.IsEnabled = $false
     $script:ScopeComboBox.IsEnabled = $false
+    $script:HistoryRangeComboBox.IsEnabled = $false
+    $script:RebuildIndexButton.IsEnabled = $false
+    $script:PurgeOldIndexButton.IsEnabled = $false
     $script:IntervalStatusText.Text = '计算中'
     $script:IntervalStatusText.Foreground = [Windows.Media.Brushes]::Aquamarine
     Start-TokenRaderIntervalComputeAsync -Baseline $script:State.IntervalBaseline
@@ -610,6 +653,9 @@ function Stop-IntervalMeasurement {
     $script:SessionListBox.IsEnabled = $true
     $script:ProjectComboBox.IsEnabled = $true
     $script:ScopeComboBox.IsEnabled = $true
+    $script:HistoryRangeComboBox.IsEnabled = $true
+    $script:RebuildIndexButton.IsEnabled = $true
+    $script:PurgeOldIndexButton.IsEnabled = $true
     $script:IntervalStatusText.Text = '结算中'
     $script:IntervalStatusText.Foreground = [Windows.Media.Brushes]::LightSkyBlue
 
@@ -803,7 +849,7 @@ function Refresh-Application {
     if ($script:State.Refreshing) { return }
     $script:State.Refreshing = $true
     try {
-        $script:StatusText.Text = '正在枚举本地 Codex 会话…'
+        $script:StatusText.Text = '正在从本地索引读取 Codex 会话…'
         $previousPath = ''
         if ($null -ne $script:SessionListBox.SelectedItem) {
             $previousPath = [string]$script:SessionListBox.SelectedItem.FilePath
@@ -821,12 +867,21 @@ function Refresh-Application {
         } else {
             $script:AccountHintText.Text = '账号只用于标记当前会话；不会读取 auth.json 中的密钥。'
         }
-        Merge-LatestRateLimits -Candidate (Get-TokenRaderLatestRateLimits -SessionsRoot $script:Paths.SessionsRoot)
+        Merge-LatestRateLimits -Candidate (Get-TokenRaderLatestRateLimits -SessionsRoot $script:Paths.SessionsRoot -SnapshotCache $script:State.RateLimitSnapshotCache)
 
-        $sessions = @(Get-TokenRaderSessionFiles -SessionsRoot $script:Paths.SessionsRoot)
-        $projects = @(Get-TokenRaderProjects -SessionsRoot $script:Paths.SessionsRoot)
+        $historyDays = Get-SelectedHistoryDays
+        $index = Get-TokenRaderIndex
+        if ($null -ne $index) {
+            $sessions = @(Get-TokenRaderIndexedSessionFiles -Days $historyDays -MaximumFiles 200)
+            $projects = @(Get-TokenRaderIndexedProjects -Days $historyDays)
+        } else {
+            # 索引组件不可用时保留直接读取日志的兼容路径。
+            $sessions = @(Get-TokenRaderSessionFiles -SessionsRoot $script:Paths.SessionsRoot)
+            $projects = @(Get-TokenRaderProjects -SessionsRoot $script:Paths.SessionsRoot)
+        }
         $script:State.Projects = $projects
-        $script:SessionCountText.Text = ('{0} 个日志（最多显示 200） · {1} 个项目' -f $sessions.Count, $projects.Count)
+        $rangeLabel = if ($historyDays -eq 0) { '全部历史' } else { '最近 {0} 天' -f $historyDays }
+        $script:SessionCountText.Text = ('{0} 个日志（最多显示 200） · {1} 个项目 · {2}' -f $sessions.Count, $projects.Count, $rangeLabel)
         $script:SessionListBox.ItemsSource = $null
         $script:SessionListBox.ItemsSource = $sessions
         $script:ProjectComboBox.ItemsSource = $null
@@ -867,15 +922,60 @@ function Refresh-Application {
 }
 
 $script:RefreshButton.Add_Click({
-    Refresh-Application
-    # 用户显式刷新：按需构建或增量同步 SQLite 索引（打开时默认不构建）
+    # 用户显式刷新：先同步新增/修改日志，再从索引显示结果。
     try {
         if ($null -eq (Get-TokenRaderIndex)) {
-            New-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
-        } else {
-            Update-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
+            Open-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
         }
-    } catch { }
+        Update-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
+    } catch {
+        $script:StatusText.Text = '索引同步失败，将尝试直接读取日志：' + $_.Exception.Message
+    }
+    Refresh-Application
+})
+$script:RebuildIndexButton.Add_Click({
+    if ([bool]$script:State.IsMeasuring) { return }
+    $script:RebuildIndexButton.IsEnabled = $false
+    $script:RefreshButton.IsEnabled = $false
+    $script:StatusText.Text = '正在完整重建本地索引；原始 Codex 日志不会被修改…'
+    try {
+        New-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot -Force | Out-Null
+        $script:State.ProjectCache = @{}
+        $script:State.RateLimitSnapshotCache = @{}
+        Refresh-Application
+        $script:StatusText.Text = '本地索引已完整重建。'
+    } catch {
+        $script:StatusText.Text = '索引重建失败：' + $_.Exception.Message
+    } finally {
+        $script:RebuildIndexButton.IsEnabled = $true
+        $script:RefreshButton.IsEnabled = $true
+    }
+})
+$script:PurgeOldIndexButton.Add_Click({
+    if ([bool]$script:State.IsMeasuring) { return }
+    $script:PurgeOldIndexButton.IsEnabled = $false
+    $script:RefreshButton.IsEnabled = $false
+    $script:StatusText.Text = '正在清理30天以前的本地索引；原始 Codex 日志不会被修改…'
+    try {
+        if ($null -eq (Get-TokenRaderIndex)) {
+            Open-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
+        }
+        $cleanup = Remove-TokenRaderIndexHistory -Days 30
+        $script:State.ProjectCache = @{}
+        Refresh-Application
+        $script:StatusText.Text = ('已清理 {0} 个30天以前的索引记录；原始日志保持不变。' -f [int]$cleanup.RemovedFiles)
+    } catch {
+        $script:StatusText.Text = '旧索引清理失败：' + $_.Exception.Message
+    } finally {
+        $script:PurgeOldIndexButton.IsEnabled = $true
+        $script:RefreshButton.IsEnabled = $true
+    }
+})
+$script:HistoryRangeComboBox.Add_SelectionChanged({
+    if (-not $script:State.Refreshing -and -not [bool]$script:State.IsMeasuring) {
+        $script:State.ProjectCache = @{}
+        Refresh-Application
+    }
 })
 $script:SessionListBox.Add_SelectionChanged({
     if (-not $script:State.Refreshing -and -not [bool]$script:State.IsMeasuring) {
@@ -929,22 +1029,24 @@ $script:Timer.Add_Tick({
     if ([bool]$script:State.IsMeasuring) {
         Update-IntervalView
     } else {
+        # 只读取首次发现或长度/修改时间发生变化的日志内容。
+        try { Update-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null } catch { }
         Refresh-Application
-        # 增量同步索引（仅在索引已存在时；缺失时保持闲置，由“立即刷新”按钮按需构建）
-        if ($null -ne (Get-TokenRaderIndex)) {
-            try { Update-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null } catch { }
-        }
     }
 })
 $script:Window.Add_Closing({
     $script:WindowClosing = $true
     $script:Timer.Stop()
-    Clear-TokenRaderIndex
+    Close-TokenRaderIndex
     Reset-TokenRaderComputeHost
 })
 
 Set-PricingTable
+# 索引保存在项目 data/private 下。首次启动导入历史，之后只补入新增/修改内容。
+try {
+    Open-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
+    Update-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot | Out-Null
+} catch { }
 Refresh-Application
-# 默认打开不对任何会话/项目进行计算；SQLite 索引由“立即刷新”按钮按需构建。
 $script:Timer.Start()
 [void]$script:Window.ShowDialog()

@@ -295,32 +295,125 @@ function ConvertFrom-TokenRaderUsageTextFast {
     }
 }
 
+function ConvertTo-TokenRaderResetTime {
+    param(
+        $Value,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt,
+        [bool]$RelativeSeconds = $false
+    )
+
+    if ($null -eq $Value) { return $null }
+    if ($RelativeSeconds) {
+        try { return $ObservedAt.AddSeconds([double]$Value).ToLocalTime() } catch { return $null }
+    }
+    if ($Value -is [DateTimeOffset]) { return ([DateTimeOffset]$Value).ToLocalTime() }
+    if ($Value -is [DateTime]) { return ([DateTimeOffset]$Value).ToLocalTime() }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $number = [Int64]0
+    if ([Int64]::TryParse($text, [ref]$number)) {
+        try {
+            if ([Math]::Abs([double]$number) -ge 100000000000.0) {
+                return [DateTimeOffset]::FromUnixTimeMilliseconds($number).ToLocalTime()
+            }
+            return [DateTimeOffset]::FromUnixTimeSeconds($number).ToLocalTime()
+        } catch { return $null }
+    }
+    try { return [DateTimeOffset]::Parse($text).ToLocalTime() } catch { return $null }
+}
+
+function Get-TokenRaderResetIdentity {
+    param(
+        [int]$WindowMinutes,
+        $ResetsAt
+    )
+
+    if ($null -eq $ResetsAt) { return '' }
+    try {
+        $utcMinute = [Math]::Floor(([DateTimeOffset]$ResetsAt).ToUniversalTime().ToUnixTimeSeconds() / 60.0)
+        return ('{0}|{1}' -f $WindowMinutes, [Int64]$utcMinute)
+    } catch { return '' }
+}
+
+function Get-TokenRaderRateWindowKind {
+    param([int]$WindowMinutes)
+
+    if ($WindowMinutes -ge 240 -and $WindowMinutes -le 360) { return 'FiveHour' }
+    if ($WindowMinutes -ge 9000 -and $WindowMinutes -le 11520) { return 'Weekly' }
+    return ''
+}
+
+function New-TokenRaderEventFingerprint {
+    param(
+        [Parameter(Mandatory = $true)][DateTimeOffset]$Timestamp,
+        [string]$Model,
+        [Parameter(Mandatory = $true)]$TotalUsage,
+        [Parameter(Mandatory = $true)]$CallUsage
+    )
+
+    @(
+        $Timestamp.ToUniversalTime().Ticks,
+        ([string]$Model).ToLowerInvariant(),
+        $TotalUsage.Input, $TotalUsage.Cached, $TotalUsage.Output, $TotalUsage.ReasoningOutput,
+        $CallUsage.Input, $CallUsage.Cached, $CallUsage.Output, $CallUsage.ReasoningOutput
+    ) -join ':'
+}
+
+function New-TokenRaderUsageFingerprint {
+    param(
+        [Parameter(Mandatory = $true)]$TotalUsage,
+        [Parameter(Mandatory = $true)]$CallUsage
+    )
+
+    @(
+        $TotalUsage.Input, $TotalUsage.Cached, $TotalUsage.Output, $TotalUsage.ReasoningOutput,
+        $CallUsage.Input, $CallUsage.Cached, $CallUsage.Output, $CallUsage.ReasoningOutput
+    ) -join ':'
+}
+
 function ConvertFrom-TokenRaderRateWindowTextFast {
-    param([Parameter(Mandatory = $true)][string]$InnerText)
+    param(
+        [Parameter(Mandatory = $true)][string]$InnerText,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt,
+        [string]$SourceFile = '',
+        [string]$PlanType = ''
+    )
 
     if ([string]::IsNullOrWhiteSpace($InnerText)) { return $null }
     $used = [regex]::Match($InnerText, '"used_percent"\s*:\s*"?([0-9.]+)"?')
     $minutes = [regex]::Match($InnerText, '"window_minutes"\s*:\s*"?(\d+)"?')
     if (-not $used.Success -or -not $minutes.Success) { return $null }
-    $resets = [regex]::Match($InnerText, '"resets_at"\s*:\s*"?(\d+)"?')
     $usedPercent = [Math]::Max(0.0, [Math]::Min(100.0, [double]$used.Groups[1].Value))
     $windowMinutes = [int]$minutes.Groups[1].Value
     $resetsAt = $null
-    if ($resets.Success) {
-        try { $resetsAt = [DateTimeOffset]::FromUnixTimeSeconds([Int64]$resets.Groups[1].Value).ToLocalTime() } catch { }
+    $resetMatch = [regex]::Match($InnerText, '"(?:resets_at|reset_at)"\s*:\s*(?:"([^"]+)"|([-0-9.]+))')
+    if ($resetMatch.Success) {
+        $resetValue = if ($resetMatch.Groups[1].Success) { $resetMatch.Groups[1].Value } else { $resetMatch.Groups[2].Value }
+        $resetsAt = ConvertTo-TokenRaderResetTime -Value $resetValue -ObservedAt $ObservedAt
+    } else {
+        $relativeMatch = [regex]::Match($InnerText, '"resets_in_seconds"\s*:\s*"?([-0-9.]+)"?')
+        if ($relativeMatch.Success) {
+            $resetsAt = ConvertTo-TokenRaderResetTime -Value $relativeMatch.Groups[1].Value -ObservedAt $ObservedAt -RelativeSeconds $true
+        }
     }
     [pscustomobject]@{
         UsedPercent = $usedPercent
         RemainingPercent = 100.0 - $usedPercent
         WindowMinutes = $windowMinutes
         ResetsAt = $resetsAt
+        ResetIdentity = Get-TokenRaderResetIdentity -WindowMinutes $windowMinutes -ResetsAt $resetsAt
+        ObservedAt = $ObservedAt
+        SourceFile = $SourceFile
+        PlanType = $PlanType
     }
 }
 
 function ConvertFrom-TokenRaderTokenLineFast {
     param(
         [Parameter(Mandatory = $true)][string]$LineText,
-        [string]$Model
+        [string]$Model,
+        [string]$SourceFile = ''
     )
 
     # Fast path: extract the fields this program needs from a well-formed
@@ -347,10 +440,11 @@ function ConvertFrom-TokenRaderTokenLineFast {
     $rateLimits = $null
     if ($LineText.Contains('rate_limits')) {
         $planMatch = [regex]::Match($LineText, '"plan_type"\s*:\s*"([^"]*)"')
+        $planType = if ($planMatch.Success) { $planMatch.Groups[1].Value } else { '' }
         $primaryMatch = [regex]::Match($LineText, '"primary"\s*:\s*\{([^{}]*)\}')
         $secondaryMatch = [regex]::Match($LineText, '"secondary"\s*:\s*\{([^{}]*)\}')
-        $primaryWindow = if ($primaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $primaryMatch.Groups[1].Value } else { $null }
-        $secondaryWindow = if ($secondaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $secondaryMatch.Groups[1].Value } else { $null }
+        $primaryWindow = if ($primaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $primaryMatch.Groups[1].Value -ObservedAt $timestamp -SourceFile $SourceFile -PlanType $planType } else { $null }
+        $secondaryWindow = if ($secondaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $secondaryMatch.Groups[1].Value -ObservedAt $timestamp -SourceFile $SourceFile -PlanType $planType } else { $null }
         if (($primaryMatch.Success -and $null -eq $primaryWindow) -or ($secondaryMatch.Success -and $null -eq $secondaryWindow)) { return $null }
 
         # Inline equivalent of ConvertTo-TokenRaderRateLimits over the two
@@ -358,31 +452,32 @@ function ConvertFrom-TokenRaderTokenLineFast {
         $fiveHour = $null
         $weekly = $null
         if ($null -ne $primaryWindow) {
-            if ($primaryWindow.WindowMinutes -ge 240 -and $primaryWindow.WindowMinutes -le 360) { $fiveHour = $primaryWindow }
-            elseif ($primaryWindow.WindowMinutes -ge 9000) { $weekly = $primaryWindow }
+            $kind = Get-TokenRaderRateWindowKind -WindowMinutes $primaryWindow.WindowMinutes
+            if ($kind -eq 'FiveHour') { $fiveHour = $primaryWindow }
+            elseif ($kind -eq 'Weekly') { $weekly = $primaryWindow }
         }
         if ($null -ne $secondaryWindow) {
-            if ($secondaryWindow.WindowMinutes -ge 240 -and $secondaryWindow.WindowMinutes -le 360) { $fiveHour = $secondaryWindow }
-            elseif ($secondaryWindow.WindowMinutes -ge 9000) { $weekly = $secondaryWindow }
+            $kind = Get-TokenRaderRateWindowKind -WindowMinutes $secondaryWindow.WindowMinutes
+            if ($kind -eq 'FiveHour') { $fiveHour = $secondaryWindow }
+            elseif ($kind -eq 'Weekly') { $weekly = $secondaryWindow }
         }
         $rateLimits = [pscustomobject]@{
             ObservedAt = $timestamp
-            PlanType = if ($planMatch.Success) { $planMatch.Groups[1].Value } else { '' }
+            PlanType = $planType
             FiveHour = $fiveHour
             Weekly = $weekly
         }
     }
 
-    $fingerprint = @(
-        $totalUsage.Input, $totalUsage.Cached, $totalUsage.Output, $totalUsage.ReasoningOutput,
-        $callUsage.Input, $callUsage.Cached, $callUsage.Output, $callUsage.ReasoningOutput
-    ) -join ':'
+    $fingerprint = New-TokenRaderEventFingerprint -Timestamp $timestamp -Model $Model -TotalUsage $totalUsage -CallUsage $callUsage
+    $usageFingerprint = New-TokenRaderUsageFingerprint -TotalUsage $totalUsage -CallUsage $callUsage
     return [pscustomobject]@{
         Timestamp = $timestamp
         Model = $Model
         Total = $totalUsage
         Call = $callUsage
         Fingerprint = $fingerprint
+        UsageFingerprint = $usageFingerprint
         RateLimits = $rateLimits
     }
 }
@@ -413,7 +508,7 @@ function Add-TokenRaderLineEvent {
     }
 
     if ($hasTokenCount -and $completeObject) {
-        $event = ConvertFrom-TokenRaderTokenLineFast -LineText $trimmed -Model ([string]$State.Model)
+        $event = ConvertFrom-TokenRaderTokenLineFast -LineText $trimmed -Model ([string]$State.Model) -SourceFile ([string]$State.SourceFile)
         if ($null -ne $event) {
             [void]$Events.Add($event)
             return
@@ -441,17 +536,16 @@ function Add-TokenRaderLineEvent {
     $callUsage = ConvertTo-TokenRaderUsage $info.last_token_usage
     $timestamp = [DateTimeOffset]::Now
     try { $timestamp = [DateTimeOffset]::Parse([string]$record.timestamp).ToLocalTime() } catch { }
-    $rateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $(if ($null -ne $record.payload.PSObject.Properties['rate_limits']) { $record.payload.rate_limits } else { $null }) -ObservedAt $timestamp
-    $fingerprint = @(
-        $totalUsage.Input, $totalUsage.Cached, $totalUsage.Output, $totalUsage.ReasoningOutput,
-        $callUsage.Input, $callUsage.Cached, $callUsage.Output, $callUsage.ReasoningOutput
-    ) -join ':'
+    $rateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $(if ($null -ne $record.payload.PSObject.Properties['rate_limits']) { $record.payload.rate_limits } else { $null }) -ObservedAt $timestamp -SourceFile ([string]$State.SourceFile)
+    $fingerprint = New-TokenRaderEventFingerprint -Timestamp $timestamp -Model ([string]$State.Model) -TotalUsage $totalUsage -CallUsage $callUsage
+    $usageFingerprint = New-TokenRaderUsageFingerprint -TotalUsage $totalUsage -CallUsage $callUsage
     [void]$Events.Add([pscustomobject]@{
         Timestamp = $timestamp
         Model = [string]$State.Model
         Total = $totalUsage
         Call = $callUsage
         Fingerprint = $fingerprint
+        UsageFingerprint = $usageFingerprint
         RateLimits = $rateLimits
     })
 }
@@ -466,7 +560,7 @@ function Get-TokenRaderUsageEvents {
     )
 
     $events = New-Object System.Collections.ArrayList
-    $state = [pscustomobject]@{ Model = $InitialModel }
+    $state = [pscustomobject]@{ Model = $InitialModel; SourceFile = $FilePath }
     if (-not (Test-Path -LiteralPath $FilePath)) {
         return [pscustomobject]@{ Events = @(); LastModel = $InitialModel; BytesRead = 0 }
     }
@@ -544,7 +638,12 @@ function Get-TokenRaderUsageEvents {
 }
 
 function ConvertTo-TokenRaderRateWindow {
-    param([Parameter(Mandatory = $true)]$RawWindow)
+    param(
+        [Parameter(Mandatory = $true)]$RawWindow,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt,
+        [string]$SourceFile = '',
+        [string]$PlanType = ''
+    )
 
     $usedPercent = [Math]::Max(0.0, [Math]::Min(100.0, [double]$RawWindow.used_percent))
     $windowMinutes = [int]$RawWindow.window_minutes
@@ -557,7 +656,9 @@ function ConvertTo-TokenRaderRateWindow {
     }
     $resetsAt = $null
     if ($null -ne $resetValue) {
-        try { $resetsAt = [DateTimeOffset]::FromUnixTimeSeconds([Int64]$resetValue).ToLocalTime() } catch { }
+        $resetsAt = ConvertTo-TokenRaderResetTime -Value $resetValue -ObservedAt $ObservedAt
+    } elseif ($null -ne $RawWindow.PSObject.Properties['resets_in_seconds'] -and $null -ne $RawWindow.resets_in_seconds) {
+        $resetsAt = ConvertTo-TokenRaderResetTime -Value $RawWindow.resets_in_seconds -ObservedAt $ObservedAt -RelativeSeconds $true
     }
 
     [pscustomobject]@{
@@ -565,13 +666,18 @@ function ConvertTo-TokenRaderRateWindow {
         RemainingPercent = 100.0 - $usedPercent
         WindowMinutes = $windowMinutes
         ResetsAt = $resetsAt
+        ResetIdentity = Get-TokenRaderResetIdentity -WindowMinutes $windowMinutes -ResetsAt $resetsAt
+        ObservedAt = $ObservedAt
+        SourceFile = $SourceFile
+        PlanType = $PlanType
     }
 }
 
 function ConvertTo-TokenRaderRateLimits {
     param(
         $RawRateLimits,
-        [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt
+        [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt,
+        [string]$SourceFile = ''
     )
 
     $fiveHour = $null
@@ -583,9 +689,10 @@ function ConvertTo-TokenRaderRateLimits {
             if ($null -eq $RawRateLimits.PSObject.Properties[$propertyName]) { continue }
             $rawWindow = $RawRateLimits.$propertyName
             if ($null -eq $rawWindow -or $null -eq $rawWindow.PSObject.Properties['window_minutes'] -or $null -eq $rawWindow.PSObject.Properties['used_percent']) { continue }
-            $window = ConvertTo-TokenRaderRateWindow -RawWindow $rawWindow
-            if ($window.WindowMinutes -ge 240 -and $window.WindowMinutes -le 360) { $fiveHour = $window }
-            elseif ($window.WindowMinutes -ge 9000) { $weekly = $window }
+            $window = ConvertTo-TokenRaderRateWindow -RawWindow $rawWindow -ObservedAt $ObservedAt -SourceFile $SourceFile -PlanType $planType
+            $kind = Get-TokenRaderRateWindowKind -WindowMinutes $window.WindowMinutes
+            if ($kind -eq 'FiveHour') { $fiveHour = $window }
+            elseif ($kind -eq 'Weekly') { $weekly = $window }
         }
     }
 
@@ -649,6 +756,8 @@ function Get-TokenRaderUsageSnapshot {
     $tokenIndex = -1
     $model = ''
     $fallbackModel = ''
+    $latestRateLimits = $null
+    $latestRateLimitsFallback = $null
 
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         $line = ([string]$lines[$i]).TrimStart([char]0xFEFF)
@@ -665,16 +774,31 @@ function Get-TokenRaderUsageSnapshot {
             }
             if ($null -ne $tokenRecord -and [string]::IsNullOrWhiteSpace($model) -and -not [string]::IsNullOrWhiteSpace($candidate)) {
                 $model = $candidate
-                break
+                if ($null -ne $latestRateLimits) { break }
             }
             continue
         }
 
         $isTokenRecord = ($record.type -eq 'event_msg' -and $record.payload.type -eq 'token_count') -or
                          ($record.type -eq 'token_count')
-        if ($isTokenRecord -and $null -eq $tokenRecord) {
+        if (-not $isTokenRecord -or $null -eq $record.payload) { continue }
+
+        $recordTimestamp = [DateTimeOffset]::Now
+        try { $recordTimestamp = [DateTimeOffset]::Parse([string]$record.timestamp).ToLocalTime() } catch { }
+        if ($null -eq $latestRateLimits -and $null -ne $record.payload.PSObject.Properties['rate_limits']) {
+            $candidateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $record.payload.rate_limits -ObservedAt $recordTimestamp -SourceFile $FilePath
+            if ($null -eq $latestRateLimitsFallback) { $latestRateLimitsFallback = $candidateLimits }
+            if ($null -ne $candidateLimits.FiveHour -or $null -ne $candidateLimits.Weekly) {
+                $latestRateLimits = $candidateLimits
+            }
+        }
+        if ($null -eq $tokenRecord -and $null -ne $record.payload.info -and
+            $null -ne $record.payload.info.total_token_usage -and $null -ne $record.payload.info.last_token_usage) {
             $tokenRecord = $record
             $tokenIndex = $i
+        }
+        if ($null -ne $tokenRecord -and -not [string]::IsNullOrWhiteSpace($model) -and $null -ne $latestRateLimits) {
+            break
         }
     }
 
@@ -687,19 +811,15 @@ function Get-TokenRaderUsageSnapshot {
 
     $timestamp = $null
     try { $timestamp = [DateTimeOffset]::Parse([string]$tokenRecord.timestamp).ToLocalTime() } catch { $timestamp = [DateTimeOffset]::Now }
-    $planType = ''
-    if ($null -ne $payload.PSObject.Properties['rate_limits'] -and $null -ne $payload.rate_limits -and
-        $null -ne $payload.rate_limits.PSObject.Properties['plan_type']) {
-        $planType = [string]$payload.rate_limits.plan_type
-    }
-    $rateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $(if ($null -ne $payload.PSObject.Properties['rate_limits']) { $payload.rate_limits } else { $null }) -ObservedAt $timestamp
+    $snapshotRateLimits = if ($null -ne $latestRateLimits) { $latestRateLimits } else { $latestRateLimitsFallback }
+    $planType = if ($null -ne $snapshotRateLimits) { [string]$snapshotRateLimits.PlanType } else { '' }
 
     [pscustomobject]@{
         FilePath = $FilePath
         Timestamp = $timestamp
         Model = $model
         PlanType = $planType
-        RateLimits = $rateLimits
+        RateLimits = $snapshotRateLimits
         Task = ConvertTo-TokenRaderUsage $info.total_token_usage
         Call = ConvertTo-TokenRaderUsage $info.last_token_usage
         ContextWindow = [Int64]$info.model_context_window
@@ -711,13 +831,24 @@ function Get-TokenRaderUsageSnapshot {
 function Get-TokenRaderLatestRateLimits {
     param(
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
-        [int]$MaximumFiles = 16
+        [int]$MaximumFiles = 0,
+        [hashtable]$EndOffsets = $null,
+        [hashtable]$SnapshotCache = $null
     )
 
     if (-not (Test-Path -LiteralPath $SessionsRoot)) { return $null }
+    $endOffsetMap = $null
+    if ($null -ne $EndOffsets) {
+        $endOffsetMap = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in @($EndOffsets.Keys)) {
+            $endOffsetMap[(ConvertTo-TokenRaderCanonicalPath -Path ([string]$key))] = [Int64]$EndOffsets[$key]
+        }
+    }
     $files = @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTimeUtc -Descending |
-        Select-Object -First ([Math]::Max(1, $MaximumFiles)))
+        Sort-Object LastWriteTimeUtc -Descending)
+    if ($MaximumFiles -gt 0 -and $files.Count -gt $MaximumFiles) {
+        $files = @($files | Select-Object -First $MaximumFiles)
+    }
     $fiveHour = $null
     $weekly = $null
     $fiveObserved = [DateTimeOffset]::MinValue
@@ -725,21 +856,45 @@ function Get-TokenRaderLatestRateLimits {
     $planType = ''
 
     foreach ($file in $files) {
-        $snapshot = Get-TokenRaderUsageSnapshot -FilePath $file.FullName
+        $canonicalPath = ConvertTo-TokenRaderCanonicalPath -Path ([string]$file.FullName)
+        if ($null -ne $endOffsetMap -and -not $endOffsetMap.ContainsKey($canonicalPath)) { continue }
+        $effectiveEnd = [Int64]$file.Length
+        if ($null -ne $endOffsetMap) { $effectiveEnd = [Math]::Min($effectiveEnd, [Int64]$endOffsetMap[$canonicalPath]) }
+        if ($effectiveEnd -le 0) { continue }
+
+        $snapshot = $null
+        if ($null -ne $SnapshotCache -and $SnapshotCache.ContainsKey($canonicalPath)) {
+            $cachedEntry = $SnapshotCache[$canonicalPath]
+            if ([Int64]$cachedEntry.EndOffset -eq $effectiveEnd -and
+                [Int64]$cachedEntry.LastWriteTimeUtcTicks -eq [Int64]$file.LastWriteTimeUtc.Ticks) {
+                $snapshot = $cachedEntry.Snapshot
+            }
+        }
+        if ($null -eq $snapshot) {
+            $snapshot = Get-TokenRaderUsageSnapshot -FilePath $canonicalPath -EndOffset $effectiveEnd
+            if ($null -ne $SnapshotCache) {
+                $SnapshotCache[$canonicalPath] = [pscustomobject]@{
+                    EndOffset = $effectiveEnd
+                    LastWriteTimeUtcTicks = [Int64]$file.LastWriteTimeUtc.Ticks
+                    Snapshot = $snapshot
+                }
+            }
+        }
         if ($null -eq $snapshot -or $null -eq $snapshot.RateLimits) { continue }
         $rateLimits = $snapshot.RateLimits
-        if ($null -ne $rateLimits.FiveHour -and $rateLimits.ObservedAt -gt $fiveObserved) {
+        if ($null -ne $rateLimits.FiveHour -and $rateLimits.FiveHour.ObservedAt -gt $fiveObserved) {
             $fiveHour = $rateLimits.FiveHour
-            $fiveObserved = $rateLimits.ObservedAt
+            $fiveObserved = $rateLimits.FiveHour.ObservedAt
         }
-        if ($null -ne $rateLimits.Weekly -and $rateLimits.ObservedAt -gt $weeklyObserved) {
+        if ($null -ne $rateLimits.Weekly -and $rateLimits.Weekly.ObservedAt -gt $weeklyObserved) {
             $weekly = $rateLimits.Weekly
-            $weeklyObserved = $rateLimits.ObservedAt
+            $weeklyObserved = $rateLimits.Weekly.ObservedAt
         }
-        if (-not [string]::IsNullOrWhiteSpace([string]$rateLimits.PlanType)) { $planType = [string]$rateLimits.PlanType }
     }
 
     if ($null -eq $fiveHour -and $null -eq $weekly) { return $null }
+    if ($fiveObserved -ge $weeklyObserved -and $null -ne $fiveHour) { $planType = [string]$fiveHour.PlanType }
+    elseif ($null -ne $weekly) { $planType = [string]$weekly.PlanType }
     [pscustomobject]@{
         ObservedAt = if ($fiveObserved -gt $weeklyObserved) { $fiveObserved } else { $weeklyObserved }
         PlanType = $planType
@@ -831,8 +986,13 @@ function Get-TokenRaderCost {
 }
 
 function New-TokenRaderMeasurementBaseline {
-    param([Parameter(Mandatory = $true)][string]$SessionsRoot)
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [hashtable]$RateLimitSnapshotCache = $null,
+        [string]$AccountIdentity = ''
+    )
 
+    $startedAt = [DateTimeOffset]::Now
     $files = @()
     if (Test-Path -LiteralPath $SessionsRoot) {
         $files = @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue | ForEach-Object {
@@ -846,12 +1006,18 @@ function New-TokenRaderMeasurementBaseline {
             }
         })
     }
+    $startOffsets = @{}
+    foreach ($entry in $files) { $startOffsets[[string]$entry.FilePath] = [Int64]$entry.Length }
+    $rateLimits = Get-TokenRaderLatestRateLimits -SessionsRoot $SessionsRoot -EndOffsets $startOffsets -SnapshotCache $RateLimitSnapshotCache
 
     [pscustomobject]@{
-        StartedAt = [DateTimeOffset]::Now
+        StartedAt = $startedAt
         SessionsRoot = $SessionsRoot
         Files = $files
-        RateLimits = Get-TokenRaderLatestRateLimits -SessionsRoot $SessionsRoot
+        StartOffsets = $startOffsets
+        RateLimits = $rateLimits
+        StartRateLimits = $rateLimits
+        AccountIdentity = $AccountIdentity
     }
 }
 
@@ -963,10 +1129,27 @@ function Get-TokenRaderIntervalResult {
         }
         return $Entry.BaselineTask
     }
+    $baselineEventFingerprintsByPath = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    $loadBaselineEventFingerprints = {
+        param($Entry)
+        $keys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        if ($null -eq $Entry) { return ,$keys }
+        $ancestorPath = ConvertTo-TokenRaderCanonicalPath -Path ([string]$Entry.FilePath)
+        if ($baselineEventFingerprintsByPath.ContainsKey($ancestorPath)) {
+            return ,$baselineEventFingerprintsByPath[$ancestorPath]
+        }
+        $ancestorEvents = Get-TokenRaderUsageEvents -FilePath $ancestorPath -StartOffset 0 -EndOffset ([Int64]$Entry.Length)
+        foreach ($ancestorEvent in @($ancestorEvents.Events)) {
+            [void]$keys.Add([string]$ancestorEvent.UsageFingerprint)
+        }
+        $baselineEventFingerprintsByPath[$ancestorPath] = $keys
+        return ,$keys
+    }
 
     $changed = New-Object System.Collections.ArrayList
     foreach ($file in $currentFiles) {
         $fullPath = ConvertTo-TokenRaderCanonicalPath -Path ([string]$file.FullName)
+        if ($null -ne $endOffsetMap -and -not $endOffsetMap.ContainsKey($fullPath)) { continue }
         $baselineEntry = if ($baselineMap.ContainsKey($fullPath)) { $baselineMap[$fullPath] } else { $null }
         $visibleLength = [Int64]$file.Length
         if ($null -ne $endOffsetMap -and $endOffsetMap.ContainsKey($fullPath)) {
@@ -1024,6 +1207,7 @@ function Get-TokenRaderIntervalResult {
     [Int64]$inheritedEventCount = 0
     [Int64]$bytesRead = 0
     $seenEvents = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $rootHistoryEvents = @{}
     $activeFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $models = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $unknownModels = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -1036,6 +1220,11 @@ function Get-TokenRaderIntervalResult {
 
     foreach ($change in @($changed | Sort-Object Depth, @{ Expression = { $_.File.CreationTimeUtc } })) {
         $changePath = [string]$change.FullPath
+        $rootHistoryKey = ([string]$change.RootId).ToLowerInvariant()
+        if (-not $rootHistoryEvents.ContainsKey($rootHistoryKey)) {
+            $rootHistoryEvents[$rootHistoryKey] = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        }
+        $rootHistory = $rootHistoryEvents[$rootHistoryKey]
         $baselineTask = $null
         $initialModel = ''
         $startOffset = 0
@@ -1044,7 +1233,9 @@ function Get-TokenRaderIntervalResult {
             $initialModel = [string]$change.BaselineEntry.BaselineModel
             $startOffset = [Int64]$change.BaselineEntry.Length
         }
-        $ancestorTask = if ($change.IsNew -and $null -ne $change.BaselineAncestor) { & $loadBaselineSnapshot $change.BaselineAncestor } else { $null }
+        $ancestorEventFingerprints = if ($change.IsNew -and $null -ne $change.BaselineAncestor) {
+            & $loadBaselineEventFingerprints $change.BaselineAncestor
+        } else { $null }
 
         $effectiveEnd = [Int64]$change.File.Length
         if ($null -ne $endOffsetMap -and $endOffsetMap.ContainsKey($changePath)) {
@@ -1068,11 +1259,16 @@ function Get-TokenRaderIntervalResult {
                 $latestRateLimits = $event.RateLimits
                 $latestRateObserved = $event.RateLimits.ObservedAt
             }
-            if ($null -ne $ancestorTask -and [Int64]$event.Total.Input -le [Int64]$ancestorTask.Input -and
-                [Int64]$event.Total.Output -le [Int64]$ancestorTask.Output) {
+            $usageFingerprint = [string]$event.UsageFingerprint
+            if ($change.IsNew -and $null -ne $ancestorEventFingerprints -and $ancestorEventFingerprints.Contains($usageFingerprint)) {
                 $inheritedEventCount++
                 continue
             }
+            if ($change.Depth -gt 0 -and $rootHistory.Contains($usageFingerprint)) {
+                $duplicateEventCount++
+                continue
+            }
+            [void]$rootHistory.Add($usageFingerprint)
             $eventKey = ([string]$change.RootId) + '|' + ([string]$event.Fingerprint)
             if (-not $seenEvents.Add($eventKey)) {
                 $duplicateEventCount++
@@ -1155,6 +1351,17 @@ function Get-TokenRaderIntervalResult {
                     elseif ($modelList.Count -eq 1) { $modelList[0] }
                     else { ('{0} 个模型' -f $modelList.Count) }
 
+    $startRateLimits = if ($null -ne $Baseline.PSObject.Properties['StartRateLimits']) {
+        $Baseline.StartRateLimits
+    } elseif ($null -ne $Baseline.PSObject.Properties['RateLimits']) {
+        $Baseline.RateLimits
+    } else { $null }
+    $endRateLimits = $latestRateLimits
+    if ($null -ne $Baseline.PSObject.Properties['StartOffsets']) {
+        $endRateLimits = Get-TokenRaderLatestRateLimits -SessionsRoot ([string]$Baseline.SessionsRoot) -EndOffsets $EndOffsets
+    }
+    $pricingComplete = ($unknownModels.Count -eq 0)
+
     $signatureParts = foreach ($file in $currentFiles) {
         '{0}|{1}|{2}' -f $file.FullName, [Int64]$file.Length, $file.LastWriteTimeUtc.Ticks
     }
@@ -1171,9 +1378,12 @@ function Get-TokenRaderIntervalResult {
         CachedCost = $cachedCost
         OutputCost = $outputCost
         TotalCost = $inputCost + $cachedCost + $outputCost
-        CostComplete = ($unknownModels.Count -eq 0)
+        PricingComplete = $pricingComplete
+        CostComplete = $pricingComplete
         UnknownModels = @($unknownModels | Sort-Object)
-        RateLimits = $latestRateLimits
+        StartRateLimits = $startRateLimits
+        EndRateLimits = $endRateLimits
+        RateLimits = $endRateLimits
         RawEvents = $rawEventCount
         CountedEvents = $countedEventCount
         DuplicateEventsDropped = $duplicateEventCount
@@ -1232,9 +1442,20 @@ function Get-TokenRaderQuotaEstimate {
     )
 
     function Get-WindowEstimate {
-        param($StartWindow, $EndWindow)
+        param($StartWindow, $EndWindow, [string]$StartPlanType, [string]$EndPlanType)
         if (-not $CostComplete -or $IntervalCost -le 0 -or $null -eq $StartWindow -or $null -eq $EndWindow) { return $null }
-        if ($null -ne $StartWindow.ResetsAt -and $null -ne $EndWindow.ResetsAt -and $StartWindow.ResetsAt -ne $EndWindow.ResetsAt) { return $null }
+        if (-not $StartPlanType.Equals($EndPlanType, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+        if ([int]$StartWindow.WindowMinutes -ne [int]$EndWindow.WindowMinutes) { return $null }
+        if ($null -eq $StartWindow.ResetsAt -or $null -eq $EndWindow.ResetsAt) { return $null }
+        $startResetIdentity = if ($null -ne $StartWindow.PSObject.Properties['ResetIdentity']) { [string]$StartWindow.ResetIdentity } else {
+            Get-TokenRaderResetIdentity -WindowMinutes ([int]$StartWindow.WindowMinutes) -ResetsAt $StartWindow.ResetsAt
+        }
+        $endResetIdentity = if ($null -ne $EndWindow.PSObject.Properties['ResetIdentity']) { [string]$EndWindow.ResetIdentity } else {
+            Get-TokenRaderResetIdentity -WindowMinutes ([int]$EndWindow.WindowMinutes) -ResetsAt $EndWindow.ResetsAt
+        }
+        if ([string]::IsNullOrWhiteSpace($startResetIdentity) -or $startResetIdentity -ne $endResetIdentity) { return $null }
+        if ($null -ne $StartWindow.PSObject.Properties['ObservedAt'] -and $null -ne $EndWindow.PSObject.Properties['ObservedAt'] -and
+            [DateTimeOffset]$EndWindow.ObservedAt -lt [DateTimeOffset]$StartWindow.ObservedAt) { return $null }
         $deltaPercent = [double]$EndWindow.UsedPercent - [double]$StartWindow.UsedPercent
         if ($deltaPercent -le 0) { return $null }
         $totalUsd = $IntervalCost / ($deltaPercent / 100.0)
@@ -1246,9 +1467,20 @@ function Get-TokenRaderQuotaEstimate {
         }
     }
 
+    function Get-WindowPlanType {
+        param($RateLimits, $Window)
+        if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['PlanType'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$Window.PlanType)) { return [string]$Window.PlanType }
+        if ($null -ne $RateLimits -and $null -ne $RateLimits.PSObject.Properties['PlanType']) { return [string]$RateLimits.PlanType }
+        return ''
+    }
     [pscustomobject]@{
-        FiveHour = if ($null -ne $StartRateLimits -and $null -ne $EndRateLimits) { Get-WindowEstimate $StartRateLimits.FiveHour $EndRateLimits.FiveHour } else { $null }
-        Weekly = if ($null -ne $StartRateLimits -and $null -ne $EndRateLimits) { Get-WindowEstimate $StartRateLimits.Weekly $EndRateLimits.Weekly } else { $null }
+        FiveHour = if ($null -ne $StartRateLimits -and $null -ne $EndRateLimits) {
+            Get-WindowEstimate $StartRateLimits.FiveHour $EndRateLimits.FiveHour (Get-WindowPlanType $StartRateLimits $StartRateLimits.FiveHour) (Get-WindowPlanType $EndRateLimits $EndRateLimits.FiveHour)
+        } else { $null }
+        Weekly = if ($null -ne $StartRateLimits -and $null -ne $EndRateLimits) {
+            Get-WindowEstimate $StartRateLimits.Weekly $EndRateLimits.Weekly (Get-WindowPlanType $StartRateLimits $StartRateLimits.Weekly) (Get-WindowPlanType $EndRateLimits $EndRateLimits.Weekly)
+        } else { $null }
     }
 }
 
@@ -1272,14 +1504,27 @@ function Get-TokenRaderIndexerPath {
     return Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.dll'
 }
 
-function Get-TokenRaderIndexerTempDir {
-    $dir = Join-Path $env:TEMP 'TokenRader'
+function Get-TokenRaderIndexerDataDir {
+    $dir = Join-Path $PSScriptRoot 'data\private\index'
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     return $dir
 }
 
 function Get-TokenRaderIndexerDbPath {
-    return Join-Path (Get-TokenRaderIndexerTempDir) 'index.db'
+    # Tests may select another ignored data/private subdirectory so they never
+    # overwrite a user's persistent index. Production always uses index.db.
+    if (-not [string]::IsNullOrWhiteSpace($env:TOKEN_RADER_INDEX_DB)) {
+        $candidate = [IO.Path]::GetFullPath($env:TOKEN_RADER_INDEX_DB)
+        $normalizedCandidate = $candidate.Replace([IO.Path]::AltDirectorySeparatorChar, [IO.Path]::DirectorySeparatorChar)
+        $privateSegment = [IO.Path]::DirectorySeparatorChar + 'data' + [IO.Path]::DirectorySeparatorChar + 'private' + [IO.Path]::DirectorySeparatorChar
+        if ($normalizedCandidate.IndexOf($privateSegment, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            throw 'TOKEN_RADER_INDEX_DB 必须位于某个项目的 data/private 目录内。'
+        }
+        $candidateDir = Split-Path -Parent $candidate
+        if (-not (Test-Path -LiteralPath $candidateDir)) { New-Item -ItemType Directory -Path $candidateDir -Force | Out-Null }
+        return $candidate
+    }
+    return Join-Path (Get-TokenRaderIndexerDataDir) 'index.db'
 }
 
 <#
@@ -1297,6 +1542,243 @@ function Initialize-TokenRaderIndexer {
     } catch { return $false }
 }
 
+function Close-TokenRaderIndex {
+    $index = $script:TokenRaderIndex
+    if ($null -ne $index -and $null -ne $index.Connection) {
+        try { $index.Connection.Close(); $index.Connection.Dispose() } catch { }
+    }
+    $script:TokenRaderIndex = $null
+}
+
+function Open-TokenRaderIndex {
+    param([Parameter(Mandatory = $true)][string]$SessionsRoot)
+
+    if (-not (Initialize-TokenRaderIndexer)) {
+        throw 'C# Indexer DLL 不可用，请先运行 Build.ps1'
+    }
+    $canonicalRoot = [IO.Path]::GetFullPath($SessionsRoot).TrimEnd([char]'\', [char]'/')
+    $existing = $script:TokenRaderIndex
+    if ($null -ne $existing -and $null -ne $existing.Connection -and
+        [string]$existing.SessionsRoot -eq $canonicalRoot) {
+        return $existing
+    }
+    Close-TokenRaderIndex
+
+    $dbPath = Get-TokenRaderIndexerDbPath
+    $wasPresent = Test-Path -LiteralPath $dbPath
+    $conn = New-Object System.Data.SQLite.SQLiteConnection ('Data Source=' + $dbPath + ';Version=3;')
+    $conn.Open()
+    [TokenRaderIndexer]::CreateSchema($conn)
+    $metadata = [TokenRaderIndexer]::GetFileMetadata($conn)
+    $script:TokenRaderIndex = [pscustomobject]@{
+        DbPath = $dbPath
+        Connection = $conn
+        SessionsRoot = $canonicalRoot
+        LastSync = $null
+        LastFullReconcile = $null
+        IsNew = (-not $wasPresent -or $metadata.Rows.Count -eq 0)
+        IndexedFileCount = [int]$metadata.Rows.Count
+        LastImportedFiles = 0
+        LastImportedRecords = 0
+    }
+    return $script:TokenRaderIndex
+}
+
+function ConvertTo-TokenRaderMetadataMap {
+    param([Parameter(Mandatory = $true)]$Table)
+    $map = @{}
+    foreach ($row in @($Table.Rows)) {
+        $path = [string]$row['path']
+        if (-not [string]::IsNullOrWhiteSpace($path)) { $map[$path.ToLowerInvariant()] = $row }
+    }
+    return $map
+}
+
+function Get-TokenRaderIndexRetentionCutoff {
+    param([Parameter(Mandatory = $true)]$Connection)
+
+    $raw = [TokenRaderIndexer]::GetSetting($Connection, 'retention_cutoff_ticks')
+    if ([string]::IsNullOrWhiteSpace([string]$raw)) { return 0L }
+    $cutoff = [Int64]0
+    if ([Int64]::TryParse([string]$raw, [ref]$cutoff) -and $cutoff -gt 0) { return $cutoff }
+    return 0L
+}
+
+function Get-TokenRaderCompleteJsonlOffset {
+    param([Parameter(Mandatory = $true)][string]$FilePath)
+
+    $stream = $null
+    try {
+        $stream = New-Object System.IO.FileStream(
+            $FilePath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        )
+        $length = [Int64]$stream.Length
+        if ($length -le 0) { return 0L }
+        $bufferSize = 65536
+        $end = $length
+        while ($end -gt 0) {
+            $start = [Math]::Max([Int64]0, $end - $bufferSize)
+            $count = [int]($end - $start)
+            $buffer = New-Object byte[] $count
+            [void]$stream.Seek($start, [IO.SeekOrigin]::Begin)
+            $read = $stream.Read($buffer, 0, $count)
+            for ($i = $read - 1; $i -ge 0; $i--) {
+                if ($buffer[$i] -eq 10) { return [Int64]($start + $i + 1) }
+            }
+            $end = $start
+        }
+        return 0L
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+function Sync-TokenRaderIndexFiles {
+    param(
+        [Parameter(Mandatory = $true)]$Index,
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [AllowNull()][string[]]$CandidateFiles,
+        [switch]$FullReconcile
+    )
+
+    $conn = $Index.Connection
+    $metadataTable = [TokenRaderIndexer]::GetFileMetadata($conn)
+    $known = ConvertTo-TokenRaderMetadataMap -Table $metadataTable
+    $retentionCutoff = Get-TokenRaderIndexRetentionCutoff -Connection $conn
+    if ($null -eq $CandidateFiles) {
+        $files = if (Test-Path -LiteralPath $SessionsRoot) {
+            @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue |
+                Where-Object { $retentionCutoff -le 0 -or $_.LastWriteTimeUtc.Ticks -ge $retentionCutoff })
+        } else { @() }
+    } else {
+        $files = @($CandidateFiles | Select-Object -Unique | ForEach-Object {
+            if (-not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_ -PathType Leaf)) {
+                $item = Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue
+                if ($null -ne $item -and $item.Extension -eq '.jsonl' -and
+                    ($retentionCutoff -le 0 -or $item.LastWriteTimeUtc.Ticks -ge $retentionCutoff)) { $item }
+            }
+        })
+    }
+
+    $seen = @{}
+    $importedFiles = 0
+    $importedRecords = 0
+    foreach ($file in $files) {
+        $canonical = [IO.Path]::GetFullPath($file.FullName)
+        $key = $canonical.ToLowerInvariant()
+        $seen[$key] = $true
+        $length = [Int64]$file.Length
+        $lastWrite = [Int64]$file.LastWriteTimeUtc.Ticks
+        $knownRow = if ($known.ContainsKey($key)) { $known[$key] } else { $null }
+        $unchanged = $null -ne $knownRow -and
+            [Int64]$knownRow['length'] -eq $length -and
+            [Int64]$knownRow['last_write_ticks'] -eq $lastWrite
+        if ($unchanged) {
+            $hasIndexedSessionId = $knownRow.Table.Columns.Contains('session_id') -and
+                -not [string]::IsNullOrWhiteSpace([string]$knownRow['session_id'])
+            if ($hasIndexedSessionId) { continue }
+            # One-time migration for indexes created before relationship
+            # metadata was added. It reads only session_meta, not token history.
+            $backfill = Get-TokenRaderSessionMetadata -FilePath $canonical
+            [TokenRaderIndexer]::UpdateFileMetadata(
+                $conn,
+                $canonical,
+                $length,
+                $lastWrite,
+                [Int64]$knownRow['parsed_offset'],
+                [string]$backfill.SessionId,
+                [string]$backfill.Cwd,
+                [string]$backfill.ParentThreadId,
+                [string]$backfill.ForkedFromId
+            )
+            continue
+        }
+
+        $sessionMetadata = Get-TokenRaderSessionMetadata -FilePath $canonical
+        $startOffset = if ($null -ne $knownRow) { [Int64]$knownRow['parsed_offset'] } else { 0L }
+        $knownSessionId = if ($null -ne $knownRow -and $knownRow.Table.Columns.Contains('session_id')) { [string]$knownRow['session_id'] } else { '' }
+        $requiresReplacement = $null -ne $knownRow -and (
+            $length -lt $startOffset -or
+            ($lastWrite -ne [Int64]$knownRow['last_write_ticks'] -and $length -le [Int64]$knownRow['length'])
+        )
+        if ($requiresReplacement) {
+            if ([string]::IsNullOrWhiteSpace($knownSessionId)) { $knownSessionId = [string]$sessionMetadata.SessionId }
+            [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $knownSessionId)
+            $startOffset = 0L
+        }
+
+        try {
+            # Codex can still be appending the final JSONL record while a
+            # refresh runs. Only advance parsed_offset through the last newline
+            # so an incomplete tail is retried on the next refresh.
+            $completeOffset = Get-TokenRaderCompleteJsonlOffset -FilePath $canonical
+            $count = if ($completeOffset -gt $startOffset) {
+                [TokenRaderIndexer]::ImportFile($conn, $canonical, $startOffset, $completeOffset)
+            } else { 0 }
+            $fresh = Get-Item -LiteralPath $canonical -ErrorAction Stop
+            [TokenRaderIndexer]::UpdateFileMetadata(
+                $conn,
+                $canonical,
+                [Int64]$fresh.Length,
+                [Int64]$fresh.LastWriteTimeUtc.Ticks,
+                [Int64]$completeOffset,
+                [string]$sessionMetadata.SessionId,
+                [string]$sessionMetadata.Cwd,
+                [string]$sessionMetadata.ParentThreadId,
+                [string]$sessionMetadata.ForkedFromId
+            )
+            $importedFiles++
+            $importedRecords += [int]$count
+        } catch {
+            # Do not advance parsed_offset after a failed import; the next
+            # refresh can retry the same changed file safely.
+            continue
+        }
+    }
+
+    if ($FullReconcile) {
+        foreach ($row in @($metadataTable.Rows)) {
+            $path = [string]$row['path']
+            $key = $path.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $sessionId = if ($row.Table.Columns.Contains('session_id')) { [string]$row['session_id'] } else { '' }
+            if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-TokenRaderSessionIdFromPath -FilePath $path }
+            [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $sessionId)
+            [TokenRaderIndexer]::RemoveFileMetadata($conn, $path)
+        }
+        $Index.LastFullReconcile = [DateTimeOffset]::Now
+    } elseif ($null -ne $CandidateFiles) {
+        foreach ($candidate in @($CandidateFiles | Select-Object -Unique)) {
+            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+            $canonical = [IO.Path]::GetFullPath($candidate)
+            $key = $canonical.ToLowerInvariant()
+            if (Test-Path -LiteralPath $canonical -PathType Leaf) {
+                $candidateItem = Get-Item -LiteralPath $canonical -ErrorAction SilentlyContinue
+                # A candidate that has aged or whose timestamp was restored
+                # below the persisted retention floor must leave the index.
+                if ($null -ne $candidateItem -and
+                    ($retentionCutoff -le 0 -or $candidateItem.LastWriteTimeUtc.Ticks -ge $retentionCutoff)) { continue }
+            }
+            if (-not $known.ContainsKey($key)) { continue }
+            $row = $known[$key]
+            $sessionId = if ($row.Table.Columns.Contains('session_id')) { [string]$row['session_id'] } else { '' }
+            if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-TokenRaderSessionIdFromPath -FilePath $canonical }
+            [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $sessionId)
+            [TokenRaderIndexer]::RemoveFileMetadata($conn, $canonical)
+        }
+    }
+
+    $Index.LastSync = [DateTimeOffset]::Now
+    $Index.IsNew = $false
+    $Index.LastImportedFiles = $importedFiles
+    $Index.LastImportedRecords = $importedRecords
+    $Index.IndexedFileCount = [int]([TokenRaderIndexer]::GetFileMetadata($conn).Rows.Count)
+    return $Index
+}
+
 <#
 .SYNOPSIS
     构建索引：扫描所有 JSONL 文件，导入 SQLite 磁盘数据库。
@@ -1311,67 +1793,16 @@ function New-TokenRaderIndex {
         [switch]$Force
     )
 
-    if (-not (Initialize-TokenRaderIndexer)) {
-        Write-Error 'C# Indexer DLL 不可用，请先运行 Build.ps1'
-        return $null
-    }
-
     $dbPath = Get-TokenRaderIndexerDbPath
-    if ($Force -and (Test-Path -LiteralPath $dbPath)) {
-        try { Remove-Item -LiteralPath $dbPath -Force } catch { }
-    }
-
-    $conn = New-Object System.Data.SQLite.SQLiteConnection ('Data Source=' + $dbPath + ';Version=3;')
-    $conn.Open()
-    [TokenRaderIndexer]::CreateSchema($conn)
-
-    $sessionFiles = @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
-    $totalFiles = 0
-    $totalRecords = 0
-
-    foreach ($file in $sessionFiles) {
-        $path = $file.FullName
-        $canonical = [IO.Path]::GetFullPath($path)
-        $length = [Int64]$file.Length
-        $lastWrite = $file.LastWriteTimeUtc.Ticks
-
-        # 检查是否已有记录
-        $knownMeta = $null
-        $metaTable = [TokenRaderIndexer]::GetFileMetadata($conn)
-        foreach ($row in $metaTable.Rows) {
-            if ([string]$row['path'] -eq $canonical) { $knownMeta = $row; break }
+    if ($Force) {
+        Close-TokenRaderIndex
+        foreach ($suffix in @('', '-wal', '-shm')) {
+            $target = $dbPath + $suffix
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction Stop }
         }
-
-        $isChanged = $true
-        $startOffset = 0
-        if ($null -ne $knownMeta) {
-            if ([Int64]$knownMeta['length'] -eq $length -and [Int64]$knownMeta['last_write_ticks'] -eq $lastWrite) {
-                $isChanged = $false
-            } else {
-                $startOffset = [Int64]$knownMeta['parsed_offset']
-            }
-        }
-
-        if ($isChanged) {
-            $totalFiles++
-            $n = 0
-            try {
-                $n = [TokenRaderIndexer]::ImportFile($conn, $path, $startOffset)
-                $totalRecords += $n
-            } catch { continue }
-        }
-
-        [TokenRaderIndexer]::UpdateFileMetadata($conn, $canonical, $length, $lastWrite, $startOffset)
     }
-
-    $script:TokenRaderIndex = [pscustomobject]@{
-        DbPath = $dbPath
-        Connection = $conn
-        SessionsRoot = $SessionsRoot
-        LastSync = [DateTimeOffset]::Now
-    }
-    Write-Output ('TokenRaderIndex: {0} 个文件，{1} 条记录，{2} 秒' -f $totalFiles, $totalRecords, [Math]::Round(([DateTimeOffset]::Now - $script:TokenRaderIndex.LastSync).TotalSeconds, 1))
-    return $script:TokenRaderIndex
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile
 }
 
 <#
@@ -1379,74 +1810,161 @@ function New-TokenRaderIndex {
     增量同步：检查文件变化，只解析新增/变更部分。
 #>
 function Update-TokenRaderIndex {
-    param([Parameter(Mandatory = $true)][string]$SessionsRoot)
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [AllowNull()][string[]]$CandidateFiles
+    )
 
     $index = $script:TokenRaderIndex
     if ($null -eq $index -or $null -eq $index.Connection) {
-        return New-TokenRaderIndex -SessionsRoot $SessionsRoot
+        $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
     }
-
-    $conn = $index.Connection
-    $sessionFiles = @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
-    $added = 0
-
-    foreach ($file in $sessionFiles) {
-        $path = $file.FullName
-        $canonical = [IO.Path]::GetFullPath($path)
-        $length = [Int64]$file.Length
-        $lastWrite = $file.LastWriteTimeUtc.Ticks
-
-        $knownMeta = $null
-        $metaTable = [TokenRaderIndexer]::GetFileMetadata($conn)
-        foreach ($row in $metaTable.Rows) {
-            if ([string]$row['path'] -eq $canonical) { $knownMeta = $row; break }
-        }
-
-        $isChanged = $true
-        $startOffset = 0
-        if ($null -ne $knownMeta) {
-            if ([Int64]$knownMeta['length'] -eq $length -and [Int64]$knownMeta['last_write_ticks'] -eq $lastWrite) {
-                $isChanged = $false
-            } else {
-                $startOffset = [Int64]$knownMeta['parsed_offset']
-            }
-        }
-
-        if ($isChanged) {
-            try {
-                $n = [TokenRaderIndexer]::ImportFile($conn, $path, $startOffset)
-                $added += $n
-            } catch { continue }
-        }
-
-        $newParsedOffset = if ($isChanged) { (Get-Item -LiteralPath $path).Length } else { $startOffset }
-        [TokenRaderIndexer]::UpdateFileMetadata($conn, $canonical, $length, $lastWrite, $newParsedOffset)
+    if ($PSBoundParameters.ContainsKey('CandidateFiles')) {
+        return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $CandidateFiles
     }
-
-    $index.LastSync = [DateTimeOffset]::Now
-    Write-Output ('Update-TokenRaderIndex: 新增 {0} 条记录' -f $added)
-    return $index
+    # A normal refresh enumerates file metadata once, but opens and parses only
+    # files whose length or last-write time changed. This catches old sessions
+    # that were reopened while avoiding repeated reads of historical contents.
+    return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile
 }
 
 <#
 .SYNOPSIS
-    清理索引：关闭数据库连接，删除临时文件。
+    删除可重建的本地索引；不会修改 Codex 原始日志。
 #>
 function Clear-TokenRaderIndex {
-    $index = $script:TokenRaderIndex
-    if ($null -ne $index -and $null -ne $index.Connection) {
-        try { $index.Connection.Close(); $index.Connection.Dispose() } catch { }
-    }
-    $script:TokenRaderIndex = $null
+    Close-TokenRaderIndex
     $dbPath = Get-TokenRaderIndexerDbPath
-    if (Test-Path -LiteralPath $dbPath) {
-        try { Remove-Item -LiteralPath $dbPath -Force } catch { }
+    foreach ($suffix in @('', '-wal', '-shm')) {
+        $target = $dbPath + $suffix
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
     }
     [GC]::Collect()
 }
 
+function Remove-TokenRaderIndexHistory {
+    param([ValidateRange(1, 36500)][int]$Days = 30)
+
+    $index = $script:TokenRaderIndex
+    if ($null -eq $index -or $null -eq $index.Connection) {
+        throw '本地索引尚未打开。'
+    }
+    $requestedCutoff = [DateTime]::UtcNow.AddDays(-$Days).Ticks
+    $existingCutoff = Get-TokenRaderIndexRetentionCutoff -Connection $index.Connection
+    $effectiveCutoff = [Math]::Max([Int64]$requestedCutoff, [Int64]$existingCutoff)
+    $removed = [TokenRaderIndexer]::PurgeIndexBefore($index.Connection, $effectiveCutoff)
+    [TokenRaderIndexer]::SetSetting($index.Connection, 'retention_cutoff_ticks', ([Int64]$effectiveCutoff).ToString([Globalization.CultureInfo]::InvariantCulture))
+    $index.LastSync = [DateTimeOffset]::Now
+    $index.IndexedFileCount = [int]([TokenRaderIndexer]::GetFileMetadata($index.Connection).Rows.Count)
+    [pscustomobject]@{
+        Days = $Days
+        CutoffUtc = [DateTime]::new([Int64]$effectiveCutoff, [DateTimeKind]::Utc)
+        RemovedFiles = [int]$removed
+        DbPath = [string]$index.DbPath
+    }
+}
+
 function Get-TokenRaderIndex {
     return $script:TokenRaderIndex
+}
+
+function Get-TokenRaderIndexedFileMetadata {
+    param(
+        [int]$Days = 30,
+        [int]$MaximumFiles = 0
+    )
+    $index = $script:TokenRaderIndex
+    if ($null -eq $index -or $null -eq $index.Connection) { return $null }
+    $cutoffTicks = if ($Days -gt 0) { [DateTime]::UtcNow.AddDays(-$Days).Ticks } else { 0L }
+    $table = [TokenRaderIndexer]::QueryFileMetadata($index.Connection, [Int64]$cutoffTicks, [int][Math]::Max(0, $MaximumFiles))
+    return ,$table
+}
+
+function ConvertFrom-TokenRaderIndexedFileRow {
+    param([Parameter(Mandatory = $true)]$Row)
+    $path = [string]$Row['path']
+    $sessionId = if ($Row.Table.Columns.Contains('session_id')) { [string]$Row['session_id'] } else { '' }
+    if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-TokenRaderSessionIdFromPath -FilePath $path }
+    $shortId = if ($sessionId.Length -gt 8) { $sessionId.Substring(0, 8) } else { $sessionId }
+    $utc = [DateTime]::new([Int64]$Row['last_write_ticks'], [DateTimeKind]::Utc)
+    $local = $utc.ToLocalTime()
+    $length = [Int64]$Row['length']
+    [pscustomobject]@{
+        FilePath = $path
+        SessionId = $sessionId
+        ShortId = $shortId
+        LastWriteTime = $local
+        LastWriteTimeUtc = $utc
+        Length = $length
+        Cwd = if ($Row.Table.Columns.Contains('cwd')) { [string]$Row['cwd'] } else { '' }
+        ParentThreadId = if ($Row.Table.Columns.Contains('parent_thread_id')) { [string]$Row['parent_thread_id'] } else { '' }
+        ForkedFromId = if ($Row.Table.Columns.Contains('forked_from_id')) { [string]$Row['forked_from_id'] } else { '' }
+        DisplayName = ('{0:MM-dd HH:mm}   {1}   {2}' -f $local, $shortId, (Format-TokenRaderFileSize $length))
+    }
+}
+
+function Get-TokenRaderIndexedSessionFiles {
+    param(
+        [int]$Days = 30,
+        [int]$MaximumFiles = 200
+    )
+    $table = Get-TokenRaderIndexedFileMetadata -Days $Days -MaximumFiles ([Math]::Max(1, $MaximumFiles))
+    if ($null -eq $table) { return @() }
+    $rows = foreach ($row in @($table.Rows)) { ConvertFrom-TokenRaderIndexedFileRow -Row $row }
+    return @($rows)
+}
+
+function Get-TokenRaderIndexedProjects {
+    param([int]$Days = 30)
+
+    $table = Get-TokenRaderIndexedFileMetadata -Days $Days -MaximumFiles 0
+    if ($null -eq $table) { return @() }
+    $groups = @{}
+    foreach ($row in @($table.Rows)) {
+        $item = ConvertFrom-TokenRaderIndexedFileRow -Row $row
+        $cwd = [string]$item.Cwd
+        if ([string]::IsNullOrWhiteSpace($cwd)) { continue }
+        try { $cwd = [IO.Path]::GetFullPath($cwd).TrimEnd([char]'\', [char]'/') } catch { $cwd = $cwd.TrimEnd([char]'\', [char]'/') }
+        if ([string]::IsNullOrWhiteSpace($cwd)) { continue }
+        $key = $cwd.ToLowerInvariant()
+        if (-not $groups.ContainsKey($key)) {
+            $name = [IO.Path]::GetFileName($cwd)
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = $cwd }
+            $groups[$key] = [pscustomobject]@{
+                ProjectPath = $cwd
+                ProjectName = $name
+                LastWriteTime = $item.LastWriteTime
+                LastWriteTimeUtc = $item.LastWriteTimeUtc
+                TotalBytes = [Int64]0
+                Entries = New-Object System.Collections.ArrayList
+            }
+        }
+        $group = $groups[$key]
+        [void]$group.Entries.Add($item)
+        $group.TotalBytes += [Int64]$item.Length
+        if ($item.LastWriteTimeUtc -gt $group.LastWriteTimeUtc) {
+            $group.LastWriteTime = $item.LastWriteTime
+            $group.LastWriteTimeUtc = $item.LastWriteTimeUtc
+        }
+    }
+
+    $projects = foreach ($group in $groups.Values) {
+        $entries = @($group.Entries | Sort-Object FilePath)
+        $paths = @($entries | ForEach-Object { [string]$_.FilePath })
+        $signature = @($entries | ForEach-Object { '{0}|{1}|{2}' -f $_.FilePath, [Int64]$_.Length, $_.LastWriteTimeUtc.Ticks }) -join ';'
+        [pscustomobject]@{
+            ProjectPath = [string]$group.ProjectPath
+            ProjectName = [string]$group.ProjectName
+            SessionCount = $paths.Count
+            LastWriteTime = $group.LastWriteTime
+            LastWriteTimeUtc = $group.LastWriteTimeUtc
+            TotalBytes = [Int64]$group.TotalBytes
+            FilePaths = $paths
+            Signature = $signature
+            DisplayName = ('{0}  ·  {1} 个日志' -f [string]$group.ProjectName, $paths.Count)
+        }
+    }
+    return @($projects | Sort-Object LastWriteTimeUtc -Descending)
 }
 
 <#
@@ -1562,4 +2080,4 @@ function ConvertFrom-TokenRaderIndexRecord {
     }
 }
 
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Get-TokenRaderIndex, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord
