@@ -1878,7 +1878,7 @@ function Sync-TokenRaderIndexFiles {
     $Index.IsNew = $false
     $Index.LastImportedFiles = $importedFiles
     $Index.LastImportedRecords = $importedRecords
-    $Index.IndexedFileCount = [int]([TokenRaderIndexer]::CaptureFileCursorTable($conn).Rows.Count)
+    $Index.IndexedFileCount = [int][TokenRaderIndexer]::GetFileCursorCount($conn)
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '同步完成'
         $ProgressState.ProcessedFiles = $ProgressState.TotalFiles
@@ -2246,13 +2246,7 @@ function ConvertTo-TokenRaderOffsetMap {
 
 function Get-TokenRaderCursorOffsets {
     param([Parameter(Mandatory = $true)]$Connection)
-    $offsets = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
-    $table = [TokenRaderIndexer]::CaptureFileCursorTable($Connection)
-    foreach ($row in @($table.Rows)) {
-        $path = ConvertTo-TokenRaderCanonicalPath -Path ([string]$row['path'])
-        if (-not [string]::IsNullOrWhiteSpace($path)) { $offsets[$path] = [Int64]$row['parsed_offset'] }
-    }
-    return $offsets
+    return ,([TokenRaderIndexer]::CaptureFileCursorOffsets($Connection))
 }
 
 function ConvertFrom-TokenRaderRateLimitRows {
@@ -2367,13 +2361,14 @@ function CaptureMeasurementBaseline {
 function CaptureMeasurementEnd {
     param(
         [Parameter(Mandatory = $true)]$Baseline,
-        [switch]$IncludeRateLimits
+        [switch]$IncludeRateLimits,
+        [hashtable]$ProgressState
     )
     $sessionsRoot = [string]$Baseline.SessionsRoot
     $index = Open-TokenRaderIndex -SessionsRoot $sessionsRoot
     $gate = [TokenRaderIndexer]::AcquireIndexGate($sessionsRoot)
     try {
-        $index = Update-TokenRaderIndex -SessionsRoot $sessionsRoot
+        $index = Update-TokenRaderIndex -SessionsRoot $sessionsRoot -ProgressState $ProgressState
         $endOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
         # The UI only needs immutable offsets/revision to finish Stopping.
         # Quota lookup is intentionally deferred to interval settlement, where
@@ -2422,107 +2417,82 @@ function Get-TokenRaderIndexedIntervalResult {
         $EndRevision = $null,
         $EndedAt = $null,
         [bool]$ScanRateLimits = $true,
-        [string]$SessionsRoot = ''
+        [string]$SessionsRoot = '',
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None,
+        [hashtable]$ProgressState = $null
     )
     if ([string]::IsNullOrWhiteSpace($SessionsRoot)) { $SessionsRoot = [string]$Baseline.SessionsRoot }
     $ending = $null
     if ($null -eq $EndOffsets) {
-        $ending = CaptureMeasurementEnd -Baseline $Baseline
+        $ending = CaptureMeasurementEnd -Baseline $Baseline -ProgressState $ProgressState
         $EndOffsets = $ending.EndOffsets
         $EndRevision = $ending.EndRevision
     }
     $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
     $starts = ConvertTo-TokenRaderOffsetMap -Value $Baseline.StartOffsets
     $ends = ConvertTo-TokenRaderOffsetMap -Value $EndOffsets
-    $table = QueryIntervalRecords -StartOffsets $starts -EndOffsets $ends -SessionsRoot $SessionsRoot
-
-    [Int64]$aggregateInput = 0
-    [Int64]$aggregateCached = 0
-    [Int64]$aggregateOutput = 0
-    [Int64]$aggregateReasoning = 0
-    [Int64]$rawEvents = if ($null -ne $table) { $table.Rows.Count } else { 0 }
-    [Int64]$countedEvents = 0
-    [Int64]$duplicateEvents = 0
-    [Int64]$inheritedEvents = 0
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-    $activeFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $models = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $unknownModels = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $buckets = @{}
     $startedAt = [DateTimeOffset]$Baseline.StartedAt
-
-    foreach ($row in @($table.Rows)) {
-        $event = ConvertFrom-TokenRaderIndexRecord -Row $row
-        $wasPresentAtStart = $starts.ContainsKey([string]$event.FilePath)
-        $isStartingWindowEvent = [DateTimeOffset]$event.Timestamp -ge $startedAt.AddDays(-1)
-        if ([DateTimeOffset]$event.Timestamp -lt $startedAt -and (-not $wasPresentAtStart -or $isStartingWindowEvent)) {
-            $inheritedEvents++
-            continue
-        }
-        $call = $event.Call
-        if ([Int64]$call.Input -le 0 -and [Int64]$call.Output -le 0) { continue }
-        $rootId = if (-not [string]::IsNullOrWhiteSpace([string]$event.RootSessionId)) { [string]$event.RootSessionId } else { [string]$event.SessionId }
-        $model = [string]$event.Model
-        $timestampKey = ([DateTimeOffset]$event.Timestamp).ToUniversalTime().ToString('o')
-        $eventKey = $rootId.ToLowerInvariant() + '|' + $timestampKey + '|' + $model.ToLowerInvariant() + '|' + [string]$event.UsageFingerprint
-        if (-not $seen.Add($eventKey)) {
-            $duplicateEvents++
-            continue
-        }
-        $countedEvents++
-        $aggregateInput += [Int64]$call.Input
-        $aggregateCached += [Int64]$call.Cached
-        $aggregateOutput += [Int64]$call.Output
-        $aggregateReasoning += [Int64]$call.ReasoningOutput
-        if (-not [string]::IsNullOrWhiteSpace([string]$event.FilePath)) { [void]$activeFiles.Add([string]$event.FilePath) }
-        if (-not [string]::IsNullOrWhiteSpace($model)) { [void]$models.Add($model) }
-
-        $price = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument
-        $longContext = $null -ne $price -and $null -ne $price.PSObject.Properties['longContextThreshold'] -and
-            [Int64]$price.longContextThreshold -gt 0 -and [Int64]$call.Input -gt [Int64]$price.longContextThreshold
-        $bucketKey = $model.ToLowerInvariant() + '|' + $(if ($longContext) { 'long' } else { 'standard' })
-        if (-not $buckets.ContainsKey($bucketKey)) {
-            $buckets[$bucketKey] = [pscustomobject]@{
-                Model = $model; LongContext = [bool]$longContext
-                Input = [Int64]0; Cached = [Int64]0; Output = [Int64]0; Reasoning = [Int64]0; Events = [Int64]0
-                InputCost = [double]0; CachedCost = [double]0; OutputCost = [double]0; Known = $true; Price = $price
-            }
-        }
-        $bucket = $buckets[$bucketKey]
-        $bucket.Input += [Int64]$call.Input
-        $bucket.Cached += [Int64]$call.Cached
-        $bucket.Output += [Int64]$call.Output
-        $bucket.Reasoning += [Int64]$call.ReasoningOutput
-        $bucket.Events++
-        $eventCost = Get-TokenRaderCost -Usage $call -Model $model -PricingDocument $PricingDocument -Scope call
-        if ($eventCost.Known) {
-            $bucket.InputCost += [double]$eventCost.InputCost
-            $bucket.CachedCost += [double]$eventCost.CachedCost
-            $bucket.OutputCost += [double]$eventCost.OutputCost
-        } else {
-            $bucket.Known = $false
-            [void]$unknownModels.Add($(if ([string]::IsNullOrWhiteSpace($model)) { '未知模型' } else { $model }))
+    $thresholds = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($PricingDocument.models)) {
+        $threshold = if ($null -ne $entry.PSObject.Properties['longContextThreshold']) { [Int64]$entry.longContextThreshold } else { 0L }
+        $id = [string]$entry.id
+        if (-not [string]::IsNullOrWhiteSpace($id)) { $thresholds[$id] = $threshold }
+        foreach ($alias in @($entry.aliases)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$alias)) { $thresholds[[string]$alias] = $threshold }
         }
     }
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '流式聚合区间记录'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+    $aggregate = [TokenRaderIndexer]::AggregateIntervalRecords(
+        $index.Connection, $starts, $ends, $startedAt, $thresholds, $CancellationToken, $ProgressState)
 
+    $unknownModels = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     [double]$inputCost = 0
     [double]$cachedCost = 0
     [double]$outputCost = 0
-    $items = foreach ($bucket in @($buckets.Values)) {
-        $inputCost += [double]$bucket.InputCost
-        $cachedCost += [double]$bucket.CachedCost
-        $outputCost += [double]$bucket.OutputCost
+    $priceCache = @{}
+    $unitTokens = if ($null -ne $PricingDocument.PSObject.Properties['unitTokens'] -and [double]$PricingDocument.unitTokens -gt 0) {
+        [double]$PricingDocument.unitTokens
+    } else { 1000000.0 }
+    $items = foreach ($bucket in @($aggregate.Buckets)) {
         $bucketUsage = New-TokenRaderUsage -InputTokens $bucket.Input -CachedTokens $bucket.Cached -OutputTokens $bucket.Output -ReasoningOutputTokens $bucket.Reasoning
+        $model = [string]$bucket.Model
+        if (-not $priceCache.ContainsKey($model)) { $priceCache[$model] = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument }
+        $price = $priceCache[$model]
+        $known = $null -ne $price
+        [double]$bucketInputCost = 0
+        [double]$bucketCachedCost = 0
+        [double]$bucketOutputCost = 0
+        [double]$inputMultiplier = 1.0
+        [double]$outputMultiplier = 1.0
+        if ($known) {
+            if ([bool]$bucket.LongContext) {
+                $inputMultiplier = if ($null -ne $price.PSObject.Properties['longContextInputMultiplier']) { [double]$price.longContextInputMultiplier } else { 2.0 }
+                $outputMultiplier = if ($null -ne $price.PSObject.Properties['longContextOutputMultiplier']) { [double]$price.longContextOutputMultiplier } else { 1.5 }
+            }
+            $bucketInputCost = ([double]$bucketUsage.Uncached / $unitTokens) * [double]$price.input * $inputMultiplier
+            $bucketCachedCost = ([double]$bucketUsage.Cached / $unitTokens) * [double]$price.cachedInput * $inputMultiplier
+            $bucketOutputCost = ([double]$bucketUsage.Output / $unitTokens) * [double]$price.output * $outputMultiplier
+            $inputCost += $bucketInputCost
+            $cachedCost += $bucketCachedCost
+            $outputCost += $bucketOutputCost
+        } else {
+            [void]$unknownModels.Add($(if ([string]::IsNullOrWhiteSpace($model)) { '未知模型' } else { $model }))
+        }
         [pscustomobject]@{
-            Model = [string]$bucket.Model
+            Model = $model
             LongContext = [bool]$bucket.LongContext
             Usage = $bucketUsage
             Events = [Int64]$bucket.Events
             Cost = [pscustomobject]@{
-                Known = [bool]$bucket.Known; Model = [string]$bucket.Model; Price = $bucket.Price
-                InputCost = [double]$bucket.InputCost; CachedCost = [double]$bucket.CachedCost; OutputCost = [double]$bucket.OutputCost
-                TotalCost = [double]$bucket.InputCost + [double]$bucket.CachedCost + [double]$bucket.OutputCost
+                Known = $known; Model = $model; Price = $price
+                InputCost = $bucketInputCost; CachedCost = $bucketCachedCost; OutputCost = $bucketOutputCost
+                TotalCost = $bucketInputCost + $bucketCachedCost + $bucketOutputCost
                 LongContextApplied = [bool]$bucket.LongContext
+                InputMultiplier = $inputMultiplier
+                OutputMultiplier = $outputMultiplier
             }
         }
     }
@@ -2533,13 +2503,8 @@ function Get-TokenRaderIndexedIntervalResult {
     $startRateLimits = if ($null -ne $Baseline.PSObject.Properties['StartRateLimits']) { $Baseline.StartRateLimits }
                        elseif ($null -ne $Baseline.PSObject.Properties['RateLimits']) { $Baseline.RateLimits }
                        else { $null }
-    $modelList = @($models | Sort-Object)
-    $usage = New-TokenRaderUsage -InputTokens $aggregateInput -CachedTokens $aggregateCached -OutputTokens $aggregateOutput -ReasoningOutputTokens $aggregateReasoning
-    [Int64]$bytesRead = 0
-    foreach ($path in @($ends.Keys)) {
-        $start = if ($starts.ContainsKey($path)) { [Int64]$starts[$path] } else { 0L }
-        $bytesRead += [Math]::Max(0L, [Int64]$ends[$path] - $start)
-    }
+    $modelList = @($aggregate.Models)
+    $usage = New-TokenRaderUsage -InputTokens $aggregate.TotalInput -CachedTokens $aggregate.TotalCached -OutputTokens $aggregate.TotalOutput -ReasoningOutputTokens $aggregate.TotalReasoning
     $pricingComplete = $unknownModels.Count -eq 0
     [pscustomobject]@{
         StartedAt = $startedAt
@@ -2547,7 +2512,7 @@ function Get-TokenRaderIndexedIntervalResult {
         Usage = $usage
         Models = $modelList
         ModelDisplay = if ($modelList.Count -eq 0) { '等待模型调用' } elseif ($modelList.Count -eq 1) { $modelList[0] } else { '{0} 个模型' -f $modelList.Count }
-        ChangedSessions = $activeFiles.Count
+        ChangedSessions = [int]$aggregate.ChangedSessions
         Items = @($items)
         InputCost = $inputCost
         CachedCost = $cachedCost
@@ -2559,11 +2524,13 @@ function Get-TokenRaderIndexedIntervalResult {
         StartRateLimits = $startRateLimits
         EndRateLimits = $endRateLimits
         RateLimits = $endRateLimits
-        RawEvents = $rawEvents
-        CountedEvents = $countedEvents
-        DuplicateEventsDropped = $duplicateEvents
-        InheritedEventsDropped = $inheritedEvents
-        BytesRead = $bytesRead
+        RawEvents = [Int64]$aggregate.RawEvents
+        CountedEvents = [Int64]$aggregate.CountedEvents
+        DuplicateEventsDropped = [Int64]$aggregate.DuplicateEventsDropped
+        InheritedEventsDropped = [Int64]$aggregate.InheritedEventsDropped
+        BytesRead = [Int64]$aggregate.BytesRead
+        ProcessedRows = [Int64]$aggregate.ProcessedRows
+        ProcessingMilliseconds = [double]$aggregate.ProcessingMilliseconds
         IndexRevision = if ($null -ne $EndRevision) { [Int64]$EndRevision } else { [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) }
         ChangeRevision = if ($null -ne $ending) { [Int64]$ending.ChangeRevision } else { [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot) }
         Signature = 'index:' + $(if ($null -ne $EndRevision) { [string][Int64]$EndRevision } else { [string][Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) })

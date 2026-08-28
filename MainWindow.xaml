@@ -159,8 +159,9 @@
                 </StackPanel>
                 <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
                     <CheckBox x:Name="AutoRefreshCheckBox" Content="每 5 分钟自动刷新" IsChecked="True" Margin="0,0,15,0"/>
-                    <ComboBox x:Name="HistoryRangeComboBox" Width="105" SelectedIndex="1" Margin="0,0,8,0"
-                              ToolTip="历史显示范围">
+                    <ComboBox x:Name="HistoryRangeComboBox" Width="105" SelectedIndex="0" Margin="0,0,8,0"
+                              ToolTip="历史显示范围（最近1天表示当前时刻向前24小时）">
+                        <ComboBoxItem Content="最近1天" Tag="1"/>
                         <ComboBoxItem Content="最近7天" Tag="7"/>
                         <ComboBoxItem Content="最近30天" Tag="30"/>
                         <ComboBoxItem Content="最近90天" Tag="90"/>

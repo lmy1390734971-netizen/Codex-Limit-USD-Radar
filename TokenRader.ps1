@@ -32,8 +32,12 @@ $script:State = @{
     IntervalBaseline = $null
     IntervalResult = $null
     IntervalComputing = $false
+    IntervalComputeStopping = $false
+    IntervalActiveScanRateLimits = $false
     IntervalComputePending = $false
     IntervalComputePendingRequest = $null
+    IntervalLastError = ''
+    IntervalFinalRetry = $null
     IntervalCache = $null
     BackgroundJobs = @{}
     IndexReady = $false
@@ -66,12 +70,18 @@ $script:IntervalComputeScript = {
         [string]$PricingPath,
         [string]$ModulePath,
         [string]$SessionsRoot,
-        [bool]$ScanRateLimits
+        [bool]$ScanRateLimits,
+        [Threading.CancellationToken]$CancellationToken,
+        [hashtable]$ProgressState
     )
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
     $prices = Get-TokenRaderPrices -PricingPath $PricingPath
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '同步增量日志'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
     # The indexed core path owns interval parsing, end-boundary snapshots and
     # rate-limit selection.  Deliberately do not fall back to the old full-log
     # path here; a missing indexed function is a worker error reported
@@ -87,6 +97,8 @@ $script:IntervalComputeScript = {
     if ($null -ne $EndedAt -and $indexedCommand.Parameters.ContainsKey('EndedAt')) { $indexedParameters.EndedAt = $EndedAt }
     if ($indexedCommand.Parameters.ContainsKey('ScanRateLimits')) { $indexedParameters.ScanRateLimits = $ScanRateLimits }
     if ($indexedCommand.Parameters.ContainsKey('SessionsRoot')) { $indexedParameters.SessionsRoot = $SessionsRoot }
+    if ($indexedCommand.Parameters.ContainsKey('CancellationToken')) { $indexedParameters.CancellationToken = $CancellationToken }
+    if ($indexedCommand.Parameters.ContainsKey('ProgressState')) { $indexedParameters.ProgressState = $ProgressState }
     $result = & $indexedCommand.Name @indexedParameters
     $latest = if ($null -ne $result -and $null -ne $result.PSObject.Properties['EndRateLimits']) { $result.EndRateLimits }
               elseif ($null -ne $result -and $null -ne $result.PSObject.Properties['RateLimits']) { $result.RateLimits }
@@ -220,7 +232,7 @@ function Get-SelectedHistoryDays {
         $days = 0
         if ([int]::TryParse([string]$item.Tag, [ref]$days) -and $days -ge 0) { return $days }
     }
-    return 30
+    return 1
 }
 
 function New-TokenRaderRequestId {
@@ -254,7 +266,8 @@ function Set-TokenRaderUiState {
     $script:RefreshButton.IsEnabled = ($canOperate -and -not [bool]$script:State.IndexSyncing)
     $script:RebuildIndexButton.IsEnabled = ($canOperate -and $indexReady)
     $script:PurgeOldIndexButton.IsEnabled = ($canOperate -and $indexReady)
-    $script:HistoryRangeComboBox.IsEnabled = $canOperate
+    # 历史浏览范围不参与开始/结束时间段的计量边界，测量进行中也可切换。
+    $script:HistoryRangeComboBox.IsEnabled = ($NewState -in @('Idle', 'Measuring', 'Ready', 'Error'))
     $script:SessionListBox.IsEnabled = $canOperate
     $script:ProjectComboBox.IsEnabled = $canOperate
     $script:ScopeComboBox.IsEnabled = $canOperate
@@ -313,6 +326,8 @@ function Reset-TokenRaderBackgroundFailureState {
     $script:State.EndCaptureRequestId = 0L
     $script:State.IntervalComputeRequestId = 0L
     $script:State.IntervalComputing = $false
+    $script:State.IntervalComputeStopping = $false
+    $script:State.IntervalActiveScanRateLimits = $false
     $script:State.IntervalComputePending = $false
     $script:State.IntervalComputePendingRequest = $null
     $script:State.PendingMeasurementStart = $false
@@ -344,13 +359,20 @@ function Request-TokenRaderBackgroundStop {
     param([Parameter(Mandatory = $true)]$Job)
     if ($null -ne $Job.StopAsyncResult) { return }
     $Job.CompletionDelivered = $true
+    if ($null -ne $Job.CancellationSource) {
+        try { $Job.CancellationSource.Cancel() } catch { }
+    }
     try {
         # BeginStop is asynchronous: cancellation and timeout never block WPF.
         $Job.StopAsyncResult = $Job.PowerShell.BeginStop([System.AsyncCallback]$null, $null)
     } catch {
         try { $Job.PowerShell.Dispose() } catch { }
+        try { if ($null -ne $Job.CancellationSource) { $Job.CancellationSource.Dispose() } } catch { }
         if ($script:State.BackgroundJobs.ContainsKey([Int64]$Job.RequestId)) {
             [void]$script:State.BackgroundJobs.Remove([Int64]$Job.RequestId)
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$Job.StopCompletionHandler)) {
+            try { Invoke-TokenRaderBackgroundHandler -HandlerName ([string]$Job.StopCompletionHandler) -Value $null -Job $Job } catch { }
         }
     }
 }
@@ -376,7 +398,15 @@ function Start-TokenRaderBackgroundPoller {
                     if ($job.StopAsyncResult.IsCompleted) {
                         try { $job.PowerShell.EndStop($job.StopAsyncResult) } catch { }
                         try { $job.PowerShell.Dispose() } catch { }
+                        try { if ($null -ne $job.CancellationSource) { $job.CancellationSource.Dispose() } } catch { }
                         [void]$script:State.BackgroundJobs.Remove($requestId)
+                        if (-not [string]::IsNullOrWhiteSpace([string]$job.StopCompletionHandler)) {
+                            try {
+                                Invoke-TokenRaderBackgroundHandler -HandlerName ([string]$job.StopCompletionHandler) -Value $null -Job $job
+                            } catch {
+                                Reset-TokenRaderBackgroundFailureState -Message ('后台停止回调失败：' + $_.Exception.Message)
+                            }
+                        }
                     }
                     continue
                 }
@@ -392,6 +422,7 @@ function Start-TokenRaderBackgroundPoller {
                         $errorMessage = $_.Exception.Message
                     } finally {
                         try { $job.PowerShell.Dispose() } catch { }
+                        try { if ($null -ne $job.CancellationSource) { $job.CancellationSource.Dispose() } } catch { }
                     }
 
                     if (-not [bool]$job.CompletionDelivered) {
@@ -420,6 +451,23 @@ function Start-TokenRaderBackgroundPoller {
                     $prefix = if ([bool](Get-TokenRaderCallbackContextValue -Context $job.CallbackContext -Name 'ColdStart' -Default $false)) { '首次建库' } else { '索引同步' }
                     $script:StatusText.Text = ('{0}：{1}{2}，已用 {3:0.0} 秒…' -f $prefix, $stage, $countText, $elapsed.TotalSeconds)
                 }
+                if ([string]$job.Kind -eq 'IntervalCompute' -and
+                    [Int64]$script:State.IntervalComputeRequestId -eq [Int64]$job.RequestId -and
+                    ($now - [DateTimeOffset]$job.LastProgressUiAt).TotalMilliseconds -ge 1000) {
+                    $job.LastProgressUiAt = $now
+                    $isFinalCompute = [bool](Get-TokenRaderCallbackContextValue -Context $job.CallbackContext -Name 'Final' -Default $false)
+                    $stage = [string](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'Stage' -Default '计算时间段消耗')
+                    $processedRows = [Int64](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'ProcessedRows' -Default 0L)
+                    $slow = ([int]$job.SoftWarningSeconds -gt 0 -and $elapsed.TotalSeconds -ge [int]$job.SoftWarningSeconds)
+                    $detail = if ($processedRows -gt 0) { '，已处理 {0:N0} 条记录' -f $processedRows } else { '' }
+                    $script:StatusText.Text = if ($isFinalCompute) {
+                        '正在后台结算冻结时间段：{0}{1}，计算用时 {2:0} 秒{3}' -f $stage, $detail, $elapsed.TotalSeconds, $(if ($slow) { '（数据量较大）' } else { '' })
+                    } elseif ($null -ne $script:State.IntervalResult) {
+                        '正在后台更新：{0}{1}；当前保留上一次结果，计算用时 {2:0} 秒{3}' -f $stage, $detail, $elapsed.TotalSeconds, $(if ($slow) { '（数据量较大）' } else { '' })
+                    } else {
+                        '正在后台计算：{0}{1}，计算用时 {2:0} 秒{3}' -f $stage, $detail, $elapsed.TotalSeconds, $(if ($slow) { '（数据量较大）' } else { '' })
+                    }
+                }
 
                 $totalTimedOut = ([int]$job.TimeoutSeconds -gt 0 -and $elapsed.TotalSeconds -ge [int]$job.TimeoutSeconds)
                 $lastProgressAt = [DateTimeOffset]$job.StartedAt
@@ -429,6 +477,7 @@ function Start-TokenRaderBackgroundPoller {
                 $stalled = ([int]$job.StallTimeoutSeconds -gt 0 -and ($now - $lastProgressAt).TotalSeconds -ge [int]$job.StallTimeoutSeconds)
                 if (($totalTimedOut -or $stalled) -and -not [bool]$job.CompletionDelivered) {
                     $job.CompletionDelivered = $true
+                    if ($job.CallbackContext -is [System.Collections.IDictionary]) { $job.CallbackContext['StopPending'] = $true }
                     $timeoutMessage = if ($stalled) {
                         '后台任务长时间没有进度，已停止并解锁界面。'
                     } else { '后台任务超过限定时间，已停止并解锁界面。' }
@@ -459,8 +508,11 @@ function Start-TokenRaderBackgroundJob {
         [Parameter(Mandatory = $true)][string]$FailureHandler,
         $CallbackContext = $null,
         [int]$TimeoutSeconds = 0,
+        [int]$SoftWarningSeconds = 0,
         [int]$StallTimeoutSeconds = 0,
-        [hashtable]$ProgressState = $null
+        [hashtable]$ProgressState = $null,
+        [Threading.CancellationTokenSource]$CancellationSource = $null,
+        [string]$StopCompletionHandler = ''
     )
 
     if ($script:WindowClosing) { return $false }
@@ -481,8 +533,11 @@ function Start-TokenRaderBackgroundJob {
             CallbackContext = $CallbackContext
             StartedAt = $startedAt
             TimeoutSeconds = $TimeoutSeconds
+            SoftWarningSeconds = $SoftWarningSeconds
             StallTimeoutSeconds = $StallTimeoutSeconds
             ProgressState = $ProgressState
+            CancellationSource = $CancellationSource
+            StopCompletionHandler = $StopCompletionHandler
             CompletionDelivered = $false
             StopAsyncResult = $null
             LastProgressUiAt = $startedAt
@@ -491,6 +546,7 @@ function Start-TokenRaderBackgroundJob {
         return $true
     } catch {
         try { $worker.Dispose() } catch { }
+        try { if ($null -ne $CancellationSource) { $CancellationSource.Dispose() } } catch { }
         if ($script:State.BackgroundJobs.ContainsKey($RequestId)) { [void]$script:State.BackgroundJobs.Remove($RequestId) }
         $failedJob = [pscustomobject]@{
             Generation = $Generation; RequestId = $RequestId; Kind = $Kind; CallbackContext = $CallbackContext
@@ -509,8 +565,10 @@ function Stop-TokenRaderBackgroundJobs {
         $script:BackgroundPollTimer.Stop()
     }
     foreach ($job in @($script:State.BackgroundJobs.Values)) {
+        try { if ($null -ne $job.CancellationSource) { $job.CancellationSource.Cancel() } } catch { }
         try { $job.PowerShell.Stop() } catch { }
         try { $job.PowerShell.Dispose() } catch { }
+        try { if ($null -ne $job.CancellationSource) { $job.CancellationSource.Dispose() } } catch { }
     }
     $script:State.BackgroundJobs.Clear()
 }
@@ -588,11 +646,123 @@ function Complete-TokenRaderIntervalComputeJob {
         -Generation $Generation -RequestId $RequestId
 }
 
+function New-TokenRaderFinalRetryState {
+    param([Int64]$Generation, $Context)
+    return [pscustomobject]@{
+        Generation = $Generation
+        BaselineStartedAt = Get-TokenRaderCallbackContextValue -Context $Context -Name 'BaselineStartedAt'
+        EndOffsets = Get-TokenRaderCallbackContextValue -Context $Context -Name 'EndOffsets'
+        EndRevision = Get-TokenRaderCallbackContextValue -Context $Context -Name 'EndRevision'
+        EndedAt = Get-TokenRaderCallbackContextValue -Context $Context -Name 'EndedAt'
+        ScanRateLimits = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'ScanRateLimits' -Default $true)
+    }
+}
+
+function Start-TokenRaderPendingIntervalCompute {
+    param($PendingRequest, [Int64]$Generation)
+    if ($null -eq $PendingRequest -or [Int64]$PendingRequest.Generation -ne $Generation -or
+        $null -eq $script:State.IntervalBaseline) { return $false }
+    if ([bool]$PendingRequest.Final) {
+        Set-TokenRaderUiState -NewState 'ComputingFinal' -StatusMessage '实时预览已停止，正在使用冻结边界完成最终结算…'
+    } else {
+        $script:StatusText.Text = '前一后台请求已结束，正在执行合并后的手动刷新…'
+    }
+    $pendingEndOffsets = if ($null -eq $PendingRequest.EndOffsets) {
+        $null
+    } else {
+        ConvertTo-TokenRaderOffsetHashtable -Value $PendingRequest.EndOffsets
+    }
+    Start-TokenRaderIntervalComputeAsync `
+        -Baseline $script:State.IntervalBaseline `
+        -EndOffsets $pendingEndOffsets `
+        -EndRevision $PendingRequest.EndRevision `
+        -EndedAt $PendingRequest.EndedAt `
+        -Final ([bool]$PendingRequest.Final) `
+        -ScanRateLimits ([bool]$PendingRequest.ScanRateLimits) `
+        -Generation $Generation `
+        -RequestId ([Int64]$PendingRequest.RequestId)
+    return $true
+}
+
 function Fail-TokenRaderIntervalComputeJob {
     param($ErrorMessage, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
     $final = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'Final' -Default $false)
-    Fail-TokenRaderMeasurementRequest -Generation $Generation -RequestId $RequestId -Final $final `
-        -Message ('时间段后台计算失败：' + [string]$ErrorMessage)
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $Generation -or
+        [Int64]$script:State.IntervalComputeRequestId -ne $RequestId) { return }
+
+    $message = '时间段后台计算失败：' + [string]$ErrorMessage
+    $stopPending = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'StopPending' -Default $false)
+    $script:State.IntervalLastError = $message
+
+    if ($final) {
+        # EndOffsets and EndRevision are immutable. Preserve them so a timeout
+        # or transient SQLite lock can be retried without losing the completed
+        # measurement or accidentally including later log writes.
+        $script:State.IntervalFinalRetry = New-TokenRaderFinalRetryState -Generation $Generation -Context $Context
+    }
+
+    if ($stopPending) {
+        # Do not unlock or launch a replacement until CancellationToken and
+        # BeginStop have both completed. This prevents a timed-out native query
+        # from becoming a hidden CPU-consuming zombie beside the next request.
+        $script:State.IntervalComputeStopping = $true
+        $script:StatusText.Text = if ($final) {
+            $message + ' 正在取消过慢的最终查询；冻结边界已保留…'
+        } elseif ([string]$script:State.UiState -eq 'Stopping') {
+            $message + ' 正在取消实时预览；结束边界仍在冻结…'
+        } else {
+            $message + ' 正在取消过慢查询；测量仍然有效…'
+        }
+        return
+    }
+
+    $pendingRequest = if ([bool]$script:State.IntervalComputePending) { $script:State.IntervalComputePendingRequest } else { $null }
+    $script:State.IntervalComputeRequestId = 0L
+    $script:State.IntervalComputing = $false
+    $script:State.IntervalComputeStopping = $false
+    $script:State.IntervalActiveScanRateLimits = $false
+    $script:State.IntervalComputePending = $false
+    $script:State.IntervalComputePendingRequest = $null
+
+    if ($final) {
+        Set-TokenRaderUiState -NewState 'Ready' -StatusMessage ($message + ' 已保留冻结边界；点击“查看结果”可重试。')
+        return
+    }
+
+    # A live preview is advisory. Its failure must not invalidate the frozen
+    # baseline, the current measurement, or the last successfully shown result.
+    if (Start-TokenRaderPendingIntervalCompute -PendingRequest $pendingRequest -Generation $Generation) { return }
+
+    if ([string]$script:State.UiState -eq 'Measuring') {
+        Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage ($message + ' 测量仍然有效，可稍后再次查看。')
+    } elseif ([string]$script:State.UiState -eq 'Stopping') {
+        $script:StatusText.Text = $message + ' 正在继续冻结结束边界…'
+    }
+}
+
+function Complete-TokenRaderIntervalStopJob {
+    param($Payload, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $Generation -or
+        [Int64]$script:State.IntervalComputeRequestId -ne $RequestId) { return }
+
+    $final = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'Final' -Default $false)
+    $pendingRequest = if ([bool]$script:State.IntervalComputePending) { $script:State.IntervalComputePendingRequest } else { $null }
+    $message = [string]$script:State.IntervalLastError
+    $script:State.IntervalComputeRequestId = 0L
+    $script:State.IntervalComputing = $false
+    $script:State.IntervalComputeStopping = $false
+    $script:State.IntervalActiveScanRateLimits = $false
+    $script:State.IntervalComputePending = $false
+    $script:State.IntervalComputePendingRequest = $null
+
+    if (Start-TokenRaderPendingIntervalCompute -PendingRequest $pendingRequest -Generation $Generation) { return }
+    if ($final) {
+        Set-TokenRaderUiState -NewState 'Ready' -StatusMessage ($message + ' 已停止过慢查询并保留冻结边界；点击“查看结果”可重试。')
+    } elseif ([string]$script:State.UiState -eq 'Measuring') {
+        Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage ($message + ' 已停止过慢查询；测量仍然有效，可再次查看。')
+    } elseif ([string]$script:State.UiState -eq 'Stopping') {
+        $script:StatusText.Text = $message + ' 已停止实时预览；正在继续冻结结束边界…'
+    }
 }
 
 function Start-TokenRaderMeasurementBaselineAsync {
@@ -843,11 +1013,13 @@ function Show-IntervalResult {
     $script:ScopeBadgeText.Text = if ($Running) { '全部项目实时计算' } else { '全部项目时间段' }
     $duration = $Result.EndedAt - $Result.StartedAt
     $durationText = Format-IntervalDuration $duration
+    $processingMilliseconds = if ($null -ne $Result.PSObject.Properties['ProcessingMilliseconds']) { [double]$Result.ProcessingMilliseconds } else { 0.0 }
+    $processingText = if ($processingMilliseconds -gt 0) { ' · 本次结果计算 {0:0.00} 秒' -f ($processingMilliseconds / 1000.0) } else { '' }
     $script:UpdatedText.Text = ('{0:HH:mm:ss} → {1:HH:mm:ss} · {2} · {3} 个活跃会话' -f $Result.StartedAt, $Result.EndedAt, $durationText, $Result.ChangedSessions)
     $script:IntervalTimeText.Text = if ($Running) {
-        ('开始于 {0:HH:mm:ss} · 已计时 {1}' -f $Result.StartedAt, $durationText)
+        ('开始于 {0:HH:mm:ss} · 测量时长 {1}{2}' -f $Result.StartedAt, $durationText, $processingText)
     } else {
-        ('{0:HH:mm:ss} — {1:HH:mm:ss} · 共 {2}' -f $Result.StartedAt, $Result.EndedAt, $durationText)
+        ('{0:HH:mm:ss} — {1:HH:mm:ss} · 测量时长 {2}{3}' -f $Result.StartedAt, $Result.EndedAt, $durationText, $processingText)
     }
 
     Set-UsageMetrics -Usage $Result.Usage -Model ([string]$Result.ModelDisplay)
@@ -887,7 +1059,31 @@ function Show-IntervalResult {
         [Int64]$Result.CountedEvents,
         [Int64]$Result.DuplicateEventsDropped,
         [Int64]$Result.InheritedEventsDropped)
-    $script:StatusText.Text = if ($Running) { '正在实时统计全部项目在指定时间段内的新消耗…' } else { '全部项目的时间段计算已结束，结果已冻结。' }
+    $script:StatusText.Text = if ($Running) { '已显示本次测量的最新结果；测量仍在继续。' } else { '全部项目的时间段计算已结束，结果已冻结。' }
+    Update-QuotaCards
+}
+
+function Show-EmptyIntervalMeasurement {
+    param([Parameter(Mandatory = $true)]$Baseline)
+    $zeroUsage = [pscustomobject]@{
+        Input = [Int64]0; Cached = [Int64]0; Uncached = [Int64]0
+        Output = [Int64]0; ReasoningOutput = [Int64]0; Total = [Int64]0; CacheHitRate = 0.0
+    }
+    $script:SelectedSessionText.Text = '全部项目 · 指定时间段消耗（计算中）'
+    $script:ScopeBadgeText.Text = '全部项目实时计算'
+    $script:UpdatedText.Text = ('开始于 {0:HH:mm:ss} · 等待首次查看结果' -f [DateTimeOffset]$Baseline.StartedAt)
+    $script:IntervalTimeText.Text = ('开始于 {0:HH:mm:ss} · 测量时长 0 秒 · 尚未执行结果计算' -f [DateTimeOffset]$Baseline.StartedAt)
+    Set-UsageMetrics -Usage $zeroUsage -Model '等待模型调用'
+    $script:UsdCostText.Text = Format-TokenRaderUsd 0
+    $script:CostBreakdownText.Text = '尚未读取本次测量的新调用'
+    $script:LongContextText.Text = '点击“查看结果”后进行精确增量计算'
+    $script:InputPriceText.Text = '等待调用'
+    $script:CachedPriceText.Text = '等待调用'
+    $script:OutputPriceText.Text = '等待调用'
+    $script:State.CurrentPriceUrl = ''
+    $script:OpenPricingButton.IsEnabled = $false
+    $script:FormulaText.Text = '时间段始终统计全部项目和全部 Codex 会话，不受项目下拉框影响。'
+    $script:CaveatText.Text = '开始位置已经冻结；尚未运行结果查询，不代表本次消耗为零。'
     Update-QuotaCards
 }
 
@@ -931,7 +1127,7 @@ function Complete-TokenRaderMeasurementBaseline {
     $script:State.IntervalCache = $null
     Merge-LatestRateLimits -Candidate $Baseline.StartRateLimits
     Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage '开始位置已冻结，正在等待 Codex 新消耗…'
-    Start-TokenRaderIntervalComputeAsync -Baseline $Baseline -Generation $Generation
+    Show-EmptyIntervalMeasurement -Baseline $Baseline
 }
 
 function Complete-TokenRaderMeasurementEnd {
@@ -977,6 +1173,8 @@ function Fail-TokenRaderMeasurementRequest {
     if ([Int64]$script:State.IntervalComputeRequestId -eq $RequestId) {
         $script:State.IntervalComputeRequestId = 0
         $script:State.IntervalComputing = $false
+        $script:State.IntervalComputeStopping = $false
+        $script:State.IntervalActiveScanRateLimits = $false
     }
     $script:State.IntervalComputePending = $false
     $script:State.IntervalComputePendingRequest = $null
@@ -1004,31 +1202,60 @@ function Start-TokenRaderIntervalComputeAsync {
     if ([Int64]$script:State.MeasurementGeneration -ne $effectiveGeneration) { return }
     $effectiveRequestId = if ($RequestId -gt 0) { $RequestId } else { New-TokenRaderRequestId }
     if ([bool]$script:State.IntervalComputing) {
-        # Keep only the newest request for this measurement.  A final request
-        # supersedes any live request but waits for it to finish.
-        $script:State.IntervalComputePending = $true
-        $script:State.IntervalComputePendingRequest = [pscustomobject]@{
-            Generation = $effectiveGeneration
-            RequestId = $effectiveRequestId
-            BaselineStartedAt = [DateTimeOffset]$Baseline.StartedAt
-            EndOffsets = $EndOffsets
-            EndRevision = $EndRevision
-            EndedAt = $EndedAt
-            Final = $Final
-            ScanRateLimits = $ScanRateLimits
+        # A final request always supersedes a preview. A manual preview that
+        # requests fresh quota data may follow an automatic token-only preview,
+        # but repeated equivalent clicks are coalesced into the same request.
+        $queueManualQuota = (-not $Final -and $ScanRateLimits -and
+            -not [bool]$script:State.IntervalActiveScanRateLimits -and
+            (-not [bool]$script:State.IntervalComputePending -or
+                $null -eq $script:State.IntervalComputePendingRequest -or
+                -not [bool]$script:State.IntervalComputePendingRequest.ScanRateLimits))
+        if ($Final -or $queueManualQuota) {
+            $script:State.IntervalComputePending = $true
+            $script:State.IntervalComputePendingRequest = [pscustomobject]@{
+                Generation = $effectiveGeneration
+                RequestId = $effectiveRequestId
+                BaselineStartedAt = [DateTimeOffset]$Baseline.StartedAt
+                EndOffsets = $EndOffsets
+                EndRevision = $EndRevision
+                EndedAt = $EndedAt
+                Final = $Final
+                ScanRateLimits = $ScanRateLimits
+            }
+        }
+        if ($Final -and -not [bool]$script:State.IntervalComputeStopping) {
+            $activeRequestId = [Int64]$script:State.IntervalComputeRequestId
+            $activeJob = if ($script:State.BackgroundJobs.ContainsKey($activeRequestId)) {
+                $script:State.BackgroundJobs[$activeRequestId]
+            } else { $null }
+            if ($null -ne $activeJob) {
+                $script:State.IntervalComputeStopping = $true
+                $script:StatusText.Text = '结束边界已冻结，正在停止实时预览后执行最终结算…'
+                Request-TokenRaderBackgroundStop -Job $activeJob
+            }
         }
         return
     }
 
     $script:State.IntervalComputing = $true
+    $script:State.IntervalComputeStopping = $false
+    $script:State.IntervalActiveScanRateLimits = $ScanRateLimits
     $script:State.IntervalComputeRequestId = $effectiveRequestId
+    $script:State.IntervalLastError = ''
     if ($Final) { $script:StatusText.Text = '正在后台结算指定时间段…' }
+    elseif ($null -ne $script:State.IntervalResult) { $script:StatusText.Text = '正在后台更新；当前保留上一次结果…' }
     else { $script:StatusText.Text = '正在后台计算指定时间段消耗…' }
 
     $snapshots = @{}
     if ($null -ne $script:State.IntervalCache -and $null -ne $script:State.IntervalCache.PSObject.Properties['BaselineSnapshots']) {
         $snapshots = $script:State.IntervalCache.BaselineSnapshots
     }
+    $progressState = [hashtable]::Synchronized(@{
+        Stage = '启动后台计算'
+        ProcessedRows = [Int64]0
+        LastProgressAt = [DateTimeOffset]::Now
+    })
+    $cancellationSource = [Threading.CancellationTokenSource]::new()
     [void](Start-TokenRaderBackgroundJob `
         -ScriptBlock $script:IntervalComputeScript `
         -Parameters @{
@@ -1041,6 +1268,8 @@ function Start-TokenRaderIntervalComputeAsync {
             ModulePath = [string](Join-Path $PSScriptRoot 'TokenRader.Core.psm1')
             SessionsRoot = [string]$script:Paths.SessionsRoot
             ScanRateLimits = $ScanRateLimits
+            CancellationToken = $cancellationSource.Token
+            ProgressState = $progressState
         } `
         -Kind 'IntervalCompute' `
         -Generation $effectiveGeneration `
@@ -1050,8 +1279,16 @@ function Start-TokenRaderIntervalComputeAsync {
         -CallbackContext @{
             BaselineStartedAt = [DateTimeOffset]$Baseline.StartedAt
             Final = $Final
+            EndOffsets = $EndOffsets
+            EndRevision = $EndRevision
+            EndedAt = $EndedAt
+            ScanRateLimits = $ScanRateLimits
         } `
-        -TimeoutSeconds 60)
+        -TimeoutSeconds $(if ($Final) { 60 } else { 15 }) `
+        -SoftWarningSeconds 3 `
+        -ProgressState $progressState `
+        -CancellationSource $cancellationSource `
+        -StopCompletionHandler 'Complete-TokenRaderIntervalStopJob')
 }
 
 function Complete-TokenRaderIntervalCompute {
@@ -1085,6 +1322,8 @@ function Complete-TokenRaderIntervalCompute {
         $accepted = $true
         $result = $Payload.Result
         $script:State.IntervalResult = $result
+        $script:State.IntervalLastError = ''
+        if ($Final) { $script:State.IntervalFinalRetry = $null }
         if ($null -ne $Payload.PSObject.Properties['LatestRateLimits']) { Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits }
         $endLimits = if ($null -ne $result.PSObject.Properties['EndRateLimits']) { $result.EndRateLimits } else { $result.RateLimits }
         Merge-LatestRateLimits -Candidate $endLimits
@@ -1107,6 +1346,8 @@ function Complete-TokenRaderIntervalCompute {
     } finally {
         if ([Int64]$script:State.IntervalComputeRequestId -eq $effectiveRequestId) {
             $script:State.IntervalComputing = $false
+            $script:State.IntervalComputeStopping = $false
+            $script:State.IntervalActiveScanRateLimits = $false
             $script:State.IntervalComputeRequestId = 0
         }
         if ($succeeded -and $Final) { Set-TokenRaderUiState -NewState 'Ready' }
@@ -1119,9 +1360,14 @@ function Complete-TokenRaderIntervalCompute {
             if ($null -ne $request -and [Int64]$request.Generation -eq $effectiveGeneration -and
                 [DateTimeOffset]$request.BaselineStartedAt -eq [DateTimeOffset]$script:State.IntervalBaseline.StartedAt) {
                 if ([bool]$request.Final) { Set-TokenRaderUiState -NewState 'ComputingFinal' }
+                $pendingEndOffsets = if ($null -eq $request.EndOffsets) {
+                    $null
+                } else {
+                    ConvertTo-TokenRaderOffsetHashtable -Value $request.EndOffsets
+                }
                 Start-TokenRaderIntervalComputeAsync `
                     -Baseline $script:State.IntervalBaseline `
-                    -EndOffsets (ConvertTo-TokenRaderOffsetHashtable -Value $request.EndOffsets) `
+                    -EndOffsets $pendingEndOffsets `
                     -EndRevision $request.EndRevision `
                     -EndedAt $request.EndedAt `
                     -Final ([bool]$request.Final) `
@@ -1134,6 +1380,7 @@ function Complete-TokenRaderIntervalCompute {
 }
 
 function Update-IntervalView {
+    param([switch]$Manual)
     if ($null -eq $script:State.IntervalBaseline) { return }
     if ($null -ne $script:State.IntervalResult) {
         Show-IntervalResult -Result $script:State.IntervalResult -Running ([bool]$script:State.IsMeasuring)
@@ -1141,10 +1388,44 @@ function Update-IntervalView {
             $script:StatusText.Text = '正在后台结算，当前显示上一次结果…'
         }
     }
+    if ($script:State.UiState -eq 'Ready' -and $null -ne $script:State.IntervalFinalRetry) {
+        if ([bool]$script:State.IntervalComputing) {
+            $script:StatusText.Text = '正在重试冻结时间段结算；当前保留上一次结果…'
+            return
+        }
+        $retry = $script:State.IntervalFinalRetry
+        if ([Int64]$retry.Generation -ne [Int64]$script:State.MeasurementGeneration -or
+            [DateTimeOffset]$retry.BaselineStartedAt -ne [DateTimeOffset]$script:State.IntervalBaseline.StartedAt) {
+            $script:State.IntervalFinalRetry = $null
+            return
+        }
+        Set-TokenRaderUiState -NewState 'ComputingFinal' -StatusMessage '正在按已冻结的结束边界重试结算…'
+        Start-TokenRaderIntervalComputeAsync `
+            -Baseline $script:State.IntervalBaseline `
+            -EndOffsets (ConvertTo-TokenRaderOffsetHashtable -Value $retry.EndOffsets) `
+            -EndRevision $retry.EndRevision `
+            -EndedAt $retry.EndedAt `
+            -Final $true `
+            -ScanRateLimits ([bool]$retry.ScanRateLimits) `
+            -Generation ([Int64]$retry.Generation)
+        return
+    }
     if ($script:State.UiState -eq 'Measuring') {
+        if ([bool]$script:State.IntervalComputing) {
+            if ($Manual -and -not [bool]$script:State.IntervalActiveScanRateLimits) {
+                Start-TokenRaderIntervalComputeAsync `
+                    -Baseline $script:State.IntervalBaseline `
+                    -ScanRateLimits $true `
+                    -Generation ([Int64]$script:State.MeasurementGeneration)
+            }
+            $script:StatusText.Text = if ($null -ne $script:State.IntervalResult) {
+                '正在后台更新；当前保留上一次结果，重复请求已合并…'
+            } else { '正在后台计算时间段新消耗，重复请求已合并…' }
+            return
+        }
         # An unchanged watcher revision is an O(1) cache hit. Never enumerate
         # the complete session tree on the WPF dispatcher.
-        if ($null -ne $script:State.IntervalCache -and
+        if (-not $Manual -and $null -ne $script:State.IntervalCache -and
             $null -ne $script:State.IntervalCache.PSObject.Properties['ChangeRevision']) {
             $currentChangeRevision = Get-TokenRaderChangeRevision -SessionsRoot $script:Paths.SessionsRoot
             if ([Int64]$currentChangeRevision -eq [Int64]$script:State.IntervalCache.ChangeRevision) {
@@ -1154,6 +1435,7 @@ function Update-IntervalView {
         }
         Start-TokenRaderIntervalComputeAsync `
             -Baseline $script:State.IntervalBaseline `
+            -ScanRateLimits ([bool]$Manual) `
             -Generation ([Int64]$script:State.MeasurementGeneration)
     }
 }
@@ -1261,8 +1543,12 @@ function Start-IntervalMeasurement {
     $script:State.EndCaptureRequestId = 0
     $script:State.IntervalComputeRequestId = 0
     $script:State.IntervalComputing = $false
+    $script:State.IntervalComputeStopping = $false
+    $script:State.IntervalActiveScanRateLimits = $false
     $script:State.IntervalComputePending = $false
     $script:State.IntervalComputePendingRequest = $null
+    $script:State.IntervalLastError = ''
+    $script:State.IntervalFinalRetry = $null
     $script:State.IntervalBaseline = $null
     $script:State.IntervalResult = $null
     $script:State.IntervalCache = $null
@@ -1290,6 +1576,8 @@ function Cancel-TokenRaderMeasurementPreparation {
     $script:State.EndCaptureRequestId = 0L
     $script:State.IntervalComputeRequestId = 0L
     $script:State.IntervalComputing = $false
+    $script:State.IntervalComputeStopping = $false
+    $script:State.IntervalActiveScanRateLimits = $false
     $script:State.IntervalComputePending = $false
     $script:State.IntervalComputePendingRequest = $null
     $script:State.IntervalBaseline = $null
@@ -1626,7 +1914,7 @@ $script:PurgeOldIndexButton.Add_Click({
     }
 })
 $script:HistoryRangeComboBox.Add_SelectionChanged({
-    if (-not $script:State.Refreshing -and [string]$script:State.UiState -in @('Idle', 'Ready', 'Error')) {
+    if (-not $script:State.Refreshing -and [string]$script:State.UiState -in @('Idle', 'Measuring', 'Ready', 'Error')) {
         $script:State.ProjectCache = @{}
         Refresh-Application
     }
@@ -1662,7 +1950,7 @@ $script:StopMeasureButton.Add_Click({ Stop-IntervalMeasurement })
 $script:ViewIntervalButton.Add_Click({
     if ($null -ne $script:State.IntervalBaseline) {
         $script:State.ViewMode = 'interval'
-        Update-IntervalView
+        Update-IntervalView -Manual
     }
 })
 $script:OpenLogsButton.Add_Click({

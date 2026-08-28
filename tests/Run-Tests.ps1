@@ -442,12 +442,65 @@ try {
     Assert-Near $frozenResultBeforeAppend.TotalCost $frozenResultAfterAppend.TotalCost 0.0000001 'frozen interval cost remains stable after a later append'
     Assert-Near 5.0 $frozenResultAfterAppend.EndRateLimits.FiveHour.UsedPercent 0.0001 'frozen interval keeps the end rate-limit snapshot'
     Assert-Near 6.0 $frozenResultAfterAppend.EndRateLimits.Weekly.UsedPercent 0.0001 'frozen interval keeps the end weekly snapshot'
-    Assert-Equal 1 $indexedFrozenBeforeAppend.CountedEvents 'indexed frozen interval counts the bounded call'
+    if ([Int64]$indexedFrozenBeforeAppend.CountedEvents -ne 1L) {
+        $indexedFreezeStarts = ConvertTo-TestOffsetHashtable -Value $captureFreezeBaseline.StartOffsets
+        $indexedFreezeRows = QueryIntervalRecords -StartOffsets $indexedFreezeStarts -EndOffsets $captureFreezeEndOffsets -SessionsRoot $captureFreezeRoot
+        throw ('ASSERT FAILED: indexed frozen interval counts the bounded call. Expected=[1] Actual=[{0}] Raw=[{1}] Processed=[{2}] Inherited=[{3}] Start=[{4}] End=[{5}] DirectRows=[{6}]' -f
+            $indexedFrozenBeforeAppend.CountedEvents, $indexedFrozenBeforeAppend.RawEvents,
+            $indexedFrozenBeforeAppend.ProcessedRows, $indexedFrozenBeforeAppend.InheritedEventsDropped,
+            [Int64]$indexedFreezeStarts[$captureFreezePath], [Int64]$captureFreezeEndOffsets[$captureFreezePath],
+            $(if ($null -eq $indexedFreezeRows) { -1 } else { $indexedFreezeRows.Rows.Count }))
+    }
     Assert-Equal 1 $indexedFrozenAfterAppend.CountedEvents 'indexed frozen interval ignores an append after EndOffsets'
     Assert-Equal $indexedFrozenBeforeAppend.Usage.Input $indexedFrozenAfterAppend.Usage.Input 'indexed frozen input remains stable'
     Assert-Near $indexedFrozenBeforeAppend.TotalCost $indexedFrozenAfterAppend.TotalCost 0.0000001 'indexed frozen cost remains stable'
     Assert-Near 5.0 $indexedFrozenAfterAppend.EndRateLimits.FiveHour.UsedPercent 0.0001 'indexed frozen five-hour snapshot remains stable'
     Assert-Near 6.0 $indexedFrozenAfterAppend.EndRateLimits.Weekly.UsedPercent 0.0001 'indexed frozen weekly snapshot remains stable'
+
+    # The compiled aggregator must remain numerically identical to the legacy
+    # byte parser across multiple models, long-context pricing and an unknown
+    # model. Two calls with identical counters but different timestamps are
+    # deliberately retained as separate real calls.
+    $indexedParityRoot = Join-Path $tempRoot 'indexed-pricing-parity'
+    New-Item -ItemType Directory -Path $indexedParityRoot | Out-Null
+    $indexedParityPath = Join-Path $indexedParityRoot 'rollout-indexed-pricing.jsonl'
+    $indexedParityId = '71000000-0000-0000-0000-000000000001'
+    $indexedParityInitialAt = [DateTimeOffset]::Now.ToUniversalTime().AddMinutes(-1)
+    $indexedParityInitial = @(
+        [ordered]@{ timestamp = $indexedParityInitialAt.ToString('o'); type = 'session_meta'; payload = [ordered]@{ id = $indexedParityId; cwd = $indexedParityRoot; model_provider = 'openai' } },
+        [ordered]@{ timestamp = $indexedParityInitialAt.AddSeconds(1).ToString('o'); type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.5' } },
+        (New-TestTokenRecord -Timestamp $indexedParityInitialAt.AddSeconds(2).ToString('o') -TotalInput 1000 -TotalCached 100 -TotalOutput 100 -CallInput 1000 -CallCached 100 -CallOutput 100)
+    )
+    @($indexedParityInitial | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress }) | Set-Content -LiteralPath $indexedParityPath -Encoding UTF8
+    $indexedParityBaseline = CaptureMeasurementBaseline -SessionsRoot $indexedParityRoot -PricingDocument $prices
+    $indexedParityCallAt = [DateTimeOffset]::Now.ToUniversalTime().AddSeconds(1)
+    $indexedParityNewRecords = @(
+        (New-TestTokenRecord -Timestamp $indexedParityCallAt.ToString('o') -TotalInput 2000 -TotalCached 200 -TotalOutput 200 -CallInput 1000 -CallCached 100 -CallOutput 100),
+        (New-TestTokenRecord -Timestamp $indexedParityCallAt.AddMilliseconds(1).ToString('o') -TotalInput 2000 -TotalCached 200 -TotalOutput 200 -CallInput 1000 -CallCached 100 -CallOutput 100),
+        [ordered]@{ timestamp = $indexedParityCallAt.AddMilliseconds(2).ToString('o'); type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.6-sol' } },
+        (New-TestTokenRecord -Timestamp $indexedParityCallAt.AddMilliseconds(3).ToString('o') -TotalInput 302001 -TotalCached 100201 -TotalOutput 400 -CallInput 300001 -CallCached 100001 -CallOutput 200),
+        [ordered]@{ timestamp = $indexedParityCallAt.AddMilliseconds(4).ToString('o'); type = 'turn_context'; payload = [ordered]@{ model = 'synthetic-unknown-model' } },
+        (New-TestTokenRecord -Timestamp $indexedParityCallAt.AddMilliseconds(5).ToString('o') -TotalInput 302501 -TotalCached 100201 -TotalOutput 450 -CallInput 500 -CallCached 0 -CallOutput 50)
+    )
+    @($indexedParityNewRecords | ForEach-Object { ($_ | ConvertTo-Json -Depth 8 -Compress) }) | Add-Content -LiteralPath $indexedParityPath -Encoding UTF8
+    $indexedParityDeadline = [DateTime]::UtcNow.AddSeconds(2)
+    while ([TokenRaderIndexer]::GetChangeRevision($indexedParityRoot) -le [Int64]$indexedParityBaseline.ChangeRevision -and
+        [DateTime]::UtcNow -lt $indexedParityDeadline) { Start-Sleep -Milliseconds 10 }
+    $indexedParityEnd = CaptureMeasurementEnd -Baseline $indexedParityBaseline
+    $indexedParityLegacy = Get-TokenRaderIntervalResult -Baseline $indexedParityBaseline -PricingDocument $prices -EndOffsets $indexedParityEnd.EndOffsets
+    $indexedParityCompiled = Get-TokenRaderIndexedIntervalResult -Baseline $indexedParityBaseline -PricingDocument $prices `
+        -EndOffsets $indexedParityEnd.EndOffsets -EndRevision $indexedParityEnd.EndRevision -ScanRateLimits $false
+    Assert-Equal 4 $indexedParityCompiled.CountedEvents 'compiled aggregator keeps identical-token calls at different timestamps'
+    Assert-Equal $indexedParityLegacy.CountedEvents $indexedParityCompiled.CountedEvents 'compiled and legacy event count parity'
+    Assert-Equal $indexedParityLegacy.Usage.Input $indexedParityCompiled.Usage.Input 'compiled and legacy input parity'
+    Assert-Equal $indexedParityLegacy.Usage.Cached $indexedParityCompiled.Usage.Cached 'compiled and legacy cached input parity'
+    Assert-Equal $indexedParityLegacy.Usage.Output $indexedParityCompiled.Usage.Output 'compiled and legacy output parity'
+    Assert-Near $indexedParityLegacy.TotalCost $indexedParityCompiled.TotalCost 0.0000001 'compiled and legacy multi-model API cost parity'
+    Assert-Equal $false $indexedParityCompiled.PricingComplete 'compiled aggregator preserves unknown-model pricing state'
+    Assert-Equal $false $indexedParityCompiled.CostComplete 'compiled aggregator preserves compatibility cost state'
+    Assert-Equal 3 @($indexedParityCompiled.Models).Count 'compiled aggregator returns all known and unknown models'
+    Assert-Equal 1 @($indexedParityCompiled.Items | Where-Object { $_.Model -eq 'gpt-5.6-sol' -and $_.LongContext }).Count 'compiled aggregator preserves long-context bucket'
+    Assert-Equal 4 ([Int64]$indexedParityCompiled.ProcessedRows) 'compiled diagnostics report streamed rows'
 
     # A real Codex task tree copies parent token_count history into sibling subagent
     # logs. Only exact copies within the same root task may be deduplicated; an
@@ -1348,6 +1401,10 @@ try {
         }
     }
 
+    $aggregateTestScript = Join-Path $PSScriptRoot 'Run-AggregatePerformanceTests.ps1'
+    if ($Performance) { & $aggregateTestScript -IncludeLegacyInterference }
+    else { & $aggregateTestScript }
+
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')
     $reader = New-Object System.Xml.XmlNodeReader $xaml
@@ -1355,11 +1412,20 @@ try {
     foreach ($controlName in @('ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'IntervalStatusText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText', 'TotalMetricText', 'HitRateMetricText', 'UsdCostText', 'FiveHourUsageText', 'FiveHourDollarText', 'WeeklyUsageText', 'WeeklyDollarText', 'PricingDataGrid')) {
         if ($null -eq $window.FindName($controlName)) { throw "ASSERT FAILED: missing XAML control $controlName" }
     }
+    $historyRange = $window.FindName('HistoryRangeComboBox')
+    if ($historyRange.Items.Count -lt 1 -or [string]$historyRange.Items[0].Tag -ne '1' -or
+        [string]$historyRange.Items[0].Content -ne '最近1天' -or $historyRange.SelectedIndex -ne 0) {
+        throw 'UI CONTRACT FAILED: rolling 24-hour history must be the first and default range'
+    }
 
     # Interval view must be a cheap state/cache operation. It must not scan the
     # whole session tree synchronously on every click, and the background
     # compute path must not fall back to invoking the parser on the UI thread.
     $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
+    if ($uiSource -notmatch 'HistoryRangeComboBox\.IsEnabled\s*=\s*\(\$NewState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)\)' -or
+        $uiSource -notmatch 'State\.UiState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)') {
+        throw 'UI CONTRACT FAILED: history range must remain selectable while measuring'
+    }
     $indexerSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'indexer\TokenRader.Indexer.cs'))
     if ($indexerSource -notmatch 'QueryLatestRateLimitRowsByOffsetRanges' -or
         $indexerSource -notmatch 'MAX\(CASE WHEN five_hour_used IS NOT NULL THEN source_offset_end END\)' -or
@@ -1552,11 +1618,51 @@ try {
     if ($viewMatch.Value -match 'Get-TokenRaderSessionTreeSignature') {
         throw 'UI CONTRACT FAILED: Update-IntervalView must not call Get-TokenRaderSessionTreeSignature synchronously'
     }
+    if ($viewMatch.Value -notmatch 'IntervalFinalRetry' -or $viewMatch.Value -notmatch 'IntervalComputing') {
+        throw 'UI CONTRACT FAILED: interval view must preserve in-flight results and retry frozen final boundaries'
+    }
+    if ($uiSource -match '正在实时统计全部项目在指定时间段内的新消耗') {
+        throw 'UI CONTRACT FAILED: completed preview must not be labelled as an in-progress calculation'
+    }
     $asyncMatch = [regex]::Match($uiSource, '(?s)function Start-TokenRaderIntervalComputeAsync\b.*?(?=\r?\nfunction |\z)')
     if (-not $asyncMatch.Success) { throw 'UI CONTRACT FAILED: background interval compute function was not found' }
     if ($asyncMatch.Value -match 'Fallback:\s*run the computation synchronously' -or
         $asyncMatch.Value -match 'Get-TokenRaderIntervalResult') {
         throw 'UI CONTRACT FAILED: interval compute path contains a synchronous parser fallback'
+    }
+    if ($asyncMatch.Value -notmatch 'queueManualQuota' -or
+        $asyncMatch.Value -notmatch 'IntervalActiveScanRateLimits' -or
+        $asyncMatch.Value -notmatch 'IntervalComputePending') {
+        throw 'UI CONTRACT FAILED: repeated equivalent refreshes must coalesce while a manual quota refresh can follow a token-only request'
+    }
+    if ($asyncMatch.Value -notmatch 'TimeoutSeconds\s+\$\(if \(\$Final\) \{ 60 \} else \{ 15 \}\)' -or
+        $asyncMatch.Value -notmatch 'SoftWarningSeconds\s+3' -or
+        $asyncMatch.Value -notmatch 'CancellationTokenSource' -or
+        $asyncMatch.Value -notmatch 'Request-TokenRaderBackgroundStop') {
+        throw 'UI CONTRACT FAILED: live/final timeout, slow-stage warning, cancellation, or final-preview preemption contract changed'
+    }
+    if ($viewMatch.Value -notmatch 'param\(\[switch\]\$Manual\)' -or
+        $viewMatch.Value -notmatch 'ScanRateLimits \(\[bool\]\$Manual\)') {
+        throw 'UI CONTRACT FAILED: manual result refresh must request a quota snapshot from the same frozen end offsets'
+    }
+    $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
+    $indexedResultMatch = [regex]::Match($coreSource, '(?s)function Get-TokenRaderIndexedIntervalResult\b.*?(?=\r?\nfunction |\z)')
+    if (-not $indexedResultMatch.Success -or $indexedResultMatch.Value -notmatch 'AggregateIntervalRecords' -or
+        $indexedResultMatch.Value -match 'QueryIntervalRecords\s+-' -or
+        $indexedResultMatch.Value -match 'Get-TokenRaderCost\s+-') {
+        throw 'INDEX CONTRACT FAILED: indexed interval result must stream a compiled aggregate and price only compact model buckets'
+    }
+    $indexerSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'indexer\TokenRader.Indexer.cs'))
+    $aggregateSourceMatch = [regex]::Match($indexerSource, '(?s)public static TokenRaderIntervalAggregateResult AggregateIntervalRecords\b.*?(?=\r?\n    private static Dictionary<string, long> ReadLongContextThresholds)')
+    if (-not $aggregateSourceMatch.Success -or $aggregateSourceMatch.Value -notmatch 'ExecuteReader\(' -or
+        $aggregateSourceMatch.Value -notmatch 'ThrowIfCancellationRequested' -or
+        $aggregateSourceMatch.Value -match 'new\s+DataTable|DataTable\s+\w+\s*=') {
+        throw 'INDEX CONTRACT FAILED: compiled interval aggregation must stream SQLite rows with cancellation and without DataTable materialization'
+    }
+    $intervalFailureMatch = [regex]::Match($uiSource, '(?s)function Fail-TokenRaderIntervalComputeJob\b.*?(?=\r?\nfunction |\z)')
+    if (-not $intervalFailureMatch.Success -or $intervalFailureMatch.Value -notmatch '测量仍然有效' -or
+        $intervalFailureMatch.Value -notmatch 'IntervalFinalRetry') {
+        throw 'UI CONTRACT FAILED: interval failures must retain live measurement and frozen final retry state'
     }
     $startMatch = [regex]::Match($uiSource, '(?s)function Start-IntervalMeasurement\b.*?(?=\r?\nfunction |\z)')
     if ($startMatch.Success -and ($startMatch.Value -match 'New-TokenRaderMeasurementBaseline' -or

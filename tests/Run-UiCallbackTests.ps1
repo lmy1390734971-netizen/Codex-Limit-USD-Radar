@@ -17,7 +17,9 @@ Assert-UiTest ($uiSource -notmatch 'GetNewClosure\s*\(') 'production lifecycle s
 foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Invoke-TokenRaderBackgroundHandler',
         'Request-TokenRaderBackgroundStop', 'Start-TokenRaderBackgroundPoller', 'Start-TokenRaderBackgroundJob',
         'Complete-TokenRaderIndexSyncJob', 'Complete-TokenRaderMeasurementBaselineJob',
-        'Complete-TokenRaderMeasurementBaseline')) {
+        'Complete-TokenRaderMeasurementBaseline', 'New-TokenRaderFinalRetryState',
+        'Start-TokenRaderPendingIntervalCompute', 'Fail-TokenRaderIntervalComputeJob',
+        'Complete-TokenRaderIntervalStopJob')) {
     $match = [regex]::Match($uiSource, ('(?s)function ' + [regex]::Escape($helperName) + '\b.*?(?=\r?\nfunction |\z)'))
     Assert-UiTest $match.Success ('production helper not found: ' + $helperName)
     Invoke-Expression $match.Value
@@ -42,21 +44,22 @@ try {
     # launch baseline capture; the baseline completion must enter Measuring.
     function Merge-LatestRateLimits { param($Candidate) }
     function Refresh-Application { $script:LifecycleRefreshCalled = $true }
+    $script:StatusText = [pscustomobject]@{ Text = '' }
     function Set-TokenRaderUiState {
         param([string]$NewState, [string]$StatusMessage = '')
         $script:State.UiState = $NewState
+        if (-not [string]::IsNullOrWhiteSpace($StatusMessage)) { $script:StatusText.Text = $StatusMessage }
     }
     function Start-TokenRaderMeasurementBaselineAsync {
         param([Int64]$Generation, [Int64]$RequestId)
         $script:LifecycleBaselineRequest = $RequestId
     }
-    function Start-TokenRaderIntervalComputeAsync {
-        param($Baseline, [Int64]$Generation)
-        $script:LifecycleIntervalStarted = $true
-    }
+    function Start-TokenRaderIntervalComputeAsync { param($Baseline, [Int64]$Generation); $script:LifecycleIntervalStarted = $true }
+    function Show-EmptyIntervalMeasurement { param($Baseline); $script:LifecycleEmptyMeasurementShown = $true }
     $script:LifecycleRefreshCalled = $false
     $script:LifecycleBaselineRequest = 0L
     $script:LifecycleIntervalStarted = $false
+    $script:LifecycleEmptyMeasurementShown = $false
     $script:State = @{
         BackgroundJobs = @{}; IndexSyncing = $true; IndexSyncRequestId = 77L; IndexReady = $false
         IndexCatalogAvailable = $false; ProjectCache = @{}; RateLimitSnapshotCache = @{}
@@ -76,7 +79,57 @@ try {
     }
     Complete-TokenRaderMeasurementBaselineJob $baseline 3L 88L 'MeasurementBaseline' $null
     Assert-UiTest ([string]$script:State.UiState -eq 'Measuring') 'baseline completion did not transition Starting to Measuring'
-    Assert-UiTest $script:LifecycleIntervalStarted 'baseline completion did not start interval calculation'
+    Assert-UiTest $script:LifecycleEmptyMeasurementShown 'baseline completion did not render the initial measurement placeholder'
+    Assert-UiTest (-not $script:LifecycleIntervalStarted) 'baseline completion started a redundant zero-width interval calculation'
+
+    # A live preview timeout is recoverable: it must retain the baseline and
+    # last result instead of invalidating the whole measurement.
+    $preservedResult = [pscustomobject]@{ Marker = 'preserved' }
+    $script:State = @{
+        BackgroundJobs = @{}; MeasurementGeneration = 3L; IntervalComputeRequestId = 90L
+        IntervalComputing = $true; IntervalComputePending = $false; IntervalComputePendingRequest = $null
+        IntervalLastError = ''; IntervalFinalRetry = $null; IntervalBaseline = $baseline
+        IntervalResult = $preservedResult; UiState = 'Measuring'
+    }
+    Fail-TokenRaderIntervalComputeJob 'synthetic timeout' 3L 90L 'IntervalCompute' @{ Final = $false }
+    Assert-UiTest ([string]$script:State.UiState -eq 'Measuring') 'live preview failure invalidated the measurement'
+    Assert-UiTest ($script:State.IntervalBaseline -eq $baseline) 'live preview failure discarded the baseline'
+    Assert-UiTest ($script:State.IntervalResult -eq $preservedResult) 'live preview failure discarded the last result'
+    Assert-UiTest ([Int64]$script:State.IntervalComputeRequestId -eq 0L) 'live preview failure did not unlock computation'
+
+    # A timeout marked StopPending keeps the computation locked until the
+    # underlying runspace has actually stopped. Only the stop callback may
+    # release the request, preventing a second CPU-heavy worker from racing it.
+    $script:State.IntervalComputeRequestId = 92L
+    $script:State.IntervalComputing = $true
+    $script:State.IntervalComputeStopping = $false
+    $script:State.IntervalActiveScanRateLimits = $false
+    $script:State.IntervalComputePending = $false
+    $script:State.IntervalComputePendingRequest = $null
+    $script:State.UiState = 'Measuring'
+    Fail-TokenRaderIntervalComputeJob 'synthetic cancellable timeout' 3L 92L 'IntervalCompute' @{ Final = $false; StopPending = $true }
+    Assert-UiTest ([bool]$script:State.IntervalComputing) 'timeout unlocked before the underlying worker stopped'
+    Assert-UiTest ([bool]$script:State.IntervalComputeStopping) 'timeout did not expose the stopping state'
+    Assert-UiTest ([Int64]$script:State.IntervalComputeRequestId -eq 92L) 'timeout discarded the active request before stop completion'
+    Complete-TokenRaderIntervalStopJob $null 3L 92L 'IntervalCompute' @{ Final = $false; StopPending = $true }
+    Assert-UiTest (-not [bool]$script:State.IntervalComputing) 'stop completion did not unlock interval computation'
+    Assert-UiTest (-not [bool]$script:State.IntervalComputeStopping) 'stop completion left the stopping flag set'
+    Assert-UiTest ([Int64]$script:State.IntervalComputeRequestId -eq 0L) 'stop completion did not clear the request id'
+
+    # A final timeout preserves the immutable end boundary and becomes Ready,
+    # allowing View Result to retry without including later appends.
+    $frozenEnd = @{ synthetic = 25L }
+    $script:State.IntervalComputeRequestId = 91L
+    $script:State.IntervalComputing = $true
+    $script:State.UiState = 'ComputingFinal'
+    Fail-TokenRaderIntervalComputeJob 'synthetic final timeout' 3L 91L 'IntervalCompute' @{
+        Final = $true; BaselineStartedAt = $baseline.StartedAt; EndOffsets = $frozenEnd
+        EndRevision = 12L; EndedAt = [DateTimeOffset]::Now; ScanRateLimits = $true
+    }
+    Assert-UiTest ([string]$script:State.UiState -eq 'Ready') 'final failure did not enter retryable Ready state'
+    Assert-UiTest ($null -ne $script:State.IntervalFinalRetry) 'final failure did not preserve retry boundaries'
+    Assert-UiTest ([Int64]$script:State.IntervalFinalRetry.EndRevision -eq 12L) 'final retry revision changed'
+    Assert-UiTest ($script:State.IntervalResult -eq $preservedResult) 'final failure discarded the last result'
 
     $script:State = @{ BackgroundJobs = @{} }
     $script:CompletionSeen = $false

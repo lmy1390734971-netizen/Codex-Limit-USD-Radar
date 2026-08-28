@@ -22,6 +22,6 @@ Write-Output "Built $launcherOutput"
 $indexerSource = Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.cs'
 $indexerOutput = Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.dll'
 $sqliteRef = Join-Path $PSScriptRoot 'indexer\System.Data.SQLite.dll'
-& $compiler /nologo /target:library /reference:System.Web.Extensions.dll /reference:$sqliteRef /optimize+ /out:$indexerOutput $indexerSource
+& $compiler /nologo /target:library /reference:System.Runtime.Serialization.dll /reference:$sqliteRef /optimize+ /out:$indexerOutput $indexerSource
 if ($LASTEXITCODE -ne 0) { throw "Indexer build failed with exit code $LASTEXITCODE" }
 Write-Output "Built $indexerOutput"

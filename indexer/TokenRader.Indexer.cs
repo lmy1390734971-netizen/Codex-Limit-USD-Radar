@@ -6,17 +6,114 @@ using System.Data;
 using System.Data.SQLite;
 using System.Globalization;
 using System.IO;
+using System.Diagnostics;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
-using System.Web.Script.Serialization;
+
+[DataContract]
+internal sealed class TokenRaderJsonUsage
+{
+    [DataMember(Name = "input_tokens", EmitDefaultValue = false)] public object InputTokens { get; set; }
+    [DataMember(Name = "cached_input_tokens", EmitDefaultValue = false)] public object CachedInputTokens { get; set; }
+    [DataMember(Name = "output_tokens", EmitDefaultValue = false)] public object OutputTokens { get; set; }
+    [DataMember(Name = "reasoning_output_tokens", EmitDefaultValue = false)] public object ReasoningOutputTokens { get; set; }
+}
+
+[DataContract]
+internal sealed class TokenRaderJsonInfo
+{
+    [DataMember(Name = "total_token_usage", EmitDefaultValue = false)] public TokenRaderJsonUsage TotalTokenUsage { get; set; }
+    [DataMember(Name = "last_token_usage", EmitDefaultValue = false)] public TokenRaderJsonUsage LastTokenUsage { get; set; }
+}
+
+[DataContract]
+internal sealed class TokenRaderJsonRateWindow
+{
+    [DataMember(Name = "used_percent", EmitDefaultValue = false)] public object UsedPercent { get; set; }
+    [DataMember(Name = "window_minutes", EmitDefaultValue = false)] public object WindowMinutes { get; set; }
+    [DataMember(Name = "resets_at", EmitDefaultValue = false)] public object ResetsAt { get; set; }
+    [DataMember(Name = "reset_at", EmitDefaultValue = false)] public object ResetAt { get; set; }
+    [DataMember(Name = "resets_in_seconds", EmitDefaultValue = false)] public object ResetsInSeconds { get; set; }
+}
+
+[DataContract]
+internal sealed class TokenRaderJsonRateLimits
+{
+    [DataMember(Name = "plan_type", EmitDefaultValue = false)] public string PlanType { get; set; }
+    [DataMember(Name = "primary", EmitDefaultValue = false)] public TokenRaderJsonRateWindow Primary { get; set; }
+    [DataMember(Name = "secondary", EmitDefaultValue = false)] public TokenRaderJsonRateWindow Secondary { get; set; }
+}
+
+[DataContract]
+internal sealed class TokenRaderJsonPayload
+{
+    [DataMember(Name = "type", EmitDefaultValue = false)] public string Type { get; set; }
+    [DataMember(Name = "info", EmitDefaultValue = false)] public TokenRaderJsonInfo Info { get; set; }
+    [DataMember(Name = "rate_limits", EmitDefaultValue = false)] public TokenRaderJsonRateLimits RateLimits { get; set; }
+}
+
+[DataContract]
+internal sealed class TokenRaderJsonRecord
+{
+    [DataMember(Name = "timestamp", EmitDefaultValue = false)] public object Timestamp { get; set; }
+    [DataMember(Name = "type", EmitDefaultValue = false)] public string Type { get; set; }
+    [DataMember(Name = "payload", EmitDefaultValue = false)] public TokenRaderJsonPayload Payload { get; set; }
+}
+
+/// <summary>区间聚合的单个模型/上下文桶；不包含价格，价格由调用方按模型一次解析。</summary>
+public sealed class TokenRaderIntervalAggregateBucket
+{
+    public string Model { get; set; }
+    public bool LongContext { get; set; }
+    public long Input { get; set; }
+    public long Cached { get; set; }
+    public long Output { get; set; }
+    public long Reasoning { get; set; }
+    public long Events { get; set; }
+
+    public TokenRaderIntervalAggregateBucket()
+    {
+        Model = "";
+    }
+}
+
+/// <summary>
+/// SQLite 流式区间聚合结果。结果只携带紧凑的 token 桶，不携带 DataTable 或
+/// 单条记录；调用方可据此按模型及长上下文价格计算成本。
+/// </summary>
+public sealed class TokenRaderIntervalAggregateResult
+{
+    public long RawEvents { get; set; }
+    public long CountedEvents { get; set; }
+    public long DuplicateEventsDropped { get; set; }
+    public long InheritedEventsDropped { get; set; }
+    public long BytesRead { get; set; }
+    public long ProcessedRows { get; set; }
+    public long ProcessingMilliseconds { get; set; }
+    public long TotalInput { get; set; }
+    public long TotalCached { get; set; }
+    public long TotalOutput { get; set; }
+    public long TotalReasoning { get; set; }
+    public int ChangedSessions { get; set; }
+    public string[] Models { get; set; }
+    public TokenRaderIntervalAggregateBucket[] Buckets { get; set; }
+
+    public TokenRaderIntervalAggregateResult()
+    {
+        Models = new string[0];
+        Buckets = new TokenRaderIntervalAggregateBucket[0];
+    }
+}
 
 /// <summary>
 /// 磁盘 SQLite 索引引擎。将 Codex 会话日志（JSONL）中的 token 记录解析后
 /// 写入项目 data/private/index/index.db，后续所有查询走 SQL，
 /// 数据在磁盘而非内存，进程内存保持恒定。
 ///
-/// 编译：csc /target:library /reference:System.Web.Extensions.dll /reference:System.Data.SQLite.dll /optimize+ ...
+/// 编译：csc /target:library /reference:System.Runtime.Serialization.dll /reference:System.Data.SQLite.dll /optimize+ ...
 /// </summary>
 public static class TokenRaderIndexer
 {
@@ -235,7 +332,8 @@ public static class TokenRaderIndexer
         @"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
         RegexOptions.Compiled);
 
-    private static readonly JavaScriptSerializer _json = new JavaScriptSerializer();
+    [ThreadStatic]
+    private static DataContractJsonSerializer _jsonSerializer;
 
     /// <summary>增量解析一个 JSONL 文件，插入 SQLite，返回新记录数。</summary>
     public static int ImportFile(SQLiteConnection db, string filePath, long startOffset)
@@ -347,28 +445,28 @@ public static class TokenRaderIndexer
 
                         try
                         {
-                            var record = _json.DeserializeObject(line) as Dictionary<string, object>;
+                            var record = DeserializeLogRecord(line);
                             if (record == null) continue;
-                            string type = record.ContainsKey("type") ? (record["type"] as string ?? "") : "";
-                            var payload = GetDict(record, "payload");
+                            string type = record.Type ?? "";
+                            var payload = record.Payload;
                             if (payload == null) continue;
                             bool isTokenRecord = type == "token_count" ||
-                                (type == "event_msg" && GetString(payload, "type") == "token_count");
+                                (type == "event_msg" && string.Equals(payload.Type, "token_count", StringComparison.Ordinal));
                             if (!isTokenRecord) continue;
-                            var info = GetDict(payload, "info");
+                            var info = payload.Info;
                             if (info == null) continue;
-                            var total = GetDict(info, "total_token_usage");
-                            var last = GetDict(info, "last_token_usage");
+                            var total = info.TotalTokenUsage;
+                            var last = info.LastTokenUsage;
                             if (total == null || last == null) continue;
 
-                            long totalInput = GetInt64(total, "input_tokens");
-                            long totalCached = GetInt64(total, "cached_input_tokens");
-                            long totalOutput = GetInt64(total, "output_tokens");
-                            long totalReasoning = GetInt64(total, "reasoning_output_tokens");
-                            long callInput = GetInt64(last, "input_tokens");
-                            long callCached = GetInt64(last, "cached_input_tokens");
-                            long callOutput = GetInt64(last, "output_tokens");
-                            long callReasoning = GetInt64(last, "reasoning_output_tokens");
+                            long totalInput = GetInt64Value(total.InputTokens);
+                            long totalCached = GetInt64Value(total.CachedInputTokens);
+                            long totalOutput = GetInt64Value(total.OutputTokens);
+                            long totalReasoning = GetInt64Value(total.ReasoningOutputTokens);
+                            long callInput = GetInt64Value(last.InputTokens);
+                            long callCached = GetInt64Value(last.CachedInputTokens);
+                            long callOutput = GetInt64Value(last.OutputTokens);
+                            long callReasoning = GetInt64Value(last.ReasoningOutputTokens);
                             if (totalCached > totalInput) totalCached = totalInput;
                             if (callCached > callInput) callCached = callInput;
 
@@ -379,18 +477,17 @@ public static class TokenRaderIndexer
                             double? fiveHourUsed = null; int? fiveHourWindow = null; long? fiveHourResets = null;
                             double? weeklyUsed = null; int? weeklyWindow = null; long? weeklyResets = null;
                             string planType = "";
-                            var rateLimits = GetDict(payload, "rate_limits");
+                            var rateLimits = payload.RateLimits;
                             if (rateLimits != null)
                             {
-                                planType = GetString(rateLimits, "plan_type") ?? "";
+                                planType = rateLimits.PlanType ?? "";
                                 DateTimeOffset observedAt;
-                                bool hasObservedAt = TryGetObservedAt(record, out observedAt);
-                                foreach (string key in new[] { "primary", "secondary" })
+                                bool hasObservedAt = TryParseTimestamp(record.Timestamp, out observedAt);
+                                foreach (TokenRaderJsonRateWindow win in new[] { rateLimits.Primary, rateLimits.Secondary })
                                 {
-                                    var win = GetDict(rateLimits, key);
                                     if (win == null) continue;
-                                    double used = GetDouble(win, "used_percent");
-                                    int winMin = (int)GetInt64(win, "window_minutes");
+                                    double used = GetDoubleValueOrZero(win.UsedPercent);
+                                    int winMin = (int)GetInt64Value(win.WindowMinutes);
                                     long resetSeconds;
                                     long? normalizedResets = TryGetResetUnixSeconds(win, hasObservedAt ? (DateTimeOffset?)observedAt : null, out resetSeconds)
                                         ? (long?)resetSeconds
@@ -402,7 +499,7 @@ public static class TokenRaderIndexer
                                 }
                             }
 
-                            p[0].Value = sessionId; p[1].Value = GetString(record, "timestamp") ?? ""; p[2].Value = currentModel;
+                            p[0].Value = sessionId; p[1].Value = Convert.ToString(record.Timestamp, CultureInfo.InvariantCulture) ?? ""; p[2].Value = currentModel;
                             p[3].Value = totalInput; p[4].Value = totalCached; p[5].Value = totalOutput; p[6].Value = totalReasoning;
                             p[7].Value = callInput; p[8].Value = callCached; p[9].Value = callOutput; p[10].Value = callReasoning;
                             p[11].Value = fingerprint;
@@ -557,6 +654,40 @@ public static class TokenRaderIndexer
     }
 
     /// <summary>
+    /// 以紧凑字典冻结全部 parsed_offset，供开始/结束测量使用。该路径不创建
+    /// DataTable，也不把关系元数据复制到 PowerShell；数据库中的路径已经
+    /// 在导入时规范化，因此可直接作为冻结边界。
+    /// </summary>
+    public static IDictionary CaptureFileCursorOffsets(SQLiteConnection db)
+    {
+        var offsets = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT path,parsed_offset FROM file_metadata WHERE path IS NOT NULL AND path<>''";
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string path = reader.IsDBNull(0) ? "" : Convert.ToString(reader.GetValue(0), CultureInfo.InvariantCulture);
+                    if (string.IsNullOrWhiteSpace(path)) continue;
+                    offsets[path] = reader.IsDBNull(1) ? 0L : Convert.ToInt64(reader.GetValue(1), CultureInfo.InvariantCulture);
+                }
+            }
+        }
+        return offsets;
+    }
+
+    public static int GetFileCursorCount(SQLiteConnection db)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(*) FROM file_metadata";
+            object value = cmd.ExecuteScalar();
+            return value == null || value == DBNull.Value ? 0 : Convert.ToInt32(value, CultureInfo.InvariantCulture);
+        }
+    }
+
+    /// <summary>
     /// 查询每个文件 [start_offset,end_offset) 范围内的 token 记录。
     /// fileRanges 至少需要 path、start_offset、end_offset 三列；列名比较
     /// 不区分大小写，并兼容 StartOffset/EndOffset 等 PowerShell 常见命名。
@@ -573,6 +704,312 @@ public static class TokenRaderIndexer
     public static DataTable QueryIntervalRecords(SQLiteConnection db, IDictionary startOffsets, IDictionary endOffsets)
     {
         return QueryRowsByOffsetRanges(db, ReadOffsetRanges(startOffsets, endOffsets), false);
+    }
+
+    /// <summary>
+    /// 流式聚合每个文件的冻结字节范围。该 API 不创建 DataTable，也不将
+    /// 区间内的所有记录载入内存；SQLiteDataReader 每次只保留当前行，结果
+    /// 仅包含按模型/长上下文分桶后的计数。旧格式 source_offset_end=0 的
+    /// 记录永远不会命中范围条件。
+    ///
+    /// longContextThresholds 为模型名到长上下文阈值的 IDictionary（大小写
+    /// 不敏感）；阈值大于 0 且 call_input 大于阈值时归入 LongContext 桶。
+    /// progressState 可选，若提供则每 256 行写入 ProcessedRows、
+    /// LastProgressTicks 和 Stage，供后台 UI 显示进度。
+    /// </summary>
+    public static TokenRaderIntervalAggregateResult AggregateIntervalRecords(
+        SQLiteConnection db,
+        IDictionary startOffsets,
+        IDictionary endOffsets,
+        DateTimeOffset startedAt,
+        IDictionary longContextThresholds,
+        CancellationToken cancellationToken,
+        IDictionary progressState = null)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+
+        var ranges = ReadAggregateOffsetRanges(startOffsets, endOffsets);
+        var thresholds = ReadLongContextThresholds(longContextThresholds);
+        var resolvedThresholds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        var baselinePaths = ReadOffsetPathSet(startOffsets);
+        var result = new TokenRaderIntervalAggregateResult();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var activeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var buckets = new Dictionary<string, TokenRaderIntervalAggregateBucket>(StringComparer.OrdinalIgnoreCase);
+        var stopwatch = Stopwatch.StartNew();
+
+        SetAggregateProgress(progressState, 0L, "聚合区间记录");
+        for (int rangeIndex = 0; rangeIndex < ranges.Count; rangeIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            OffsetRange range = ranges[rangeIndex];
+            using (var cmd = db.CreateCommand())
+            {
+                // Select only columns required by the existing interval
+                // semantics. No SELECT * and no SQL-side/global sort are used.
+                cmd.CommandText =
+                    "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
+                    "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id " +
+                    "FROM token_records WHERE source_path=@path AND source_offset_end>@start AND source_offset_end<=@end";
+                cmd.Parameters.AddWithValue("@path", range.Path);
+                cmd.Parameters.AddWithValue("@start", range.Start);
+                cmd.Parameters.AddWithValue("@end", range.End);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        result.RawEvents++;
+                        result.ProcessedRows++;
+                        if ((result.ProcessedRows & 255L) == 0L)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            SetAggregateProgress(progressState, result.ProcessedRows, "聚合区间记录");
+                        }
+
+                        string sessionId = ReadReaderString(reader, 0);
+                        string timestampText = ReadReaderString(reader, 1);
+                        string model = ReadReaderString(reader, 2);
+                        long totalInput = ReadReaderInt64(reader, 3);
+                        long totalCached = ReadReaderInt64(reader, 4);
+                        long totalOutput = ReadReaderInt64(reader, 5);
+                        long totalReasoning = ReadReaderInt64(reader, 6);
+                        long callInput = ReadReaderInt64(reader, 7);
+                        long callCached = ReadReaderInt64(reader, 8);
+                        long callOutput = ReadReaderInt64(reader, 9);
+                        long callReasoning = ReadReaderInt64(reader, 10);
+                        string fingerprint = ReadReaderString(reader, 11);
+                        string sourcePath = ReadReaderString(reader, 12);
+                        string rootSessionId = ReadReaderString(reader, 14);
+
+                        if (callInput <= 0L && callOutput <= 0L) continue;
+
+                        DateTimeOffset eventAt;
+                        bool hasTimestamp = TryParseTimestamp(timestampText, out eventAt);
+                        if (!hasTimestamp) eventAt = DateTimeOffset.MinValue;
+                        bool wasPresentAtStart = baselinePaths.Contains(sourcePath);
+                        bool isStartingWindowEvent = false;
+                        try { isStartingWindowEvent = eventAt >= startedAt.AddDays(-1.0); }
+                        catch (ArgumentOutOfRangeException) { }
+                        if (eventAt < startedAt && (!wasPresentAtStart || isStartingWindowEvent))
+                        {
+                            result.InheritedEventsDropped++;
+                            continue;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(rootSessionId)) rootSessionId = sessionId;
+                        string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
+                            totalInput, totalCached, totalOutput, totalReasoning,
+                            callInput, callCached, callOutput, callReasoning, fingerprint);
+                        if (!seen.Add(eventKey))
+                        {
+                            result.DuplicateEventsDropped++;
+                            continue;
+                        }
+
+                        result.CountedEvents++;
+                        result.TotalInput += callInput;
+                        result.TotalCached += callCached;
+                        result.TotalOutput += callOutput;
+                        result.TotalReasoning += callReasoning;
+                        if (!string.IsNullOrWhiteSpace(sourcePath)) activeFiles.Add(sourcePath);
+                        if (!string.IsNullOrWhiteSpace(model)) models.Add(model);
+                        bool longContext;
+                        long threshold;
+                        if (!resolvedThresholds.TryGetValue(model, out threshold))
+                        {
+                            threshold = ResolveAggregateLongContextThreshold(model, thresholds);
+                            resolvedThresholds[model] = threshold;
+                        }
+                        longContext = threshold > 0L && callInput > threshold;
+                        string bucketKey = model.ToLowerInvariant() + "|" + (longContext ? "long" : "standard");
+                        TokenRaderIntervalAggregateBucket bucket;
+                        if (!buckets.TryGetValue(bucketKey, out bucket))
+                        {
+                            bucket = new TokenRaderIntervalAggregateBucket {
+                                Model = model,
+                                LongContext = longContext
+                            };
+                            buckets.Add(bucketKey, bucket);
+                        }
+                        bucket.Input += callInput;
+                        bucket.Cached += callCached;
+                        bucket.Output += callOutput;
+                        bucket.Reasoning += callReasoning;
+                        bucket.Events++;
+                    }
+                }
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        SetAggregateProgress(progressState, result.ProcessedRows, "区间聚合完成");
+        result.BytesRead = ComputeRangeBytes(ranges);
+        result.ChangedSessions = activeFiles.Count;
+        var sortedModels = new List<string>(models);
+        sortedModels.Sort(StringComparer.OrdinalIgnoreCase);
+        result.Models = sortedModels.ToArray();
+        var sortedBuckets = new List<TokenRaderIntervalAggregateBucket>(buckets.Values);
+        sortedBuckets.Sort(delegate(TokenRaderIntervalAggregateBucket left, TokenRaderIntervalAggregateBucket right) {
+            int comparison = StringComparer.OrdinalIgnoreCase.Compare(left.Model, right.Model);
+            if (comparison != 0) return comparison;
+            return left.LongContext.CompareTo(right.LongContext);
+        });
+        result.Buckets = sortedBuckets.ToArray();
+        result.ProcessingMilliseconds = stopwatch.ElapsedMilliseconds;
+        SetAggregateProgress(progressState, result.ProcessedRows, "区间聚合完成");
+        return result;
+    }
+
+    private static Dictionary<string, long> ReadLongContextThresholds(IDictionary input)
+    {
+        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        if (input == null) return result;
+        foreach (DictionaryEntry entry in input)
+        {
+            string model = entry.Key == null ? "" : Convert.ToString(entry.Key, CultureInfo.InvariantCulture);
+            long threshold;
+            if (!string.IsNullOrWhiteSpace(model) && TryConvertInt64(entry.Value, out threshold))
+                result[model] = threshold;
+        }
+        return result;
+    }
+
+    private static List<OffsetRange> ReadAggregateOffsetRanges(IDictionary starts, IDictionary ends)
+    {
+        var ranges = new List<OffsetRange>();
+        if (ends == null) return ranges;
+
+        // The frozen end snapshot is authoritative. A baseline file omitted
+        // from EndOffsets must never become an unbounded range, while a file
+        // first observed after the baseline starts at byte zero.
+        var startMap = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        if (starts != null)
+        {
+            foreach (DictionaryEntry entry in starts)
+            {
+                string path = entry.Key == null ? "" : Convert.ToString(entry.Key, CultureInfo.InvariantCulture);
+                long start;
+                if (!string.IsNullOrWhiteSpace(path) && TryConvertInt64(entry.Value, out start))
+                    startMap[path] = Math.Max(0L, start);
+            }
+        }
+
+        var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (DictionaryEntry entry in ends)
+        {
+            string path = entry.Key == null ? "" : Convert.ToString(entry.Key, CultureInfo.InvariantCulture);
+            long end;
+            if (string.IsNullOrWhiteSpace(path) || !seenPaths.Add(path) ||
+                !TryConvertInt64(entry.Value, out end)) continue;
+            end = end < 0L ? long.MaxValue : end;
+            long start;
+            if (!startMap.TryGetValue(path, out start)) start = 0L;
+            if (end <= start) continue;
+            ranges.Add(new OffsetRange { Path = path, Start = start, End = end });
+        }
+        return ranges;
+    }
+
+    private static HashSet<string> ReadOffsetPathSet(IDictionary offsets)
+    {
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (offsets == null) return paths;
+        foreach (DictionaryEntry entry in offsets)
+        {
+            string candidate = entry.Key == null ? "" : Convert.ToString(entry.Key, CultureInfo.InvariantCulture);
+            if (!string.IsNullOrWhiteSpace(candidate)) paths.Add(candidate);
+        }
+        return paths;
+    }
+
+    private static long ResolveAggregateLongContextThreshold(string model, Dictionary<string, long> thresholds)
+    {
+        if (string.IsNullOrWhiteSpace(model) || thresholds == null) return 0L;
+        long exact;
+        if (thresholds.TryGetValue(model, out exact)) return exact;
+        string normalized = model.Trim();
+        string bestKey = null;
+        long bestThreshold = 0L;
+        foreach (KeyValuePair<string, long> entry in thresholds)
+        {
+            string key = entry.Key ?? "";
+            if (key.Length == 0 || !normalized.StartsWith(key + "-20", StringComparison.OrdinalIgnoreCase)) continue;
+            if (bestKey == null || key.Length > bestKey.Length)
+            {
+                bestKey = key;
+                bestThreshold = entry.Value;
+            }
+        }
+        return bestThreshold;
+    }
+
+    private static string BuildAggregateEventKey(
+        string rootSessionId,
+        DateTimeOffset eventAt,
+        string model,
+        long totalInput,
+        long totalCached,
+        long totalOutput,
+        long totalReasoning,
+        long callInput,
+        long callCached,
+        long callOutput,
+        long callReasoning,
+        string fingerprint)
+    {
+        // New rows already store this exact fingerprint. Reconstructing it
+        // when absent keeps old indexes safe while ensuring cumulative and
+        // per-call usage are always part of the de-duplication identity.
+        string usage = string.IsNullOrWhiteSpace(fingerprint)
+            ? string.Format(CultureInfo.InvariantCulture, "{0}:{1}:{2}:{3}:{4}:{5}:{6}:{7}",
+                totalInput, totalCached, totalOutput, totalReasoning,
+                callInput, callCached, callOutput, callReasoning)
+            : fingerprint;
+        string timestamp = eventAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+        return (rootSessionId ?? "").ToLowerInvariant() + "|" + timestamp + "|" +
+            (model ?? "").ToLowerInvariant() + "|" + usage;
+    }
+
+    private static long ComputeRangeBytes(List<OffsetRange> ranges)
+    {
+        long bytes = 0L;
+        if (ranges == null) return bytes;
+        foreach (OffsetRange range in ranges)
+        {
+            long length = range.End == long.MaxValue ? 0L : Math.Max(0L, range.End - range.Start);
+            if (long.MaxValue - bytes < length) return long.MaxValue;
+            bytes += length;
+        }
+        return bytes;
+    }
+
+    private static string ReadReaderString(SQLiteDataReader reader, int ordinal)
+    {
+        if (reader.IsDBNull(ordinal)) return "";
+        object value = reader.GetValue(ordinal);
+        return Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
+    }
+
+    private static long ReadReaderInt64(SQLiteDataReader reader, int ordinal)
+    {
+        if (reader.IsDBNull(ordinal)) return 0L;
+        long value;
+        return TryConvertInt64(reader.GetValue(ordinal), out value) ? value : 0L;
+    }
+
+    private static void SetAggregateProgress(IDictionary progressState, long processedRows, string stage)
+    {
+        if (progressState == null) return;
+        try
+        {
+            progressState["ProcessedRows"] = processedRows;
+            progressState["LastProgressTicks"] = DateTimeOffset.UtcNow.Ticks;
+            progressState["LastProgressAt"] = DateTimeOffset.Now;
+            progressState["Stage"] = stage ?? "";
+        }
+        catch (Exception) { }
     }
 
     /// <summary>
@@ -1298,11 +1735,15 @@ public static class TokenRaderIndexer
         catch (Exception) { return filePath ?? ""; }
     }
 
-    private static Dictionary<string, object> GetDict(Dictionary<string, object> d, string k)
-    { object o; return d.TryGetValue(k, out o) ? o as Dictionary<string, object> : null; }
-
-    private static string GetString(Dictionary<string, object> d, string k)
-    { object o; return d.TryGetValue(k, out o) ? o as string : null; }
+    private static TokenRaderJsonRecord DeserializeLogRecord(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return null;
+        if (_jsonSerializer == null)
+            _jsonSerializer = new DataContractJsonSerializer(typeof(TokenRaderJsonRecord));
+        byte[] bytes = Encoding.UTF8.GetBytes(line);
+        using (var stream = new MemoryStream(bytes, false))
+            return _jsonSerializer.ReadObject(stream) as TokenRaderJsonRecord;
+    }
 
     private static double ClampPercent(double value)
     {
@@ -1310,18 +1751,6 @@ public static class TokenRaderIndexer
         if (value < 0.0) return 0.0;
         if (value > 100.0) return 100.0;
         return value;
-    }
-
-    /// <summary>
-    /// 解析记录的 timestamp，供 resets_in_seconds 使用。
-    /// Codex 日志通常使用 ISO 8601 字符串，但兼容 Unix 秒/毫秒时间戳。
-    /// </summary>
-    private static bool TryGetObservedAt(Dictionary<string, object> record, out DateTimeOffset observedAt)
-    {
-        observedAt = default(DateTimeOffset);
-        object raw;
-        if (!record.TryGetValue("timestamp", out raw) || raw == null) return false;
-        return TryParseTimestamp(raw, out observedAt);
     }
 
     private static bool TryParseTimestamp(object raw, out DateTimeOffset value)
@@ -1401,26 +1830,25 @@ public static class TokenRaderIndexer
     }
 
     private static bool TryGetResetUnixSeconds(
-        Dictionary<string, object> window,
+        TokenRaderJsonRateWindow window,
         DateTimeOffset? observedAt,
         out long unixSeconds)
     {
         unixSeconds = 0L;
-        object raw;
         // Prefer an absolute reset time. Some log versions use reset_at while
         // current versions generally use resets_at.
-        foreach (string key in new[] { "resets_at", "reset_at" })
+        foreach (object raw in new[] { window.ResetsAt, window.ResetAt })
         {
-            if (window.TryGetValue(key, out raw) && raw != null && TryNormalizeResetValue(raw, out unixSeconds))
+            if (raw != null && TryNormalizeResetValue(raw, out unixSeconds))
                 return true;
         }
 
         // Older/newer payloads may provide only a relative number of seconds.
         // It is meaningful only when the event timestamp is parseable.
-        if (observedAt.HasValue && window.TryGetValue("resets_in_seconds", out raw) && raw != null)
+        if (observedAt.HasValue && window.ResetsInSeconds != null)
         {
             double seconds;
-            if (TryGetDoubleValue(raw, out seconds) && !double.IsNaN(seconds) && !double.IsInfinity(seconds))
+            if (TryGetDoubleValue(window.ResetsInSeconds, out seconds) && !double.IsNaN(seconds) && !double.IsInfinity(seconds))
             {
                 try
                 {
@@ -1497,10 +1925,10 @@ public static class TokenRaderIndexer
         return double.TryParse(text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out value);
     }
 
-    private static long GetInt64(Dictionary<string, object> d, string k)
+    private static long GetInt64Value(object raw)
     {
-        object o; double value;
-        if (d.TryGetValue(k, out o) && TryGetDoubleValue(o, out value) &&
+        double value;
+        if (TryGetDoubleValue(raw, out value) &&
             !double.IsNaN(value) && !double.IsInfinity(value) &&
             value >= (double)long.MinValue && value <= (double)long.MaxValue)
         {
@@ -1510,10 +1938,10 @@ public static class TokenRaderIndexer
         return 0L;
     }
 
-    private static double GetDouble(Dictionary<string, object> d, string k)
+    private static double GetDoubleValueOrZero(object raw)
     {
-        object o; double value;
-        if (d.TryGetValue(k, out o) && TryGetDoubleValue(o, out value)) return value;
+        double value;
+        if (TryGetDoubleValue(raw, out value)) return value;
         return 0.0;
     }
 }
