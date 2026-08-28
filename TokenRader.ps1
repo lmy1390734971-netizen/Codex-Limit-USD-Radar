@@ -642,8 +642,9 @@ function Complete-TokenRaderIntervalComputeJob {
     param($Payload, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
     $baselineStartedAt = [DateTimeOffset](Get-TokenRaderCallbackContextValue -Context $Context -Name 'BaselineStartedAt')
     $final = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'Final' -Default $false)
+    $scanRateLimits = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'ScanRateLimits' -Default $true)
     Complete-TokenRaderIntervalCompute -BaselineStartedAt $baselineStartedAt -Payload $Payload -Final $final `
-        -Generation $Generation -RequestId $RequestId
+        -ScanRateLimits $scanRateLimits -Generation $Generation -RequestId $RequestId
 }
 
 function New-TokenRaderFinalRetryState {
@@ -1296,6 +1297,7 @@ function Complete-TokenRaderIntervalCompute {
         [Parameter(Mandatory = $true)][DateTimeOffset]$BaselineStartedAt,
         $Payload,
         [bool]$Final = $false,
+        [bool]$ScanRateLimits = $true,
         [Int64]$Generation = 0,
         [Int64]$RequestId = 0
     )
@@ -1327,7 +1329,12 @@ function Complete-TokenRaderIntervalCompute {
         if ($null -ne $Payload.PSObject.Properties['LatestRateLimits']) { Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits }
         $endLimits = if ($null -ne $result.PSObject.Properties['EndRateLimits']) { $result.EndRateLimits } else { $result.RateLimits }
         Merge-LatestRateLimits -Candidate $endLimits
-        Update-QuotaEstimatesFromInterval -Result $result -Final $Final
+        # Automatic five-minute previews deliberately skip the quota query.
+        # Their null EndRateLimits must not erase the last estimate calibrated
+        # by a manual View Result or the final frozen settlement.
+        if ($ScanRateLimits) {
+            Update-QuotaEstimatesFromInterval -Result $result -Final $Final
+        }
         $baselineSnapshots = if ($null -ne $result.PSObject.Properties['BaselineSnapshots']) { $result.BaselineSnapshots } else { @{} }
         $script:State.IntervalCache = [pscustomobject]@{
             BaselineStartedAt = $BaselineStartedAt

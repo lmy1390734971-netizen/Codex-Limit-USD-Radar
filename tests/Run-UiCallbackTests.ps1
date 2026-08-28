@@ -19,7 +19,8 @@ foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Invoke-TokenRad
         'Complete-TokenRaderIndexSyncJob', 'Complete-TokenRaderMeasurementBaselineJob',
         'Complete-TokenRaderMeasurementBaseline', 'New-TokenRaderFinalRetryState',
         'Start-TokenRaderPendingIntervalCompute', 'Fail-TokenRaderIntervalComputeJob',
-        'Complete-TokenRaderIntervalStopJob')) {
+        'Complete-TokenRaderIntervalStopJob', 'Complete-TokenRaderIntervalComputeJob',
+        'Complete-TokenRaderIntervalCompute')) {
     $match = [regex]::Match($uiSource, ('(?s)function ' + [regex]::Escape($helperName) + '\b.*?(?=\r?\nfunction |\z)'))
     Assert-UiTest $match.Success ('production helper not found: ' + $helperName)
     Invoke-Expression $match.Value
@@ -81,6 +82,40 @@ try {
     Assert-UiTest ([string]$script:State.UiState -eq 'Measuring') 'baseline completion did not transition Starting to Measuring'
     Assert-UiTest $script:LifecycleEmptyMeasurementShown 'baseline completion did not render the initial measurement placeholder'
     Assert-UiTest (-not $script:LifecycleIntervalStarted) 'baseline completion started a redundant zero-width interval calculation'
+
+    # A token-only automatic preview has no end quota snapshot and must keep
+    # the estimate produced by the last manual refresh. A manual preview is
+    # explicitly allowed to recalibrate (or clear) it from synchronized limits.
+    $script:QuotaUpdateCalls = 0
+    function Update-QuotaEstimatesFromInterval { param($Result, [bool]$Final); $script:QuotaUpdateCalls++ }
+    function Show-IntervalResult { param($Result, [bool]$Running) }
+    $preservedEstimate = [pscustomobject]@{ Marker = 'keep' }
+    $intervalResult = [pscustomobject]@{
+        StartedAt = $baseline.StartedAt; EndedAt = [DateTimeOffset]::Now
+        EndRateLimits = $null; RateLimits = $null; Signature = 'synthetic'
+        ChangeRevision = 1L; BaselineSnapshots = @{}
+    }
+    $script:State = @{
+        BackgroundJobs = @{}; MeasurementGeneration = 3L; IntervalComputeRequestId = 89L
+        IntervalComputing = $true; IntervalComputeStopping = $false; IntervalActiveScanRateLimits = $false
+        IntervalComputePending = $false; IntervalComputePendingRequest = $null
+        IntervalLastError = ''; IntervalFinalRetry = $null; IntervalBaseline = $baseline
+        IntervalResult = $null; IntervalCache = $null; QuotaEstimates = $preservedEstimate
+        UiState = 'Measuring'; IsMeasuring = $true
+    }
+    $intervalPayload = [pscustomobject]@{ Result = $intervalResult; LatestRateLimits = $null }
+    Complete-TokenRaderIntervalComputeJob $intervalPayload 3L 89L 'IntervalCompute' @{
+        BaselineStartedAt = $baseline.StartedAt; Final = $false; ScanRateLimits = $false
+    }
+    Assert-UiTest ($script:QuotaUpdateCalls -eq 0) 'token-only automatic preview recalibrated an absent quota snapshot'
+    Assert-UiTest ($script:State.QuotaEstimates -eq $preservedEstimate) 'token-only automatic preview erased the prior dollar estimate'
+
+    $script:State.IntervalComputeRequestId = 90L
+    $script:State.IntervalComputing = $true
+    Complete-TokenRaderIntervalComputeJob $intervalPayload 3L 90L 'IntervalCompute' @{
+        BaselineStartedAt = $baseline.StartedAt; Final = $false; ScanRateLimits = $true
+    }
+    Assert-UiTest ($script:QuotaUpdateCalls -eq 1) 'manual preview did not request quota recalibration'
 
     # A live preview timeout is recoverable: it must retain the baseline and
     # last result instead of invalidating the whole measurement.
