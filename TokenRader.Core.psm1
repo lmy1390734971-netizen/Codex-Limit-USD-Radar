@@ -1543,7 +1543,12 @@ function Initialize-TokenRaderIndexer {
 }
 
 function Close-TokenRaderIndex {
+    param([switch]$KeepWatcher)
     $index = $script:TokenRaderIndex
+    if (-not $KeepWatcher -and $null -ne $index -and -not [string]::IsNullOrWhiteSpace([string]$index.SessionsRoot) -and
+        $null -ne ('TokenRaderIndexer' -as [type])) {
+        try { [TokenRaderIndexer]::StopWatcher([string]$index.SessionsRoot) } catch { }
+    }
     if ($null -ne $index -and $null -ne $index.Connection) {
         try { $index.Connection.Close(); $index.Connection.Dispose() } catch { }
     }
@@ -1569,14 +1574,22 @@ function Open-TokenRaderIndex {
     $conn = New-Object System.Data.SQLite.SQLiteConnection ('Data Source=' + $dbPath + ';Version=3;')
     $conn.Open()
     [TokenRaderIndexer]::CreateSchema($conn)
+    try { [TokenRaderIndexer]::StartWatcher($canonicalRoot) } catch { }
     $metadata = [TokenRaderIndexer]::GetFileMetadata($conn)
+    $catalogInitialized = [string][TokenRaderIndexer]::GetSetting($conn, 'catalog_initialized') -eq '1'
+    $indexedRoot = [string][TokenRaderIndexer]::GetSetting($conn, 'sessions_root')
+    $rootMatches = -not [string]::IsNullOrWhiteSpace($indexedRoot) -and
+        $indexedRoot.Equals($canonicalRoot, [StringComparison]::OrdinalIgnoreCase)
     $script:TokenRaderIndex = [pscustomobject]@{
         DbPath = $dbPath
         Connection = $conn
         SessionsRoot = $canonicalRoot
         LastSync = $null
         LastFullReconcile = $null
-        IsNew = (-not $wasPresent -or $metadata.Rows.Count -eq 0)
+        IsNew = (-not $wasPresent -or -not $catalogInitialized -or -not $rootMatches)
+        CatalogInitialized = ($catalogInitialized -and $rootMatches)
+        IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($conn)
+        ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision($canonicalRoot)
         IndexedFileCount = [int]$metadata.Rows.Count
         LastImportedFiles = 0
         LastImportedRecords = 0
@@ -1641,141 +1654,236 @@ function Sync-TokenRaderIndexFiles {
         [Parameter(Mandatory = $true)]$Index,
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
         [AllowNull()][string[]]$CandidateFiles,
-        [switch]$FullReconcile
+        [switch]$FullReconcile,
+        [hashtable]$ProgressState
     )
 
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '读取索引游标'
+        $ProgressState.ProcessedFiles = 0
+        $ProgressState.TotalFiles = 0
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
     $conn = $Index.Connection
-    $metadataTable = [TokenRaderIndexer]::GetFileMetadata($conn)
+    $metadataTable = [TokenRaderIndexer]::CaptureFileCursorTable($conn)
     $known = ConvertTo-TokenRaderMetadataMap -Table $metadataTable
     $retentionCutoff = Get-TokenRaderIndexRetentionCutoff -Connection $conn
-    if ($null -eq $CandidateFiles) {
-        $files = if (Test-Path -LiteralPath $SessionsRoot) {
-            @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue |
-                Where-Object { $retentionCutoff -le 0 -or $_.LastWriteTimeUtc.Ticks -ge $retentionCutoff })
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '枚举日志'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+    $files = if ($null -eq $CandidateFiles) {
+        if (Test-Path -LiteralPath $SessionsRoot) {
+            @(Get-ChildItem -LiteralPath $SessionsRoot -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)
         } else { @() }
     } else {
-        $files = @($CandidateFiles | Select-Object -Unique | ForEach-Object {
-            if (-not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_ -PathType Leaf)) {
+        @($CandidateFiles | Select-Object -Unique | ForEach-Object {
+            if (-not [string]::IsNullOrWhiteSpace([string]$_) -and (Test-Path -LiteralPath $_ -PathType Leaf)) {
                 $item = Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue
-                if ($null -ne $item -and $item.Extension -eq '.jsonl' -and
-                    ($retentionCutoff -le 0 -or $item.LastWriteTimeUtc.Ticks -ge $retentionCutoff)) { $item }
+                if ($null -ne $item -and $item.Extension -eq '.jsonl') { $item }
             }
         })
     }
 
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '比较日志游标'
+        $ProgressState.ProcessedFiles = 0
+        $ProgressState.TotalFiles = @($files).Count
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
     $seen = @{}
-    $importedFiles = 0
-    $importedRecords = 0
+    $relationshipBySession = @{}
+    foreach ($row in @($metadataTable.Rows)) {
+        $sessionId = [string]$row['session_id']
+        if ([string]::IsNullOrWhiteSpace($sessionId)) { continue }
+        $relationshipBySession[$sessionId.ToLowerInvariant()] = [pscustomobject]@{
+            SessionId = $sessionId
+            ParentThreadId = [string]$row['parent_thread_id']
+            ForkedFromId = [string]$row['forked_from_id']
+        }
+    }
+
+    $workItems = New-Object System.Collections.ArrayList
+    $catalogProcessed = 0
     foreach ($file in $files) {
+        $catalogProcessed++
+        if ($null -ne $ProgressState -and ($catalogProcessed -eq 1 -or $catalogProcessed % 25 -eq 0)) {
+            $ProgressState.ProcessedFiles = $catalogProcessed
+            $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+        }
         $canonical = [IO.Path]::GetFullPath($file.FullName)
         $key = $canonical.ToLowerInvariant()
         $seen[$key] = $true
-        $length = [Int64]$file.Length
-        $lastWrite = [Int64]$file.LastWriteTimeUtc.Ticks
         $knownRow = if ($known.ContainsKey($key)) { $known[$key] } else { $null }
         $unchanged = $null -ne $knownRow -and
-            [Int64]$knownRow['length'] -eq $length -and
-            [Int64]$knownRow['last_write_ticks'] -eq $lastWrite
-        if ($unchanged) {
-            $hasIndexedSessionId = $knownRow.Table.Columns.Contains('session_id') -and
-                -not [string]::IsNullOrWhiteSpace([string]$knownRow['session_id'])
-            if ($hasIndexedSessionId) { continue }
-            # One-time migration for indexes created before relationship
-            # metadata was added. It reads only session_meta, not token history.
-            $backfill = Get-TokenRaderSessionMetadata -FilePath $canonical
-            [TokenRaderIndexer]::UpdateFileMetadata(
-                $conn,
-                $canonical,
-                $length,
-                $lastWrite,
-                [Int64]$knownRow['parsed_offset'],
-                [string]$backfill.SessionId,
-                [string]$backfill.Cwd,
-                [string]$backfill.ParentThreadId,
-                [string]$backfill.ForkedFromId
-            )
-            continue
-        }
+            [Int64]$knownRow['length'] -eq [Int64]$file.Length -and
+            [Int64]$knownRow['last_write_ticks'] -eq [Int64]$file.LastWriteTimeUtc.Ticks
+        $hasRelationship = $null -ne $knownRow -and -not [string]::IsNullOrWhiteSpace([string]$knownRow['session_id'])
+        if ($unchanged -and $hasRelationship) { continue }
 
         $sessionMetadata = Get-TokenRaderSessionMetadata -FilePath $canonical
-        $startOffset = if ($null -ne $knownRow) { [Int64]$knownRow['parsed_offset'] } else { 0L }
-        $knownSessionId = if ($null -ne $knownRow -and $knownRow.Table.Columns.Contains('session_id')) { [string]$knownRow['session_id'] } else { '' }
-        $requiresReplacement = $null -ne $knownRow -and (
-            $length -lt $startOffset -or
-            ($lastWrite -ne [Int64]$knownRow['last_write_ticks'] -and $length -le [Int64]$knownRow['length'])
-        )
-        if ($requiresReplacement) {
-            if ([string]::IsNullOrWhiteSpace($knownSessionId)) { $knownSessionId = [string]$sessionMetadata.SessionId }
-            [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $knownSessionId)
-            $startOffset = 0L
+        if (-not [string]::IsNullOrWhiteSpace([string]$sessionMetadata.SessionId)) {
+            $relationshipBySession[([string]$sessionMetadata.SessionId).ToLowerInvariant()] = $sessionMetadata
         }
+        [void]$workItems.Add([pscustomobject]@{
+            File = $file
+            Canonical = $canonical
+            Key = $key
+            KnownRow = $knownRow
+            Metadata = $sessionMetadata
+            Unchanged = $unchanged
+        })
+    }
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '处理变化日志'
+        $ProgressState.ProcessedFiles = 0
+        $ProgressState.TotalFiles = $workItems.Count
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+
+    $resolveRoot = {
+        param($Metadata)
+        $root = [string]$Metadata.SessionId
+        $current = $Metadata
+        $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        for ($depth = 0; $null -ne $current -and $depth -lt 64; $depth++) {
+            $currentId = [string]$current.SessionId
+            if (-not [string]::IsNullOrWhiteSpace($currentId) -and -not $visited.Add($currentId)) { break }
+            $parent = if (-not [string]::IsNullOrWhiteSpace([string]$current.ParentThreadId)) {
+                [string]$current.ParentThreadId
+            } else { [string]$current.ForkedFromId }
+            if ([string]::IsNullOrWhiteSpace($parent)) { break }
+            $root = $parent
+            $parentKey = $parent.ToLowerInvariant()
+            if (-not $relationshipBySession.ContainsKey($parentKey)) { break }
+            $current = $relationshipBySession[$parentKey]
+            if (-not [string]::IsNullOrWhiteSpace([string]$current.SessionId)) { $root = [string]$current.SessionId }
+        }
+        if ([string]::IsNullOrWhiteSpace($root)) { $root = [string]$Metadata.SessionId }
+        return $root
+    }
+
+    $importedFiles = 0
+    $importedRecords = 0
+    $changed = $false
+    $nextRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($conn) + 1L
+    $workProcessed = 0
+    foreach ($work in @($workItems)) {
+        $workProcessed++
+        if ($null -ne $ProgressState) {
+            $ProgressState.ProcessedFiles = $workProcessed
+            $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+        }
+        $file = $work.File
+        $canonical = [string]$work.Canonical
+        $knownRow = $work.KnownRow
+        $metadata = $work.Metadata
+        $rootSessionId = & $resolveRoot $metadata
+        $length = [Int64]$file.Length
+        $lastWrite = [Int64]$file.LastWriteTimeUtc.Ticks
+        $startOffset = if ($null -ne $knownRow) { [Int64]$knownRow['parsed_offset'] } else { 0L }
+        $knownRetained = $null -ne $knownRow -and [int]$knownRow['content_retained'] -ne 0
+        $catalogOnly = $retentionCutoff -gt 0 -and $lastWrite -lt $retentionCutoff -and -not $knownRetained
+        if ($null -eq $knownRow -and $retentionCutoff -gt 0 -and $lastWrite -lt $retentionCutoff) { $catalogOnly = $true }
 
         try {
-            # Codex can still be appending the final JSONL record while a
-            # refresh runs. Only advance parsed_offset through the last newline
-            # so an incomplete tail is retried on the next refresh.
             $completeOffset = Get-TokenRaderCompleteJsonlOffset -FilePath $canonical
+            if ($catalogOnly) {
+                # Preserve only enough information to detect a later append.
+                # This direct parameterized update intentionally keeps
+                # content_retained=0; no token rows are reconstructed here.
+                $cmd = $conn.CreateCommand()
+                try {
+                    $cmd.CommandText = 'INSERT OR REPLACE INTO file_metadata (path,length,last_write_ticks,parsed_offset,session_id,cwd,parent_thread_id,forked_from_id,content_retained,root_session_id) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,0,@p9)'
+                    [void]$cmd.Parameters.AddWithValue('@p1', $canonical)
+                    [void]$cmd.Parameters.AddWithValue('@p2', $length)
+                    [void]$cmd.Parameters.AddWithValue('@p3', $lastWrite)
+                    [void]$cmd.Parameters.AddWithValue('@p4', [Int64]$completeOffset)
+                    [void]$cmd.Parameters.AddWithValue('@p5', [string]$metadata.SessionId)
+                    [void]$cmd.Parameters.AddWithValue('@p6', [string]$metadata.Cwd)
+                    [void]$cmd.Parameters.AddWithValue('@p7', [string]$metadata.ParentThreadId)
+                    [void]$cmd.Parameters.AddWithValue('@p8', [string]$metadata.ForkedFromId)
+                    [void]$cmd.Parameters.AddWithValue('@p9', [string]$rootSessionId)
+                    [void]$cmd.ExecuteNonQuery()
+                } finally { $cmd.Dispose() }
+                $changed = $true
+                continue
+            }
+
+            $knownSessionId = if ($null -ne $knownRow) { [string]$knownRow['session_id'] } else { '' }
+            $requiresReplacement = $null -ne $knownRow -and (
+                $length -lt $startOffset -or
+                ($lastWrite -ne [Int64]$knownRow['last_write_ticks'] -and $length -le [Int64]$knownRow['length'])
+            )
+            if ($requiresReplacement) {
+                if ([string]::IsNullOrWhiteSpace($knownSessionId)) { $knownSessionId = [string]$metadata.SessionId }
+                [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $knownSessionId)
+                $startOffset = 0L
+            }
+
             $count = if ($completeOffset -gt $startOffset) {
-                [TokenRaderIndexer]::ImportFile($conn, $canonical, $startOffset, $completeOffset)
+                [TokenRaderIndexer]::ImportFile($conn, $canonical, $startOffset, $completeOffset, [string]$rootSessionId, $nextRevision)
             } else { 0 }
             $fresh = Get-Item -LiteralPath $canonical -ErrorAction Stop
             [TokenRaderIndexer]::UpdateFileMetadata(
-                $conn,
-                $canonical,
-                [Int64]$fresh.Length,
-                [Int64]$fresh.LastWriteTimeUtc.Ticks,
-                [Int64]$completeOffset,
-                [string]$sessionMetadata.SessionId,
-                [string]$sessionMetadata.Cwd,
-                [string]$sessionMetadata.ParentThreadId,
-                [string]$sessionMetadata.ForkedFromId
-            )
+                $conn, $canonical, [Int64]$fresh.Length, [Int64]$fresh.LastWriteTimeUtc.Ticks,
+                [Int64]$completeOffset, [string]$metadata.SessionId, [string]$metadata.Cwd,
+                [string]$metadata.ParentThreadId, [string]$metadata.ForkedFromId, [string]$rootSessionId)
             $importedFiles++
             $importedRecords += [int]$count
+            $changed = $true
         } catch {
-            # Do not advance parsed_offset after a failed import; the next
-            # refresh can retry the same changed file safely.
+            # parsed_offset is not advanced on failure; the changed path stays
+            # eligible for a later reconciliation.
             continue
         }
     }
 
-    if ($FullReconcile) {
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '完成索引同步'
+        $ProgressState.ProcessedFiles = $ProgressState.TotalFiles
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+    $candidatePaths = @{}
+    if ($null -ne $CandidateFiles) {
+        foreach ($candidate in @($CandidateFiles | Select-Object -Unique)) {
+            if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
+            $canonical = [IO.Path]::GetFullPath([string]$candidate)
+            $candidatePaths[$canonical.ToLowerInvariant()] = $canonical
+        }
+    }
+    if ($FullReconcile -or $null -ne $CandidateFiles) {
         foreach ($row in @($metadataTable.Rows)) {
             $path = [string]$row['path']
             $key = $path.ToLowerInvariant()
-            if ($seen.ContainsKey($key)) { continue }
-            $sessionId = if ($row.Table.Columns.Contains('session_id')) { [string]$row['session_id'] } else { '' }
+            $shouldCheck = if ($FullReconcile) { -not $seen.ContainsKey($key) } else { $candidatePaths.ContainsKey($key) }
+            if (-not $shouldCheck -or (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $sessionId = [string]$row['session_id']
             if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-TokenRaderSessionIdFromPath -FilePath $path }
             [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $sessionId)
             [TokenRaderIndexer]::RemoveFileMetadata($conn, $path)
-        }
-        $Index.LastFullReconcile = [DateTimeOffset]::Now
-    } elseif ($null -ne $CandidateFiles) {
-        foreach ($candidate in @($CandidateFiles | Select-Object -Unique)) {
-            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-            $canonical = [IO.Path]::GetFullPath($candidate)
-            $key = $canonical.ToLowerInvariant()
-            if (Test-Path -LiteralPath $canonical -PathType Leaf) {
-                $candidateItem = Get-Item -LiteralPath $canonical -ErrorAction SilentlyContinue
-                # A candidate that has aged or whose timestamp was restored
-                # below the persisted retention floor must leave the index.
-                if ($null -ne $candidateItem -and
-                    ($retentionCutoff -le 0 -or $candidateItem.LastWriteTimeUtc.Ticks -ge $retentionCutoff)) { continue }
-            }
-            if (-not $known.ContainsKey($key)) { continue }
-            $row = $known[$key]
-            $sessionId = if ($row.Table.Columns.Contains('session_id')) { [string]$row['session_id'] } else { '' }
-            if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-TokenRaderSessionIdFromPath -FilePath $canonical }
-            [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $sessionId)
-            [TokenRaderIndexer]::RemoveFileMetadata($conn, $canonical)
+            $changed = $true
         }
     }
-
+    if ($FullReconcile) {
+        $Index.LastFullReconcile = [DateTimeOffset]::Now
+        [TokenRaderIndexer]::SetSetting($conn, 'catalog_initialized', '1')
+        [TokenRaderIndexer]::SetSetting($conn, 'sessions_root', ([string]$Index.SessionsRoot))
+        $Index.CatalogInitialized = $true
+    }
+    if ($changed) { $Index.IndexRevision = [Int64][TokenRaderIndexer]::IncrementIndexRevision($conn) }
+    else { $Index.IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($conn) }
+    $Index.ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision([string]$Index.SessionsRoot)
     $Index.LastSync = [DateTimeOffset]::Now
     $Index.IsNew = $false
     $Index.LastImportedFiles = $importedFiles
     $Index.LastImportedRecords = $importedRecords
-    $Index.IndexedFileCount = [int]([TokenRaderIndexer]::GetFileMetadata($conn).Rows.Count)
+    $Index.IndexedFileCount = [int]([TokenRaderIndexer]::CaptureFileCursorTable($conn).Rows.Count)
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '同步完成'
+        $ProgressState.ProcessedFiles = $ProgressState.TotalFiles
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
     return $Index
 }
 
@@ -1812,20 +1920,39 @@ function New-TokenRaderIndex {
 function Update-TokenRaderIndex {
     param(
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
-        [AllowNull()][string[]]$CandidateFiles
+        [AllowNull()][string[]]$CandidateFiles,
+        [switch]$FullReconcile,
+        [hashtable]$ProgressState
     )
 
     $index = $script:TokenRaderIndex
     if ($null -eq $index -or $null -eq $index.Connection) {
         $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
     }
+    $watcherWasActive = [TokenRaderIndexer]::IsWatcherActive($SessionsRoot)
+    if (-not $watcherWasActive) { [TokenRaderIndexer]::StartWatcher($SessionsRoot) }
     if ($PSBoundParameters.ContainsKey('CandidateFiles')) {
-        return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $CandidateFiles
+        return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $CandidateFiles -ProgressState $ProgressState
     }
-    # A normal refresh enumerates file metadata once, but opens and parses only
-    # files whose length or last-write time changed. This catches old sessions
-    # that were reopened while avoiding repeated reads of historical contents.
-    return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile
+    if ($FullReconcile -or [bool]$index.IsNew -or (-not $watcherWasActive -and (Test-Path -LiteralPath $SessionsRoot)) -or
+        [TokenRaderIndexer]::ConsumeWatcherOverflow($SessionsRoot)) {
+        return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile -ProgressState $ProgressState
+    }
+    $changedPaths = @([TokenRaderIndexer]::DrainChangedPaths($SessionsRoot))
+    if ($changedPaths.Count -gt 0) {
+        return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $changedPaths -ProgressState $ProgressState
+    }
+    $index.IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
+    $index.ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot)
+    $index.LastImportedFiles = 0
+    $index.LastImportedRecords = 0
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '同步完成'
+        $ProgressState.ProcessedFiles = 0
+        $ProgressState.TotalFiles = 0
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+    return $index
 }
 
 <#
@@ -1854,6 +1981,8 @@ function Remove-TokenRaderIndexHistory {
     $effectiveCutoff = [Math]::Max([Int64]$requestedCutoff, [Int64]$existingCutoff)
     $removed = [TokenRaderIndexer]::PurgeIndexBefore($index.Connection, $effectiveCutoff)
     [TokenRaderIndexer]::SetSetting($index.Connection, 'retention_cutoff_ticks', ([Int64]$effectiveCutoff).ToString([Globalization.CultureInfo]::InvariantCulture))
+    if ([int]$removed -gt 0) { $index.IndexRevision = [Int64][TokenRaderIndexer]::IncrementIndexRevision($index.Connection) }
+    else { $index.IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) }
     $index.LastSync = [DateTimeOffset]::Now
     $index.IndexedFileCount = [int]([TokenRaderIndexer]::GetFileMetadata($index.Connection).Rows.Count)
     [pscustomobject]@{
@@ -2019,8 +2148,11 @@ function ConvertFrom-TokenRaderIndexRecord {
     $callTotal = $callInput + $callOutput
     $callHitRate = if ($callInput -gt 0) { ($callCached * 100.0) / $callInput } else { 0.0 }
 
-    $timestamp = [DateTimeOffset]::Now
+    $timestamp = [DateTimeOffset]::MinValue
     try { $timestamp = [DateTimeOffset]::Parse([string]$Row['timestamp']).ToLocalTime() } catch { }
+    $sourceFile = if ($Row.Table.Columns.Contains('source_path')) { [string]$Row['source_path'] } else { $FilePath }
+    if ([string]::IsNullOrWhiteSpace($FilePath)) { $FilePath = $sourceFile }
+    $planType = [string]$Row['plan_type']
 
     $fiveHour = $null
     $weekly = $null
@@ -2031,7 +2163,12 @@ function ConvertFrom-TokenRaderIndexRecord {
             RemainingPercent = 100.0 - [double]$fhUsed
             WindowMinutes = [int]$Row['five_hour_window']
             ResetsAt = if ($null -ne $Row['five_hour_resets'] -and -not [DBNull]::Value.Equals($Row['five_hour_resets'])) { [DateTimeOffset]::FromUnixTimeSeconds([Int64]$Row['five_hour_resets']).ToLocalTime() } else { $null }
+            ObservedAt = $timestamp
+            SourceFile = $sourceFile
+            PlanType = $planType
+            ResetIdentity = if ($null -ne $Row['five_hour_resets'] -and -not [DBNull]::Value.Equals($Row['five_hour_resets'])) { '300:' + [string][Int64]$Row['five_hour_resets'] } else { '' }
         }
+        $fiveHour.ResetIdentity = Get-TokenRaderResetIdentity -WindowMinutes ([int]$fiveHour.WindowMinutes) -ResetsAt $fiveHour.ResetsAt
     }
     $wkUsed = $Row['weekly_used']
     if ($null -ne $wkUsed -and -not [DBNull]::Value.Equals($wkUsed)) {
@@ -2040,12 +2177,17 @@ function ConvertFrom-TokenRaderIndexRecord {
             RemainingPercent = 100.0 - [double]$wkUsed
             WindowMinutes = [int]$Row['weekly_window']
             ResetsAt = if ($null -ne $Row['weekly_resets'] -and -not [DBNull]::Value.Equals($Row['weekly_resets'])) { [DateTimeOffset]::FromUnixTimeSeconds([Int64]$Row['weekly_resets']).ToLocalTime() } else { $null }
+            ObservedAt = $timestamp
+            SourceFile = $sourceFile
+            PlanType = $planType
+            ResetIdentity = ''
         }
+        $weekly.ResetIdentity = Get-TokenRaderResetIdentity -WindowMinutes ([int]$weekly.WindowMinutes) -ResetsAt $weekly.ResetsAt
     }
 
     $rateLimits = [pscustomobject]@{
         ObservedAt = $timestamp
-        PlanType = [string]$Row['plan_type']
+        PlanType = $planType
         FiveHour = $fiveHour
         Weekly = $weekly
     }
@@ -2077,7 +2219,358 @@ function ConvertFrom-TokenRaderIndexRecord {
         ContextWindow = [Int64]0
         TailLinesRead = 0
         TokenRecordIndex = 0
+        RecordId = if ($Row.Table.Columns.Contains('id')) { [Int64]$Row['id'] } else { 0L }
+        SessionId = if ($Row.Table.Columns.Contains('session_id')) { [string]$Row['session_id'] } else { '' }
+        RootSessionId = if ($Row.Table.Columns.Contains('root_session_id')) { [string]$Row['root_session_id'] } else { '' }
+        SourceOffsetEnd = if ($Row.Table.Columns.Contains('source_offset_end')) { [Int64]$Row['source_offset_end'] } else { 0L }
+        UsageFingerprint = if ($Row.Table.Columns.Contains('fingerprint')) { [string]$Row['fingerprint'] } else { '' }
+        IndexRevision = if ($Row.Table.Columns.Contains('index_revision')) { [Int64]$Row['index_revision'] } else { 0L }
     }
 }
 
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord
+function ConvertTo-TokenRaderOffsetMap {
+    param($Value)
+    $map = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+    if ($null -eq $Value) { return $map }
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($key in @($Value.Keys)) {
+            try { $map[(ConvertTo-TokenRaderCanonicalPath -Path ([string]$key))] = [Int64]$Value[$key] } catch { }
+        }
+    } elseif ($null -ne $Value.PSObject) {
+        foreach ($property in @($Value.PSObject.Properties)) {
+            try { $map[(ConvertTo-TokenRaderCanonicalPath -Path ([string]$property.Name))] = [Int64]$property.Value } catch { }
+        }
+    }
+    return $map
+}
+
+function Get-TokenRaderCursorOffsets {
+    param([Parameter(Mandatory = $true)]$Connection)
+    $offsets = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+    $table = [TokenRaderIndexer]::CaptureFileCursorTable($Connection)
+    foreach ($row in @($table.Rows)) {
+        $path = ConvertTo-TokenRaderCanonicalPath -Path ([string]$row['path'])
+        if (-not [string]::IsNullOrWhiteSpace($path)) { $offsets[$path] = [Int64]$row['parsed_offset'] }
+    }
+    return $offsets
+}
+
+function ConvertFrom-TokenRaderRateLimitRows {
+    param($Table)
+    if ($null -eq $Table -or $Table.Rows.Count -eq 0) { return $null }
+    $fiveHour = $null
+    $weekly = $null
+    $fiveObserved = [DateTimeOffset]::MinValue
+    $weeklyObserved = [DateTimeOffset]::MinValue
+    foreach ($row in @($Table.Rows)) {
+        $record = ConvertFrom-TokenRaderIndexRecord -Row $row
+        if ($null -ne $record.RateLimits.FiveHour -and [DateTimeOffset]$record.RateLimits.FiveHour.ObservedAt -ge $fiveObserved) {
+            $fiveHour = $record.RateLimits.FiveHour
+            $fiveObserved = [DateTimeOffset]$fiveHour.ObservedAt
+        }
+        if ($null -ne $record.RateLimits.Weekly -and [DateTimeOffset]$record.RateLimits.Weekly.ObservedAt -ge $weeklyObserved) {
+            $weekly = $record.RateLimits.Weekly
+            $weeklyObserved = [DateTimeOffset]$weekly.ObservedAt
+        }
+    }
+    if ($null -eq $fiveHour -and $null -eq $weekly) { return $null }
+    $planType = if ($fiveObserved -ge $weeklyObserved -and $null -ne $fiveHour) { [string]$fiveHour.PlanType }
+                elseif ($null -ne $weekly) { [string]$weekly.PlanType }
+                else { '' }
+    [pscustomobject]@{
+        ObservedAt = if ($fiveObserved -ge $weeklyObserved) { $fiveObserved } else { $weeklyObserved }
+        PlanType = $planType
+        FiveHour = $fiveHour
+        Weekly = $weekly
+    }
+}
+
+function Get-TokenRaderIndexedRateLimitsAtOffsets {
+    param(
+        [Parameter(Mandatory = $true)]$Connection,
+        [Parameter(Mandatory = $true)]$EndOffsets
+    )
+    $ends = ConvertTo-TokenRaderOffsetMap -Value $EndOffsets
+    $starts = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in @($ends.Keys)) { $starts[$path] = 0L }
+    if ($ends.Count -eq 0) { return $null }
+    $table = [TokenRaderIndexer]::QueryLatestRateLimitsByOffsets($Connection, $starts, $ends)
+    return ConvertFrom-TokenRaderRateLimitRows -Table $table
+}
+
+function Get-TokenRaderIndexedLatestRateLimits {
+    param([Parameter(Mandatory = $true)][string]$SessionsRoot)
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    $offsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
+    return Get-TokenRaderIndexedRateLimitsAtOffsets -Connection $index.Connection -EndOffsets $offsets
+}
+
+function GetIndexRevision {
+    param([string]$SessionsRoot = '')
+    $index = $script:TokenRaderIndex
+    if (($null -eq $index -or $null -eq $index.Connection) -and -not [string]::IsNullOrWhiteSpace($SessionsRoot)) {
+        $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    }
+    if ($null -eq $index -or $null -eq $index.Connection) { return 0L }
+    $index.IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
+    return [Int64]$index.IndexRevision
+}
+
+function Get-TokenRaderChangeRevision {
+    param([Parameter(Mandatory = $true)][string]$SessionsRoot)
+    if ($null -eq ('TokenRaderIndexer' -as [type])) { return 0L }
+    return [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot)
+}
+
+function CaptureMeasurementBaseline {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        $PricingDocument = $null,
+        [string]$AccountIdentity = ''
+    )
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    $gate = [TokenRaderIndexer]::AcquireIndexGate($SessionsRoot)
+    try {
+        $index = Update-TokenRaderIndex -SessionsRoot $SessionsRoot
+        $startOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
+        $startRateLimits = Get-TokenRaderIndexedRateLimitsAtOffsets -Connection $index.Connection -EndOffsets $startOffsets
+        $files = foreach ($path in @($startOffsets.Keys)) {
+            [pscustomobject]@{
+                FilePath = [string]$path
+                Length = [Int64]$startOffsets[$path]
+                LastWriteTimeUtc = [DateTime]::MinValue
+                BaselineLoaded = $false
+                BaselineTask = $null
+                BaselineModel = ''
+            }
+        }
+        # The real timer starts only after synchronization and both snapshots
+        # are frozen. Calls generated during Starting are filtered by time.
+        $startedAt = [DateTimeOffset]::Now
+        [pscustomobject]@{
+            StartedAt = $startedAt
+            SessionsRoot = [string]$index.SessionsRoot
+            Files = @($files)
+            StartOffsets = $startOffsets
+            RateLimits = $startRateLimits
+            StartRateLimits = $startRateLimits
+            AccountIdentity = $AccountIdentity
+            PlanType = if ($null -ne $startRateLimits) { [string]$startRateLimits.PlanType } else { '' }
+            IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
+            ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot)
+        }
+    } finally {
+        $gate.Dispose()
+    }
+}
+
+function CaptureMeasurementEnd {
+    param(
+        [Parameter(Mandatory = $true)]$Baseline,
+        [switch]$IncludeRateLimits
+    )
+    $sessionsRoot = [string]$Baseline.SessionsRoot
+    $index = Open-TokenRaderIndex -SessionsRoot $sessionsRoot
+    $gate = [TokenRaderIndexer]::AcquireIndexGate($sessionsRoot)
+    try {
+        $index = Update-TokenRaderIndex -SessionsRoot $sessionsRoot
+        $endOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
+        # The UI only needs immutable offsets/revision to finish Stopping.
+        # Quota lookup is intentionally deferred to interval settlement, where
+        # it queries these same frozen offsets and cannot see later appends.
+        $endRateLimits = if ($IncludeRateLimits) {
+            Get-TokenRaderIndexedRateLimitsAtOffsets -Connection $index.Connection -EndOffsets $endOffsets
+        } else { $null }
+        [pscustomobject]@{
+            EndedAt = [DateTimeOffset]::Now
+            EndOffsets = $endOffsets
+            EndRateLimits = $endRateLimits
+            EndRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
+            ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision($sessionsRoot)
+        }
+    } finally {
+        $gate.Dispose()
+    }
+}
+
+function QueryIntervalRecords {
+    param(
+        [Parameter(Mandatory = $true)]$StartOffsets,
+        [Parameter(Mandatory = $true)]$EndOffsets,
+        [string]$SessionsRoot = ''
+    )
+    $index = $script:TokenRaderIndex
+    if (($null -eq $index -or $null -eq $index.Connection) -and -not [string]::IsNullOrWhiteSpace($SessionsRoot)) {
+        $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    }
+    if ($null -eq $index -or $null -eq $index.Connection) { return $null }
+    $startsInput = ConvertTo-TokenRaderOffsetMap -Value $StartOffsets
+    $ends = ConvertTo-TokenRaderOffsetMap -Value $EndOffsets
+    $starts = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in @($ends.Keys)) {
+        $starts[$path] = if ($startsInput.ContainsKey($path)) { [Int64]$startsInput[$path] } else { 0L }
+    }
+    return ,([TokenRaderIndexer]::QueryIntervalRecords($index.Connection, $starts, $ends))
+}
+
+function Get-TokenRaderIndexedIntervalResult {
+    param(
+        [Parameter(Mandatory = $true)]$Baseline,
+        [Parameter(Mandatory = $true)]$PricingDocument,
+        [hashtable]$BaselineSnapshots = $null,
+        $EndOffsets = $null,
+        $EndRevision = $null,
+        $EndedAt = $null,
+        [bool]$ScanRateLimits = $true,
+        [string]$SessionsRoot = ''
+    )
+    if ([string]::IsNullOrWhiteSpace($SessionsRoot)) { $SessionsRoot = [string]$Baseline.SessionsRoot }
+    $ending = $null
+    if ($null -eq $EndOffsets) {
+        $ending = CaptureMeasurementEnd -Baseline $Baseline
+        $EndOffsets = $ending.EndOffsets
+        $EndRevision = $ending.EndRevision
+    }
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    $starts = ConvertTo-TokenRaderOffsetMap -Value $Baseline.StartOffsets
+    $ends = ConvertTo-TokenRaderOffsetMap -Value $EndOffsets
+    $table = QueryIntervalRecords -StartOffsets $starts -EndOffsets $ends -SessionsRoot $SessionsRoot
+
+    [Int64]$aggregateInput = 0
+    [Int64]$aggregateCached = 0
+    [Int64]$aggregateOutput = 0
+    [Int64]$aggregateReasoning = 0
+    [Int64]$rawEvents = if ($null -ne $table) { $table.Rows.Count } else { 0 }
+    [Int64]$countedEvents = 0
+    [Int64]$duplicateEvents = 0
+    [Int64]$inheritedEvents = 0
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $activeFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $models = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $unknownModels = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $buckets = @{}
+    $startedAt = [DateTimeOffset]$Baseline.StartedAt
+
+    foreach ($row in @($table.Rows)) {
+        $event = ConvertFrom-TokenRaderIndexRecord -Row $row
+        $wasPresentAtStart = $starts.ContainsKey([string]$event.FilePath)
+        $isStartingWindowEvent = [DateTimeOffset]$event.Timestamp -ge $startedAt.AddDays(-1)
+        if ([DateTimeOffset]$event.Timestamp -lt $startedAt -and (-not $wasPresentAtStart -or $isStartingWindowEvent)) {
+            $inheritedEvents++
+            continue
+        }
+        $call = $event.Call
+        if ([Int64]$call.Input -le 0 -and [Int64]$call.Output -le 0) { continue }
+        $rootId = if (-not [string]::IsNullOrWhiteSpace([string]$event.RootSessionId)) { [string]$event.RootSessionId } else { [string]$event.SessionId }
+        $model = [string]$event.Model
+        $timestampKey = ([DateTimeOffset]$event.Timestamp).ToUniversalTime().ToString('o')
+        $eventKey = $rootId.ToLowerInvariant() + '|' + $timestampKey + '|' + $model.ToLowerInvariant() + '|' + [string]$event.UsageFingerprint
+        if (-not $seen.Add($eventKey)) {
+            $duplicateEvents++
+            continue
+        }
+        $countedEvents++
+        $aggregateInput += [Int64]$call.Input
+        $aggregateCached += [Int64]$call.Cached
+        $aggregateOutput += [Int64]$call.Output
+        $aggregateReasoning += [Int64]$call.ReasoningOutput
+        if (-not [string]::IsNullOrWhiteSpace([string]$event.FilePath)) { [void]$activeFiles.Add([string]$event.FilePath) }
+        if (-not [string]::IsNullOrWhiteSpace($model)) { [void]$models.Add($model) }
+
+        $price = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument
+        $longContext = $null -ne $price -and $null -ne $price.PSObject.Properties['longContextThreshold'] -and
+            [Int64]$price.longContextThreshold -gt 0 -and [Int64]$call.Input -gt [Int64]$price.longContextThreshold
+        $bucketKey = $model.ToLowerInvariant() + '|' + $(if ($longContext) { 'long' } else { 'standard' })
+        if (-not $buckets.ContainsKey($bucketKey)) {
+            $buckets[$bucketKey] = [pscustomobject]@{
+                Model = $model; LongContext = [bool]$longContext
+                Input = [Int64]0; Cached = [Int64]0; Output = [Int64]0; Reasoning = [Int64]0; Events = [Int64]0
+                InputCost = [double]0; CachedCost = [double]0; OutputCost = [double]0; Known = $true; Price = $price
+            }
+        }
+        $bucket = $buckets[$bucketKey]
+        $bucket.Input += [Int64]$call.Input
+        $bucket.Cached += [Int64]$call.Cached
+        $bucket.Output += [Int64]$call.Output
+        $bucket.Reasoning += [Int64]$call.ReasoningOutput
+        $bucket.Events++
+        $eventCost = Get-TokenRaderCost -Usage $call -Model $model -PricingDocument $PricingDocument -Scope call
+        if ($eventCost.Known) {
+            $bucket.InputCost += [double]$eventCost.InputCost
+            $bucket.CachedCost += [double]$eventCost.CachedCost
+            $bucket.OutputCost += [double]$eventCost.OutputCost
+        } else {
+            $bucket.Known = $false
+            [void]$unknownModels.Add($(if ([string]::IsNullOrWhiteSpace($model)) { '未知模型' } else { $model }))
+        }
+    }
+
+    [double]$inputCost = 0
+    [double]$cachedCost = 0
+    [double]$outputCost = 0
+    $items = foreach ($bucket in @($buckets.Values)) {
+        $inputCost += [double]$bucket.InputCost
+        $cachedCost += [double]$bucket.CachedCost
+        $outputCost += [double]$bucket.OutputCost
+        $bucketUsage = New-TokenRaderUsage -InputTokens $bucket.Input -CachedTokens $bucket.Cached -OutputTokens $bucket.Output -ReasoningOutputTokens $bucket.Reasoning
+        [pscustomobject]@{
+            Model = [string]$bucket.Model
+            LongContext = [bool]$bucket.LongContext
+            Usage = $bucketUsage
+            Events = [Int64]$bucket.Events
+            Cost = [pscustomobject]@{
+                Known = [bool]$bucket.Known; Model = [string]$bucket.Model; Price = $bucket.Price
+                InputCost = [double]$bucket.InputCost; CachedCost = [double]$bucket.CachedCost; OutputCost = [double]$bucket.OutputCost
+                TotalCost = [double]$bucket.InputCost + [double]$bucket.CachedCost + [double]$bucket.OutputCost
+                LongContextApplied = [bool]$bucket.LongContext
+            }
+        }
+    }
+
+    $endRateLimits = if ($null -ne $ending -and $null -ne $ending.EndRateLimits) { $ending.EndRateLimits }
+                     elseif ($ScanRateLimits) { Get-TokenRaderIndexedRateLimitsAtOffsets -Connection $index.Connection -EndOffsets $ends }
+                     else { $null }
+    $startRateLimits = if ($null -ne $Baseline.PSObject.Properties['StartRateLimits']) { $Baseline.StartRateLimits }
+                       elseif ($null -ne $Baseline.PSObject.Properties['RateLimits']) { $Baseline.RateLimits }
+                       else { $null }
+    $modelList = @($models | Sort-Object)
+    $usage = New-TokenRaderUsage -InputTokens $aggregateInput -CachedTokens $aggregateCached -OutputTokens $aggregateOutput -ReasoningOutputTokens $aggregateReasoning
+    [Int64]$bytesRead = 0
+    foreach ($path in @($ends.Keys)) {
+        $start = if ($starts.ContainsKey($path)) { [Int64]$starts[$path] } else { 0L }
+        $bytesRead += [Math]::Max(0L, [Int64]$ends[$path] - $start)
+    }
+    $pricingComplete = $unknownModels.Count -eq 0
+    [pscustomobject]@{
+        StartedAt = $startedAt
+        EndedAt = if ($null -ne $ending) { $ending.EndedAt } elseif ($null -ne $EndedAt) { [DateTimeOffset]$EndedAt } else { [DateTimeOffset]::Now }
+        Usage = $usage
+        Models = $modelList
+        ModelDisplay = if ($modelList.Count -eq 0) { '等待模型调用' } elseif ($modelList.Count -eq 1) { $modelList[0] } else { '{0} 个模型' -f $modelList.Count }
+        ChangedSessions = $activeFiles.Count
+        Items = @($items)
+        InputCost = $inputCost
+        CachedCost = $cachedCost
+        OutputCost = $outputCost
+        TotalCost = $inputCost + $cachedCost + $outputCost
+        PricingComplete = $pricingComplete
+        CostComplete = $pricingComplete
+        UnknownModels = @($unknownModels | Sort-Object)
+        StartRateLimits = $startRateLimits
+        EndRateLimits = $endRateLimits
+        RateLimits = $endRateLimits
+        RawEvents = $rawEvents
+        CountedEvents = $countedEvents
+        DuplicateEventsDropped = $duplicateEvents
+        InheritedEventsDropped = $inheritedEvents
+        BytesRead = $bytesRead
+        IndexRevision = if ($null -ne $EndRevision) { [Int64]$EndRevision } else { [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) }
+        ChangeRevision = if ($null -ne $ending) { [Int64]$ending.ChangeRevision } else { [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot) }
+        Signature = 'index:' + $(if ($null -ne $EndRevision) { [string][Int64]$EndRevision } else { [string][Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) })
+        BaselineSnapshots = if ($null -ne $BaselineSnapshots) { $BaselineSnapshots } else { @{} }
+        StartOffsets = $starts
+        EndOffsets = $ends
+    }
+}
+
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision

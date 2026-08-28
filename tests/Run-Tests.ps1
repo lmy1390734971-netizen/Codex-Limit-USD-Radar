@@ -1,5 +1,8 @@
 ﻿[CmdletBinding()]
-param([switch]$Live)
+param(
+    [switch]$Live,
+    [switch]$Performance
+)
 
 # The XAML regression check instantiates WPF controls, which behave
 # consistently only on a single-threaded apartment. Relaunch ourselves in an
@@ -8,6 +11,7 @@ param([switch]$Live)
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"' + $PSCommandPath + '"'))
     if ($Live) { $arguments += '-Live' }
+    if ($Performance) { $arguments += '-Performance' }
     $hostExecutable = if ($PSVersionTable.PSEdition -eq 'Core') { Join-Path $PSHOME 'pwsh.exe' } else { Join-Path $PSHOME 'powershell.exe' }
     Start-Process -FilePath $hostExecutable -ArgumentList $arguments -Wait -NoNewWindow
     exit $LASTEXITCODE
@@ -28,6 +32,43 @@ function Assert-Near {
     if ([Math]::Abs($Expected - $Actual) -gt $Tolerance) {
         throw "ASSERT FAILED: $Message. Expected=[$Expected] Actual=[$Actual]"
     }
+}
+
+function Assert-Greater {
+    param([Int64]$ExpectedMinimum, [Int64]$Actual, [string]$Message)
+    if ($Actual -le $ExpectedMinimum) {
+        throw "ASSERT FAILED: $Message. Expected >[$ExpectedMinimum] Actual=[$Actual]"
+    }
+}
+
+function Get-TestPercentile {
+    param(
+        [double[]]$Values,
+        [double]$Percentile
+    )
+    $ordered = @($Values | Sort-Object)
+    if ($ordered.Count -eq 0) { return 0.0 }
+    $rank = [Math]::Ceiling($ordered.Count * $Percentile) - 1
+    $index = [Math]::Max(0, [Math]::Min($ordered.Count - 1, [int]$rank))
+    return [double]$ordered[$index]
+}
+
+function ConvertTo-TestOffsetHashtable {
+    param($Value)
+    $result = @{}
+    if ($null -eq $Value) { return $result }
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Value.Keys)) {
+            try { $result[[string]$key] = [Int64]$Value[$key] } catch { }
+        }
+        return $result
+    }
+    if ($null -ne $Value.PSObject) {
+        foreach ($property in @($Value.PSObject.Properties)) {
+            try { $result[[string]$property.Name] = [Int64]$property.Value } catch { }
+        }
+    }
+    return $result
 }
 
 function New-TestTokenRecord {
@@ -128,6 +169,24 @@ function Select-TestIndexRow {
     return $null
 }
 
+function Select-TestIndexRows {
+    param([object[]]$Output)
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($item in @($Output)) {
+        if ($null -eq $item) { continue }
+        if ($item -is [System.Data.DataTable]) {
+            foreach ($row in @($item.Rows)) { [void]$rows.Add($row) }
+            continue
+        }
+        if ($item -is [System.Data.DataRow]) {
+            [void]$rows.Add($item)
+            continue
+        }
+        if ($null -ne $item.PSObject.Properties['session_id']) { [void]$rows.Add($item) }
+    }
+    return @($rows)
+}
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $projectRoot 'TokenRader.Core.psm1') -Force
 $prices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.json')
@@ -148,6 +207,10 @@ New-Item -ItemType Directory -Path $tempRoot | Out-Null
 # Resolve to the canonical long path: $env:TEMP may contain an 8.3 short name
 # (e.g. RUNNER~1) on CI runners, while Get-ChildItem returns the long form.
 $tempRoot = (Get-Item -LiteralPath $tempRoot).FullName
+$previousGlobalIndexOverride = [Environment]::GetEnvironmentVariable('TOKEN_RADER_INDEX_DB', 'Process')
+$globalTestIndexPath = Join-Path $tempRoot 'data\private\global-index\index.db'
+New-Item -ItemType Directory -Path (Split-Path -Parent $globalTestIndexPath) -Force | Out-Null
+$env:TOKEN_RADER_INDEX_DB = $globalTestIndexPath
 try {
     $fixturePath = Join-Path $tempRoot 'rollout-2026-07-14T00-00-00-00000000-0000-0000-0000-000000000001.jsonl'
     $records = @(
@@ -311,6 +374,80 @@ try {
     $quotaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $measurementBaseline.RateLimits -EndRateLimits $intervalResult.RateLimits -IntervalCost $intervalResult.TotalCost -CostComplete $intervalResult.CostComplete
     Assert-Near 0.83 $quotaEstimate.FiveHour.TotalUsd 0.0000001 'five-hour inferred USD quota'
     Assert-Near 1.66 $quotaEstimate.Weekly.TotalUsd 0.0000001 'weekly inferred USD quota'
+
+    # Explicit measurement capture contract used by the asynchronous UI.  The
+    # public commands freeze offsets/snapshots before the worker starts; the end
+    # capture is a separate immutable object and must not be reconstructed from
+    # the live filesystem later.
+    $captureBaselineCommand = Get-Command -Name CaptureMeasurementBaseline -ErrorAction SilentlyContinue
+    $captureEndCommand = Get-Command -Name CaptureMeasurementEnd -ErrorAction SilentlyContinue
+    if ($null -eq $captureBaselineCommand -or $null -eq $captureEndCommand) {
+        throw 'MEASUREMENT CONTRACT FAILED: CaptureMeasurementBaseline and CaptureMeasurementEnd are required'
+    }
+    $capturedBaseline = CaptureMeasurementBaseline -SessionsRoot $measurementRoot -PricingDocument $prices
+    if ($null -eq $capturedBaseline -or $null -eq $capturedBaseline.PSObject.Properties['StartOffsets'] -or
+        $null -eq $capturedBaseline.PSObject.Properties['StartRateLimits']) {
+        throw 'MEASUREMENT CONTRACT FAILED: baseline capture must include StartOffsets and StartRateLimits'
+    }
+    $capturedEnd = CaptureMeasurementEnd -Baseline $capturedBaseline
+    if ($null -eq $capturedEnd -or $null -eq $capturedEnd.PSObject.Properties['EndOffsets']) {
+        throw 'MEASUREMENT CONTRACT FAILED: end capture must include EndOffsets'
+    }
+    $capturedStartOffsets = ConvertTo-TestOffsetHashtable -Value $capturedBaseline.StartOffsets
+    $capturedEndOffsets = ConvertTo-TestOffsetHashtable -Value $capturedEnd.EndOffsets
+    foreach ($startPath in @($capturedStartOffsets.Keys)) {
+        if (-not $capturedEndOffsets.ContainsKey([string]$startPath)) {
+            throw "MEASUREMENT CONTRACT FAILED: EndOffsets omitted baseline file $startPath"
+        }
+        Assert-Greater ([Int64]$capturedStartOffsets[$startPath] - 1) ([Int64]$capturedEndOffsets[[string]$startPath]) 'end capture offset is not before the baseline file length'
+    }
+
+    # Freeze semantics: once EndOffsets is captured, records appended later are
+    # outside the interval even when the same result is recomputed.  Keep this
+    # fixture separate from the broader usage fixture so the expected delta is
+    # unambiguous and compare both token/cost and quota snapshots.
+    $captureFreezeRoot = Join-Path $tempRoot 'capture-freeze-sessions'
+    New-Item -ItemType Directory -Path $captureFreezeRoot | Out-Null
+    $captureFreezePath = Join-Path $captureFreezeRoot 'rollout-freeze.jsonl'
+    $captureFreezeInitial = @(
+        [ordered]@{ timestamp = '2026-07-14T01:30:00Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.6-sol' } },
+        (New-TestTokenRecord -Timestamp '2026-07-14T01:30:01Z' -TotalInput 1000 -TotalCached 400 -TotalOutput 100 -CallInput 1000 -CallCached 400 -CallOutput 100 -RateLimits (New-TestRawRateLimits -FiveHourUsed 3 -WeeklyUsed 4 -FiveHourReset 1784000000 -WeeklyReset 1784500000))
+    )
+    @($captureFreezeInitial | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress }) | Set-Content -LiteralPath $captureFreezePath -Encoding UTF8
+    $captureFreezeBaseline = CaptureMeasurementBaseline -SessionsRoot $captureFreezeRoot -PricingDocument $prices
+    $captureFreezeBeforeEnd = New-TestTokenRecord -Timestamp '2026-07-14T01:31:00Z' -TotalInput 1250 -TotalCached 500 -TotalOutput 125 -CallInput 250 -CallCached 100 -CallOutput 25 -RateLimits (New-TestRawRateLimits -FiveHourUsed 5 -WeeklyUsed 6 -FiveHourReset 1784000000 -WeeklyReset 1784500000)
+    ($captureFreezeBeforeEnd | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $captureFreezePath -Encoding UTF8
+    # FileSystemWatcher delivery is asynchronous. Wait for its monotonic
+    # revision before asking CaptureMeasurementEnd to consume the change queue,
+    # otherwise this contract test races the operating system notification.
+    $captureFreezeDeadline = [DateTime]::UtcNow.AddSeconds(2)
+    while ([TokenRaderIndexer]::GetChangeRevision($captureFreezeRoot) -le [Int64]$captureFreezeBaseline.ChangeRevision -and
+        [DateTime]::UtcNow -lt $captureFreezeDeadline) {
+        Start-Sleep -Milliseconds 10
+    }
+    $captureFreezeEnd = CaptureMeasurementEnd -Baseline $captureFreezeBaseline
+    $captureFreezeEndOffsets = ConvertTo-TestOffsetHashtable -Value $captureFreezeEnd.EndOffsets
+    if (-not $captureFreezeEndOffsets.ContainsKey([string]$captureFreezePath)) { throw 'MEASUREMENT CONTRACT FAILED: freeze end omitted fixture path' }
+    $frozenResultBeforeAppend = Get-TokenRaderIntervalResult -Baseline $captureFreezeBaseline -PricingDocument $prices -EndOffsets $captureFreezeEndOffsets
+    $indexedFrozenBeforeAppend = Get-TokenRaderIndexedIntervalResult -Baseline $captureFreezeBaseline -PricingDocument $prices -EndOffsets $captureFreezeEndOffsets -EndRevision $captureFreezeEnd.EndRevision
+    $captureFreezeAfterEnd = New-TestTokenRecord -Timestamp '2026-07-14T01:32:00Z' -TotalInput 1750 -TotalCached 700 -TotalOutput 175 -CallInput 500 -CallCached 200 -CallOutput 50 -RateLimits (New-TestRawRateLimits -FiveHourUsed 8 -WeeklyUsed 9 -FiveHourReset 1784000000 -WeeklyReset 1784500000)
+    ($captureFreezeAfterEnd | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $captureFreezePath -Encoding UTF8
+    $frozenResultAfterAppend = Get-TokenRaderIntervalResult -Baseline $captureFreezeBaseline -PricingDocument $prices -EndOffsets $captureFreezeEndOffsets
+    $indexedFrozenAfterAppend = Get-TokenRaderIndexedIntervalResult -Baseline $captureFreezeBaseline -PricingDocument $prices -EndOffsets $captureFreezeEndOffsets -EndRevision $captureFreezeEnd.EndRevision
+    Assert-Equal 1 $frozenResultBeforeAppend.CountedEvents 'frozen interval counts only records before EndOffsets'
+    Assert-Equal 1 $frozenResultAfterAppend.CountedEvents 'frozen interval remains stable after a later append'
+    Assert-Equal $frozenResultBeforeAppend.Usage.Input $frozenResultAfterAppend.Usage.Input 'frozen interval input remains stable after a later append'
+    Assert-Equal $frozenResultBeforeAppend.Usage.Cached $frozenResultAfterAppend.Usage.Cached 'frozen interval cached input remains stable after a later append'
+    Assert-Equal $frozenResultBeforeAppend.Usage.Output $frozenResultAfterAppend.Usage.Output 'frozen interval output remains stable after a later append'
+    Assert-Near $frozenResultBeforeAppend.TotalCost $frozenResultAfterAppend.TotalCost 0.0000001 'frozen interval cost remains stable after a later append'
+    Assert-Near 5.0 $frozenResultAfterAppend.EndRateLimits.FiveHour.UsedPercent 0.0001 'frozen interval keeps the end rate-limit snapshot'
+    Assert-Near 6.0 $frozenResultAfterAppend.EndRateLimits.Weekly.UsedPercent 0.0001 'frozen interval keeps the end weekly snapshot'
+    Assert-Equal 1 $indexedFrozenBeforeAppend.CountedEvents 'indexed frozen interval counts the bounded call'
+    Assert-Equal 1 $indexedFrozenAfterAppend.CountedEvents 'indexed frozen interval ignores an append after EndOffsets'
+    Assert-Equal $indexedFrozenBeforeAppend.Usage.Input $indexedFrozenAfterAppend.Usage.Input 'indexed frozen input remains stable'
+    Assert-Near $indexedFrozenBeforeAppend.TotalCost $indexedFrozenAfterAppend.TotalCost 0.0000001 'indexed frozen cost remains stable'
+    Assert-Near 5.0 $indexedFrozenAfterAppend.EndRateLimits.FiveHour.UsedPercent 0.0001 'indexed frozen five-hour snapshot remains stable'
+    Assert-Near 6.0 $indexedFrozenAfterAppend.EndRateLimits.Weekly.UsedPercent 0.0001 'indexed frozen weekly snapshot remains stable'
 
     # A real Codex task tree copies parent token_count history into sibling subagent
     # logs. Only exact copies within the same root task may be deduplicated; an
@@ -548,6 +685,31 @@ try {
     Assert-Equal $null $mixedWindowSnapshot.RateLimits.FiveHour '30-day primary does not hide missing five-hour window'
     Assert-Near 42.0 $mixedWindowSnapshot.RateLimits.Weekly.UsedPercent 0.0001 'valid weekly window remains available beside 30-day window'
 
+    # The two quota windows are independent observations.  The newest valid
+    # five-hour value and newest valid weekly value may be found in different
+    # files, so discovery must not discard one while selecting the other.
+    $splitRateRoot = Join-Path $tempRoot 'split-rate-sessions'
+    New-Item -ItemType Directory -Path $splitRateRoot | Out-Null
+    $splitPrimaryPath = Join-Path $splitRateRoot 'rollout-primary-only.jsonl'
+    $splitWeeklyPath = Join-Path $splitRateRoot 'rollout-weekly-only.jsonl'
+    $splitPrimaryRate = [ordered]@{
+        plan_type = 'pro'
+        primary = [ordered]@{ used_percent = 13; window_minutes = 300; resets_at = $fiveReset.ToUnixTimeSeconds() }
+    }
+    $splitWeeklyRate = [ordered]@{
+        plan_type = 'pro'
+        secondary = [ordered]@{ used_percent = 29; window_minutes = 10080; resets_at = $weeklyReset.ToUnixTimeSeconds() }
+    }
+    $splitPrimaryRecord = New-TestTokenRecord -Timestamp $observedAt.AddMinutes(2).ToString('o') -TotalInput 1000 -TotalCached 0 -TotalOutput 1 -CallInput 1000 -CallCached 0 -CallOutput 1 -RateLimits $splitPrimaryRate
+    $splitWeeklyRecord = New-TestTokenRecord -Timestamp $observedAt.AddMinutes(3).ToString('o') -TotalInput 1000 -TotalCached 0 -TotalOutput 1 -CallInput 1000 -CallCached 0 -CallOutput 1 -RateLimits $splitWeeklyRate
+    @($splitPrimaryRecord | ConvertTo-Json -Depth 8 -Compress) | Set-Content -LiteralPath $splitPrimaryPath -Encoding UTF8
+    @($splitWeeklyRecord | ConvertTo-Json -Depth 8 -Compress) | Set-Content -LiteralPath $splitWeeklyPath -Encoding UTF8
+    [IO.File]::SetLastWriteTimeUtc($splitPrimaryPath, [DateTime]::UtcNow.AddMinutes(-1))
+    [IO.File]::SetLastWriteTimeUtc($splitWeeklyPath, [DateTime]::UtcNow)
+    $splitRateLimits = Get-TokenRaderLatestRateLimits -SessionsRoot $splitRateRoot
+    Assert-Near 13.0 $splitRateLimits.FiveHour.UsedPercent 0.0001 'five-hour rate limit can come from a different record than weekly'
+    Assert-Near 29.0 $splitRateLimits.Weekly.UsedPercent 0.0001 'weekly rate limit can come from a different record than five-hour'
+
     # --- Quota inference validation and Pro 5x arithmetic ---
     $quotaFiveReset = [DateTimeOffset]::Parse('2026-07-14T11:00:00Z')
     $quotaWeeklyReset = [DateTimeOffset]::Parse('2026-07-21T00:00:00Z')
@@ -744,6 +906,59 @@ try {
             $expectedIndexPath = [IO.Path]::GetFullPath($indexOverridePath)
             Assert-Equal $expectedIndexPath $indexDbPath 'index DbPath uses isolated project data/private/index override'
             if (-not (Test-Path -LiteralPath $indexDbPath)) { throw 'INDEX TEST FAILED: index database was not created on disk' }
+            if ($null -eq $indexHandle.PSObject.Properties['IndexRevision']) {
+                throw 'INDEX CONTRACT FAILED: index handle is missing IndexRevision'
+            }
+            $initialIndexRevision = [Int64]$indexHandle.IndexRevision
+            $indexProgress = [hashtable]::Synchronized(@{
+                Stage = ''; ProcessedFiles = 0; TotalFiles = 0; LastProgressAt = [DateTimeOffset]::MinValue
+            })
+            $noChangeIndex = Select-TestIndexHandle -Output @(Update-TokenRaderIndex -SessionsRoot $indexSessionsRoot -ProgressState $indexProgress)
+            $noChangeRevision = [Int64](Get-TokenRaderIndex).IndexRevision
+            Assert-Equal $initialIndexRevision $noChangeRevision 'index revision does not increment when no files changed'
+            Assert-Equal $indexSessionsRoot ([string]$noChangeIndex.SessionsRoot) 'no-change update keeps the indexed sessions root'
+            Assert-Equal '同步完成' ([string]$indexProgress.Stage) 'index progress reaches the completed stage'
+            if ($indexProgress.ContainsKey('FilePath') -or $indexProgress.ContainsKey('SourceFile')) {
+                throw 'INDEX CONTRACT FAILED: shared progress must not expose source paths'
+            }
+
+            # The interval reader is deliberately exercised through its public
+            # SQLite API.  A range ending at the token row's recorded byte
+            # offset includes that row, while starting at the same offset
+            # excludes it.  This catches accidental whole-file queries and
+            # proves that each file has an independent [start,end] boundary.
+            $indexConnection = (Get-TokenRaderIndex).Connection
+            $cursorTable = $null
+            try { $cursorTable = [TokenRaderIndexer]::CaptureFileCursorTable($indexConnection) }
+            catch { throw ('INDEX CONTRACT FAILED: CaptureFileCursorTable unavailable: ' + $_.Exception.Message) }
+            if ($null -eq $cursorTable -or $cursorTable.Rows.Count -ne 3) {
+                throw ('INDEX CONTRACT FAILED: cursor table must contain the three synthetic files; actual=' +
+                    $(if ($null -eq $cursorTable) { 'null' } else { $cursorTable.Rows.Count }))
+            }
+            $initialA = Select-TestIndexRow -Output @(Get-TokenRaderIndexRecords -SessionId $indexRecentAId)
+            $initialAEnd = [Int64]$initialA['source_offset_end']
+            if ($initialAEnd -le 0) { throw 'INDEX CONTRACT FAILED: indexed token row has no positive source_offset_end' }
+            $offsetStarts = [Collections.Hashtable]@{ $indexRecentAPath = 0L }
+            $offsetEnds = [Collections.Hashtable]@{ $indexRecentAPath = $initialAEnd }
+            try {
+                $boundedInterval = [TokenRaderIndexer]::QueryIntervalRecords(
+                    $indexConnection,
+                    [System.Collections.IDictionary]$offsetStarts,
+                    [System.Collections.IDictionary]$offsetEnds)
+            } catch {
+                throw ('INDEX CONTRACT FAILED: QueryIntervalRecords unavailable: ' + $_.Exception.Message)
+            }
+            $boundedRows = @($boundedInterval.Rows)
+            Assert-Equal 1 $boundedRows.Count 'offset-bounded query includes the initial token row'
+            Assert-Equal $indexRecentAPath ([string]$boundedRows[0]['source_path']) 'offset-bounded query returns the requested file'
+            Assert-Equal $initialAEnd ([Int64]$boundedRows[0]['source_offset_end']) 'offset-bounded query honors the end offset'
+            $offsetStartsAtRow = [Collections.Hashtable]@{ $indexRecentAPath = $initialAEnd }
+            $offsetEndsAtFile = [Collections.Hashtable]@{ $indexRecentAPath = [Int64](Get-Item -LiteralPath $indexRecentAPath).Length }
+            $excludedInterval = [TokenRaderIndexer]::QueryIntervalRecords(
+                $indexConnection,
+                [System.Collections.IDictionary]$offsetStartsAtRow,
+                [System.Collections.IDictionary]$offsetEndsAtFile)
+            Assert-Equal 0 @($excludedInterval.Rows).Count 'offset-bounded query excludes rows at the start boundary'
 
             $recentSessions = @(Get-TokenRaderIndexedSessionFiles -Days 30 -MaximumFiles 200)
             Assert-Equal 2 $recentSessions.Count 'indexed session query honors 30-day history range'
@@ -780,7 +995,10 @@ try {
             $appendedAAt = $indexNow.AddHours(-1)
             $appendedA = New-TestTokenRecord -Timestamp $appendedAAt.ToString('o') -TotalInput 1500 -TotalCached 300 -TotalOutput 150 -CallInput 500 -CallCached 100 -CallOutput 50
             ($appendedA | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $indexRecentAPath -Encoding UTF8
+            $revisionBeforeCandidateA = [Int64](Get-TokenRaderIndex).IndexRevision
             $afterAUpdate = Update-TokenRaderIndex -SessionsRoot $indexSessionsRoot -CandidateFiles @($indexRecentAPath)
+            $revisionAfterCandidateA = [Int64](Get-TokenRaderIndex).IndexRevision
+            Assert-Greater $revisionBeforeCandidateA $revisionAfterCandidateA 'index revision increments after importing a changed candidate'
             $afterA = Select-TestIndexRow -Output @(Get-TokenRaderIndexRecords -SessionId $indexRecentAId)
             Assert-Equal 1500 ([Int64]$afterA['total_input']) 'candidate update imports appended session record'
             $afterAUpdateHandle = Select-TestIndexHandle -Output @($afterAUpdate)
@@ -836,6 +1054,9 @@ try {
             Assert-Equal $sourceBeforeForce.C ([IO.File]::ReadAllText($indexRecentCPath)) 'force rebuild leaves recent C source log unchanged'
             Assert-Equal $sourceBeforeForce.Old ([IO.File]::ReadAllText($indexOldAPath)) 'force rebuild leaves old source log unchanged'
             Assert-Equal 3 @((Get-TokenRaderIndexedSessionFiles -Days 30 -MaximumFiles 200)).Count 'force rebuild preserves recent indexed session count'
+            $revisionBeforeNoopCandidate = [Int64](Get-TokenRaderIndex).IndexRevision
+            Update-TokenRaderIndex -SessionsRoot $indexSessionsRoot -CandidateFiles @($indexRecentAPath) | Out-Null
+            Assert-Equal $revisionBeforeNoopCandidate ([Int64](Get-TokenRaderIndex).IndexRevision) 'index revision does not increment for an unchanged candidate'
 
             # Purging history removes old rows from the persistent index only;
             # it must not rewrite source JSONL or make an ordinary refresh
@@ -892,6 +1113,38 @@ try {
             Assert-Equal $sourceBeforePurge.B ([IO.File]::ReadAllText($indexRecentBPath)) 'force rebuild after purge leaves recent B source log unchanged'
             Assert-Equal $sourceBeforePurge.C ([IO.File]::ReadAllText($indexRecentCPath)) 'force rebuild after purge leaves recent C source log unchanged'
             Assert-Equal $sourceBeforePurge.Old ([IO.File]::ReadAllText($indexOldAPath)) 'force rebuild after purge leaves old source log unchanged'
+
+            # Materialize several SQLite query results, then close and reopen
+            # the connection. Data adapters/readers must release their cursors
+            # without deleting or locking the persistent database.
+            $cursorSessions = @(Get-TokenRaderIndexedSessionFiles -Days 60 -MaximumFiles 200)
+            $cursorProjects = @(Get-TokenRaderIndexedProjects -Days 60)
+            $cursorRangeRows = Select-TestIndexRows -Output @(Get-TokenRaderIndexRecords -StartTimestamp '0000-01-01' -EndTimestamp '9999-12-31')
+            Assert-Equal 4 $cursorSessions.Count 'cursor cleanup probe sees all indexed sessions before close'
+            Assert-Equal 3 $cursorProjects.Count 'cursor cleanup probe sees all indexed projects before close'
+            if ($cursorRangeRows.Count -lt 4) { throw 'INDEX TEST FAILED: time-range cursor probe returned too few synthetic rows' }
+            Close-TokenRaderIndex
+            Assert-Equal $true (Test-Path -LiteralPath $indexDbPath) 'closing after cursor queries preserves the database'
+            $reopenedAfterCursor = Select-TestIndexHandle -Output @(Open-TokenRaderIndex -SessionsRoot $indexSessionsRoot)
+            Assert-Equal $indexDbPath ([IO.Path]::GetFullPath([string]$reopenedAfterCursor.DbPath)) 'reopen after cursor cleanup uses the same database'
+            Assert-Equal 4 @((Get-TokenRaderIndexedSessionFiles -Days 60 -MaximumFiles 200)).Count 'reopen after cursor cleanup preserves all rows'
+
+            # A historical session can be reopened after the process has been
+            # closed. Only the appended token record may be imported; the
+            # original record must not be duplicated.
+            $oldRowsBeforeReopen = @(Select-TestIndexRows -Output @(Get-TokenRaderIndexRecords -StartTimestamp '0000-01-01' -EndTimestamp '9999-12-31') |
+                Where-Object { [string]$_['session_id'] -eq $indexOldAId })
+            $oldLatestBeforeReopen = Select-TestIndexRow -Output @(Get-TokenRaderIndexRecords -SessionId $indexOldAId)
+            Assert-Equal 3000 ([Int64]$oldLatestBeforeReopen['total_input']) 'old session latest row before reopen append'
+            [IO.File]::SetLastWriteTimeUtc($indexOldAPath, $indexNow.UtcDateTime)
+            $oldReopenAppend = New-TestTokenRecord -Timestamp $indexNow.AddMinutes(1).ToString('o') -TotalInput 3500 -TotalCached 700 -TotalOutput 350 -CallInput 500 -CallCached 100 -CallOutput 50
+            ($oldReopenAppend | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $indexOldAPath -Encoding UTF8
+            Update-TokenRaderIndex -SessionsRoot $indexSessionsRoot -CandidateFiles @($indexOldAPath) | Out-Null
+            $oldRowsAfterReopen = @(Select-TestIndexRows -Output @(Get-TokenRaderIndexRecords -StartTimestamp '0000-01-01' -EndTimestamp '9999-12-31') |
+                Where-Object { [string]$_['session_id'] -eq $indexOldAId })
+            Assert-Equal ($oldRowsBeforeReopen.Count + 1) $oldRowsAfterReopen.Count 'reopened old session imports only the appended record'
+            $oldLatestAfterReopen = Select-TestIndexRow -Output @(Get-TokenRaderIndexRecords -SessionId $indexOldAId)
+            Assert-Equal 3500 ([Int64]$oldLatestAfterReopen['total_input']) 'reopened old session latest row reflects appended usage'
     } finally {
         try { Close-TokenRaderIndex } catch { }
         try { Clear-TokenRaderIndex } catch { }
@@ -979,12 +1232,352 @@ try {
     Assert-Equal $true $largeResult.PricingComplete 'large fixture pricing completeness'
     Write-Output ('LARGE_OK events={0} ms={1}' -f $largeCount, $largeStopwatch.ElapsedMilliseconds)
 
+    if ($Performance) {
+        # Optional end-to-end indexed profiles. All files and SQLite databases
+        # live under the synthetic temp project; no real Codex log is opened.
+        $performanceRoot = Join-Path $tempRoot 'performance-sessions'
+        $performancePrivate = Join-Path $tempRoot 'data\private\performance'
+        New-Item -ItemType Directory -Path $performanceRoot -Force | Out-Null
+        New-Item -ItemType Directory -Path $performancePrivate -Force | Out-Null
+        $performanceProfiles = @(
+            [pscustomobject]@{ Name = '2k'; Files = 2000; Changed = 2; StartTargetMs = 1000; ViewTargetMs = 100; EndTargetMs = 250; ComputeTargetMs = 1000 },
+            [pscustomobject]@{ Name = '5k'; Files = 5000; Changed = 4; StartTargetMs = 3000; ViewTargetMs = 100; EndTargetMs = 500; ComputeTargetMs = 1500 }
+        )
+        $previousPerformanceIndex = [Environment]::GetEnvironmentVariable('TOKEN_RADER_INDEX_DB', 'Process')
+        try {
+            foreach ($profile in @($performanceProfiles)) {
+                Close-TokenRaderIndex
+                $env:TOKEN_RADER_INDEX_DB = Join-Path $performancePrivate ($profile.Name + '\index.db')
+                $profileRoot = Join-Path $performanceRoot $profile.Name
+                New-Item -ItemType Directory -Path $profileRoot -Force | Out-Null
+                $paths = New-Object System.Collections.Generic.List[string]
+                for ($i = 1; $i -le [int]$profile.Files; $i++) {
+                    $sessionId = '{0:D8}-0000-0000-0000-000000000000' -f $i
+                    $path = Join-Path $profileRoot ('rollout-perf-' + $sessionId + '.jsonl')
+                    $timestamp = [DateTimeOffset]::UtcNow.AddMinutes(-10).AddMilliseconds($i).ToString('o')
+                    $content = '{"timestamp":"' + $timestamp + '","type":"session_meta","payload":{"id":"' + $sessionId + '"}}' + "`n" +
+                        '{"timestamp":"' + $timestamp + '","type":"turn_context","payload":{"model":"gpt-5.5"}}' + "`n" +
+                        '{"timestamp":"' + $timestamp + '","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":1010},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":1010},"model_context_window":1050000},"rate_limits":{"plan_type":"pro","primary":{"used_percent":10,"window_minutes":300,"resets_at":1890000000},"secondary":{"used_percent":20,"window_minutes":10080,"resets_at":1890600000}}}}' + "`n"
+                    [IO.File]::WriteAllText($path, $content, (New-Object Text.UTF8Encoding($false)))
+                    [void]$paths.Add($path)
+                }
+
+                $coldWatch = [Diagnostics.Stopwatch]::StartNew()
+                New-TokenRaderIndex -SessionsRoot $profileRoot -Force | Out-Null
+                $coldWatch.Stop()
+                $startSamples = New-Object System.Collections.Generic.List[double]
+                $baseline = $null
+                for ($sample = 0; $sample -lt 5; $sample++) {
+                    $watch = [Diagnostics.Stopwatch]::StartNew()
+                    $baseline = CaptureMeasurementBaseline -SessionsRoot $profileRoot -PricingDocument $prices
+                    $watch.Stop()
+                    [void]$startSamples.Add([double]$watch.Elapsed.TotalMilliseconds)
+                }
+                Assert-Equal ([int]$profile.Files) @($baseline.StartOffsets.Keys).Count ($profile.Name + ' indexed baseline captures every cursor')
+                $revisionBefore = [Int64]$baseline.IndexRevision
+
+                [Int64]$changedBytes = 0
+                $changedPaths = @($paths | Select-Object -First ([int]$profile.Changed))
+                $watchRevisionBefore = [Int64][TokenRaderIndexer]::GetChangeRevision($profileRoot)
+                for ($i = 0; $i -lt $changedPaths.Count; $i++) {
+                    $timestamp = [DateTimeOffset]::UtcNow.AddSeconds($i + 1).ToString('o')
+                    $inputTokens = 2000 + $i
+                    $line = '{"timestamp":"' + $timestamp + '","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":' + $inputTokens + ',"cached_input_tokens":200,"output_tokens":20,"reasoning_output_tokens":0,"total_tokens":' + ($inputTokens + 20) + '},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":1010},"model_context_window":1050000},"rate_limits":{"plan_type":"pro","primary":{"used_percent":11,"window_minutes":300,"resets_at":1890000000},"secondary":{"used_percent":21,"window_minutes":10080,"resets_at":1890600000}}}}' + "`n"
+                    [IO.File]::AppendAllText([string]$changedPaths[$i], $line, (New-Object Text.UTF8Encoding($false)))
+                    $changedBytes += [Text.Encoding]::UTF8.GetByteCount($line)
+                }
+                $deadline = [DateTime]::UtcNow.AddSeconds(2)
+                while ([TokenRaderIndexer]::GetChangeRevision($profileRoot) -le $watchRevisionBefore -and [DateTime]::UtcNow -lt $deadline) {
+                    Start-Sleep -Milliseconds 20
+                }
+
+                $endWatch = [Diagnostics.Stopwatch]::StartNew()
+                $ending = CaptureMeasurementEnd -Baseline $baseline
+                $endWatch.Stop()
+                Assert-Greater $revisionBefore ([Int64]$ending.EndRevision) ($profile.Name + ' changed files advance IndexRevision')
+                Assert-Equal ([int]$profile.Changed) ([int](Get-TokenRaderIndex).LastImportedFiles) ($profile.Name + ' only changed files are opened by end capture')
+
+                $computeSamples = New-Object System.Collections.Generic.List[double]
+                $result = $null
+                for ($sample = 0; $sample -lt 5; $sample++) {
+                    $watch = [Diagnostics.Stopwatch]::StartNew()
+                    $result = Get-TokenRaderIndexedIntervalResult -Baseline $baseline -PricingDocument $prices -EndOffsets $ending.EndOffsets -EndRevision $ending.EndRevision
+                    $watch.Stop()
+                    [void]$computeSamples.Add([double]$watch.Elapsed.TotalMilliseconds)
+                }
+                Assert-Equal ([int]$profile.Changed) ([int]$result.CountedEvents) ($profile.Name + ' indexed result counts only changed calls')
+                $hardBytesMax = [Int64][Math]::Ceiling($changedBytes * 1.5 + 98304)
+                if ([Int64]$result.BytesRead -gt $hardBytesMax) {
+                    throw "PERFORMANCE FAILED: $($profile.Name) BytesRead=$($result.BytesRead) exceeds hard limit=$hardBytesMax"
+                }
+
+                # UI click work is intentionally only a cached-object read and
+                # background request scheduling; it never enumerates files.
+                $viewSamples = New-Object System.Collections.Generic.List[double]
+                for ($sample = 0; $sample -lt 20; $sample++) {
+                    $watch = [Diagnostics.Stopwatch]::StartNew()
+                    $cachedResult = $result
+                    [void]$cachedResult.Signature
+                    $watch.Stop()
+                    [void]$viewSamples.Add([double]$watch.Elapsed.TotalMilliseconds)
+                }
+
+                # Appending after the frozen end must not affect any result.
+                $afterLine = '{"timestamp":"' + [DateTimeOffset]::UtcNow.AddMinutes(1).ToString('o') + '","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":9999,"cached_input_tokens":0,"output_tokens":0},"last_token_usage":{"input_tokens":9999,"cached_input_tokens":0,"output_tokens":0}}}}' + "`n"
+                [IO.File]::AppendAllText([string]$changedPaths[0], $afterLine, (New-Object Text.UTF8Encoding($false)))
+                $frozenAgain = Get-TokenRaderIndexedIntervalResult -Baseline $baseline -PricingDocument $prices -EndOffsets $ending.EndOffsets -EndRevision $ending.EndRevision
+                Assert-Equal $result.CountedEvents $frozenAgain.CountedEvents ($profile.Name + ' frozen count survives later append')
+                Assert-Equal $result.Usage.Total $frozenAgain.Usage.Total ($profile.Name + ' frozen tokens survive later append')
+                Assert-Near $result.TotalCost $frozenAgain.TotalCost 0.0000001 ($profile.Name + ' frozen cost survives later append')
+
+                $startP95 = Get-TestPercentile -Values ([double[]]$startSamples) -Percentile 0.95
+                $viewP95 = Get-TestPercentile -Values ([double[]]$viewSamples) -Percentile 0.95
+                $computeP95 = Get-TestPercentile -Values ([double[]]$computeSamples) -Percentile 0.95
+                if ($startP95 -gt [double]$profile.StartTargetMs * 1.5) { throw "PERFORMANCE FAILED: $($profile.Name) warm start P95=$startP95 ms" }
+                if ($viewP95 -gt [double]$profile.ViewTargetMs) { throw "PERFORMANCE FAILED: $($profile.Name) view P95=$viewP95 ms" }
+                if ($endWatch.Elapsed.TotalMilliseconds -gt [double]$profile.EndTargetMs * 1.5) { throw "PERFORMANCE FAILED: $($profile.Name) end capture=$($endWatch.Elapsed.TotalMilliseconds) ms" }
+                if ($computeP95 -gt [double]$profile.ComputeTargetMs * 1.5) { throw "PERFORMANCE FAILED: $($profile.Name) compute P95=$computeP95 ms" }
+                Write-Output ('PERF_INDEXED name={0} files={1} changed={2} coldCatalogMs={3:0.0} warmStartP95Ms={4:0.0} viewP95Ms={5:0.0} endMs={6:0.0} computeP95Ms={7:0.0} bytesRead={8}' -f
+                    $profile.Name, $profile.Files, $profile.Changed, $coldWatch.Elapsed.TotalMilliseconds, $startP95, $viewP95, $endWatch.Elapsed.TotalMilliseconds, $computeP95, [Int64]$result.BytesRead)
+                Close-TokenRaderIndex
+            }
+        } finally {
+            try { Close-TokenRaderIndex } catch { }
+            if ($null -eq $previousPerformanceIndex) { Remove-Item Env:TOKEN_RADER_INDEX_DB -ErrorAction SilentlyContinue }
+            else { $env:TOKEN_RADER_INDEX_DB = $previousPerformanceIndex }
+        }
+    }
+
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
     foreach ($controlName in @('ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'IntervalStatusText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText', 'TotalMetricText', 'HitRateMetricText', 'UsdCostText', 'FiveHourUsageText', 'FiveHourDollarText', 'WeeklyUsageText', 'WeeklyDollarText', 'PricingDataGrid')) {
         if ($null -eq $window.FindName($controlName)) { throw "ASSERT FAILED: missing XAML control $controlName" }
+    }
+
+    # Interval view must be a cheap state/cache operation. It must not scan the
+    # whole session tree synchronously on every click, and the background
+    # compute path must not fall back to invoking the parser on the UI thread.
+    $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
+    $indexerSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'indexer\TokenRader.Indexer.cs'))
+    if ($indexerSource -notmatch 'QueryLatestRateLimitRowsByOffsetRanges' -or
+        $indexerSource -notmatch 'MAX\(CASE WHEN five_hour_used IS NOT NULL THEN source_offset_end END\)' -or
+        $indexerSource -notmatch 'MAX\(CASE WHEN weekly_used IS NOT NULL THEN source_offset_end END\)' -or
+        $indexerSource -match 'DataTable candidates = QueryRowsByOffsetRanges\(db, ReadOffsetRanges\([^;]+true\)') {
+        throw 'INDEX CONTRACT FAILED: latest quota lookup must reduce historical rows inside SQLite'
+    }
+    if ($uiSource -match '\.BeginInvoke\(\s*\[System\.AsyncCallback\]') {
+        throw 'UI CONTRACT FAILED: PowerShell has no compatible two-argument AsyncCallback BeginInvoke overload'
+    }
+    if ($uiSource -match 'GetNewClosure\s*\(') {
+        throw 'UI CONTRACT FAILED: measurement lifecycle callbacks must remain in the main script scope'
+    }
+    $backgroundMatch = [regex]::Match($uiSource, '(?s)function Start-TokenRaderBackgroundJob\b.*?(?=\r?\nfunction |\z)')
+    if (-not $backgroundMatch.Success -or $backgroundMatch.Value -notmatch '\$worker\.BeginInvoke\(\)' -or
+        $uiSource -notmatch 'AsyncResult\.IsCompleted') {
+        throw 'UI CONTRACT FAILED: background jobs must use parameterless BeginInvoke with non-blocking completion polling'
+    }
+    foreach ($requiredField in @('CompletionHandler', 'FailureHandler', 'CallbackContext', 'StartedAt',
+            'TimeoutSeconds', 'ProgressState', 'CompletionDelivered', 'StopAsyncResult')) {
+        if ($backgroundMatch.Value -notmatch [regex]::Escape($requiredField)) {
+            throw ('UI CONTRACT FAILED: background job is missing ' + $requiredField)
+        }
+    }
+
+    # Exercise the exact BeginInvoke overload used by the UI. This is synthetic
+    # and does not open or inspect any local Codex data.
+    $asyncProbe = [PowerShell]::Create()
+    try {
+        [void]$asyncProbe.AddScript('[pscustomobject]@{ Ok = $true }')
+        $asyncProbeResult = $asyncProbe.BeginInvoke()
+        if (-not $asyncProbeResult.AsyncWaitHandle.WaitOne(5000)) {
+            throw 'ASYNC CONTRACT FAILED: parameterless BeginInvoke did not complete'
+        }
+        $asyncProbeOutput = @($asyncProbe.EndInvoke($asyncProbeResult))
+        if ($asyncProbeOutput.Count -ne 1 -or -not [bool]$asyncProbeOutput[0].Ok) {
+            throw 'ASYNC CONTRACT FAILED: parameterless BeginInvoke returned an unexpected result'
+        }
+    } finally {
+        try { $asyncProbe.Dispose() } catch { }
+    }
+
+    # Load the production helpers and run the dispatcher completion path
+    # end-to-end. This guards against a regression where the worker starts but
+    # the UI remains locked in Starting because completion is never observed.
+    $pollerMatch = [regex]::Match($uiSource, '(?s)function Start-TokenRaderBackgroundPoller\b.*?(?=\r?\nfunction |\z)')
+    if (-not $pollerMatch.Success) { throw 'UI CONTRACT FAILED: background completion poller was not found' }
+    foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Invoke-TokenRaderBackgroundHandler',
+            'Request-TokenRaderBackgroundStop', 'Start-TokenRaderBackgroundPoller', 'Start-TokenRaderBackgroundJob')) {
+        $helperMatch = [regex]::Match($uiSource, ('(?s)function ' + [regex]::Escape($helperName) + '\b.*?(?=\r?\nfunction |\z)'))
+        if (-not $helperMatch.Success) { throw ('UI CONTRACT FAILED: helper not found: ' + $helperName) }
+        Invoke-Expression $helperMatch.Value
+    }
+    $script:WindowClosing = $false
+    $script:BackgroundPollTimer = $null
+    $script:State = @{ BackgroundJobs = @{} }
+    $script:AsyncUiProbeCompleted = $false
+    $script:AsyncUiProbeTimedOut = $false
+    $script:AsyncUiProbeError = ''
+    $script:AsyncUiProbePayload = $null
+    $script:AsyncUiProbeFrame = New-Object Windows.Threading.DispatcherFrame
+    $asyncUiWatchdog = New-Object Windows.Threading.DispatcherTimer
+    $asyncUiWatchdog.Interval = [TimeSpan]::FromSeconds(5)
+    $asyncUiWatchdog.Add_Tick({
+        $script:AsyncUiProbeTimedOut = $true
+        $script:AsyncUiProbeFrame.Continue = $false
+    })
+    function Complete-TestTokenRaderAsyncUiProbe {
+        param($Payload, $Generation, $RequestId, $Kind, $Context)
+        $script:AsyncUiProbePayload = $Payload
+        $script:AsyncUiProbeCompleted = $true
+        $script:AsyncUiProbeFrame.Continue = $false
+    }
+    function Fail-TestTokenRaderAsyncUiProbe {
+        param($ErrorMessage, $Generation, $RequestId, $Kind, $Context)
+        $script:AsyncUiProbeError = [string]$ErrorMessage
+        $script:AsyncUiProbeFrame.Continue = $false
+    }
+    try {
+        $asyncUiStarted = Start-TokenRaderBackgroundJob `
+            -ScriptBlock { Start-Sleep -Milliseconds 50; [pscustomobject]@{ Ok = $true } } `
+            -Kind 'SyntheticUiProbe' `
+            -RequestId 9001L `
+            -CompletionHandler 'Complete-TestTokenRaderAsyncUiProbe' `
+            -FailureHandler 'Fail-TestTokenRaderAsyncUiProbe' `
+            -CallbackContext @{ Probe = 'main-script-scope' }
+        $asyncUiWatchdog.Start()
+        [Windows.Threading.Dispatcher]::PushFrame($script:AsyncUiProbeFrame)
+        Assert-Equal $true $asyncUiStarted 'UI async worker starts through the production helper'
+        Assert-Equal $false $script:AsyncUiProbeTimedOut 'UI async completion is observed before timeout'
+        Assert-Equal '' $script:AsyncUiProbeError 'UI async worker has no completion error'
+        Assert-Equal $true $script:AsyncUiProbeCompleted 'UI async completion handler runs'
+        Assert-Equal $true ([bool]$script:AsyncUiProbePayload.Ok) 'UI async completion payload is preserved'
+        Assert-Equal 0 $script:State.BackgroundJobs.Count 'UI async worker is removed after completion'
+    } finally {
+        $asyncUiWatchdog.Stop()
+        if ($null -ne $script:BackgroundPollTimer) { $script:BackgroundPollTimer.Stop() }
+        foreach ($job in @($script:State.BackgroundJobs.Values)) {
+            try { $job.PowerShell.Stop() } catch { }
+            try { $job.PowerShell.Dispose() } catch { }
+        }
+        $script:State.BackgroundJobs.Clear()
+    }
+
+    # Timeout delivery is polled every 50 ms and must invoke the named failure
+    # handler in the same script scope. The worker is stopped asynchronously.
+    $script:State = @{ BackgroundJobs = @{} }
+    $script:AsyncTimeoutDelivered = $false
+    $script:AsyncTimeoutError = ''
+    $script:AsyncTimeoutFrame = New-Object Windows.Threading.DispatcherFrame
+    $script:AsyncTimeoutWatch = [Diagnostics.Stopwatch]::StartNew()
+    function Complete-TestTokenRaderTimeoutProbe {
+        param($Payload, $Generation, $RequestId, $Kind, $Context)
+        $script:AsyncTimeoutError = 'timeout worker unexpectedly completed'
+        $script:AsyncTimeoutFrame.Continue = $false
+    }
+    function Fail-TestTokenRaderTimeoutProbe {
+        param($ErrorMessage, $Generation, $RequestId, $Kind, $Context)
+        $script:AsyncTimeoutDelivered = $true
+        $script:AsyncTimeoutError = [string]$ErrorMessage
+        $script:AsyncTimeoutFrame.Continue = $false
+    }
+    try {
+        $timeoutStarted = Start-TokenRaderBackgroundJob `
+            -ScriptBlock { Start-Sleep -Seconds 5; 'late' } `
+            -Kind 'SyntheticTimeoutProbe' `
+            -RequestId 9002L `
+            -CompletionHandler 'Complete-TestTokenRaderTimeoutProbe' `
+            -FailureHandler 'Fail-TestTokenRaderTimeoutProbe' `
+            -TimeoutSeconds 1
+        [Windows.Threading.Dispatcher]::PushFrame($script:AsyncTimeoutFrame)
+        $script:AsyncTimeoutWatch.Stop()
+        Assert-Equal $true $timeoutStarted 'UI timeout worker starts'
+        Assert-Equal $true $script:AsyncTimeoutDelivered 'UI timeout failure handler runs in main script scope'
+        if ($script:AsyncTimeoutError -notmatch '超过限定时间') { throw 'ASSERT FAILED: timeout reason was not preserved' }
+        if ($script:AsyncTimeoutWatch.Elapsed.TotalMilliseconds -gt 1200) {
+            throw ('ASSERT FAILED: timeout UI unlock was delivered too late: ' + $script:AsyncTimeoutWatch.Elapsed.TotalMilliseconds + ' ms')
+        }
+    } finally {
+        if ($null -ne $script:BackgroundPollTimer) { $script:BackgroundPollTimer.Stop() }
+        foreach ($job in @($script:State.BackgroundJobs.Values)) {
+            try { $job.PowerShell.Stop() } catch { }
+            try { $job.PowerShell.Dispose() } catch { }
+        }
+        $script:State.BackgroundJobs.Clear()
+    }
+
+    # Cancellation marks completion as delivered before BeginStop. Even if the
+    # worker races to a late result, neither callback may change UI state.
+    $script:State = @{ BackgroundJobs = @{} }
+    $script:AsyncCancelCallbackCount = 0
+    function Complete-TestTokenRaderCancelProbe { param($Payload, $Generation, $RequestId, $Kind, $Context); $script:AsyncCancelCallbackCount++ }
+    function Fail-TestTokenRaderCancelProbe { param($ErrorMessage, $Generation, $RequestId, $Kind, $Context); $script:AsyncCancelCallbackCount++ }
+    try {
+        [void](Start-TokenRaderBackgroundJob `
+            -ScriptBlock { Start-Sleep -Milliseconds 300; 'late' } `
+            -Kind 'SyntheticCancelProbe' `
+            -RequestId 9003L `
+            -CompletionHandler 'Complete-TestTokenRaderCancelProbe' `
+            -FailureHandler 'Fail-TestTokenRaderCancelProbe')
+        $cancelJob = $script:State.BackgroundJobs[9003L]
+        $cancelWatch = [Diagnostics.Stopwatch]::StartNew()
+        Request-TokenRaderBackgroundStop -Job $cancelJob
+        $cancelWatch.Stop()
+        Assert-Equal $true ([bool]$cancelJob.CompletionDelivered) 'cancel suppresses late callbacks before stopping worker'
+        if ($cancelWatch.Elapsed.TotalMilliseconds -gt 100) {
+            throw ('ASSERT FAILED: asynchronous cancellation blocked UI for ' + $cancelWatch.Elapsed.TotalMilliseconds + ' ms')
+        }
+        $script:AsyncCancelFrame = New-Object Windows.Threading.DispatcherFrame
+        $script:AsyncCancelTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:AsyncCancelTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+        $script:AsyncCancelTimer.Add_Tick({
+            $script:AsyncCancelTimer.Stop()
+            $script:AsyncCancelFrame.Continue = $false
+        })
+        $script:AsyncCancelTimer.Start()
+        [Windows.Threading.Dispatcher]::PushFrame($script:AsyncCancelFrame)
+        Assert-Equal 0 $script:AsyncCancelCallbackCount 'cancelled worker late result is discarded'
+    } finally {
+        if ($null -ne $script:BackgroundPollTimer) { $script:BackgroundPollTimer.Stop() }
+        foreach ($job in @($script:State.BackgroundJobs.Values)) {
+            try { $job.PowerShell.Stop() } catch { }
+            try { $job.PowerShell.Dispose() } catch { }
+        }
+        $script:State.BackgroundJobs.Clear()
+    }
+
+    $viewMatch = [regex]::Match($uiSource, '(?s)function Update-IntervalView\b.*?(?=\r?\nfunction |\z)')
+    if (-not $viewMatch.Success) { throw 'UI CONTRACT FAILED: Update-IntervalView function was not found' }
+    if ($viewMatch.Value -match 'Get-TokenRaderSessionTreeSignature') {
+        throw 'UI CONTRACT FAILED: Update-IntervalView must not call Get-TokenRaderSessionTreeSignature synchronously'
+    }
+    $asyncMatch = [regex]::Match($uiSource, '(?s)function Start-TokenRaderIntervalComputeAsync\b.*?(?=\r?\nfunction |\z)')
+    if (-not $asyncMatch.Success) { throw 'UI CONTRACT FAILED: background interval compute function was not found' }
+    if ($asyncMatch.Value -match 'Fallback:\s*run the computation synchronously' -or
+        $asyncMatch.Value -match 'Get-TokenRaderIntervalResult') {
+        throw 'UI CONTRACT FAILED: interval compute path contains a synchronous parser fallback'
+    }
+    $startMatch = [regex]::Match($uiSource, '(?s)function Start-IntervalMeasurement\b.*?(?=\r?\nfunction |\z)')
+    if ($startMatch.Success -and ($startMatch.Value -match 'New-TokenRaderMeasurementBaseline' -or
+            $startMatch.Value -match 'Get-ChildItem')) {
+        throw 'UI CONTRACT FAILED: Start-IntervalMeasurement performs synchronous filesystem work'
+    }
+    if (-not $startMatch.Success -or $startMatch.Value -notmatch 'PendingMeasurementStart' -or
+        $startMatch.Value -notmatch 'Start-TokenRaderIndexSyncAsync') {
+        throw 'UI CONTRACT FAILED: Start must queue itself while the startup index is still preparing'
+    }
+    $stateMatch = [regex]::Match($uiSource, '(?s)function Set-TokenRaderUiState\b.*?(?=\r?\nfunction |\z)')
+    if (-not $stateMatch.Success -or
+        $stateMatch.Value -match 'StartMeasureButton\.IsEnabled\s*=.*\$indexReady') {
+        throw 'UI CONTRACT FAILED: Start button must remain clickable before the startup index is ready'
+    }
+    $stopMatch = [regex]::Match($uiSource, '(?s)function Stop-IntervalMeasurement\b.*?(?=\r?\nfunction |\z)')
+    if ($stopMatch.Success -and $stopMatch.Value -match 'Get-ChildItem') {
+        throw 'UI CONTRACT FAILED: Stop-IntervalMeasurement performs synchronous filesystem work'
+    }
+    if (-not $stopMatch.Success -or $stopMatch.Value -notmatch 'Cancel-TokenRaderMeasurementPreparation') {
+        throw 'UI CONTRACT FAILED: Stop must cancel Starting without blocking the dispatcher'
     }
     $window.Close()
 
@@ -1000,6 +1593,12 @@ try {
 
     Write-Output 'ALL_TESTS_PASSED'
 } finally {
+    try { Close-TokenRaderIndex } catch { }
+    if ($null -eq $previousGlobalIndexOverride) {
+        Remove-Item Env:TOKEN_RADER_INDEX_DB -ErrorAction SilentlyContinue
+    } else {
+        $env:TOKEN_RADER_INDEX_DB = $previousGlobalIndexOverride
+    }
     if (Test-Path -LiteralPath $tempRoot) {
         $resolved = (Resolve-Path -LiteralPath $tempRoot).Path
         $tempResolved = (Resolve-Path -LiteralPath $env:TEMP).Path

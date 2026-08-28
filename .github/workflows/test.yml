@@ -16,9 +16,15 @@ jobs:
           $PSVersionTable.PSVersion.ToString()
           (Get-Culture).Name
           [Environment]::OSVersion.VersionString
+      - name: Build launcher and indexer
+        shell: powershell
+        run: .\Build.ps1
       - name: Run regression tests
         shell: powershell
         run: .\tests\Run-Tests.ps1
-      - name: Build launcher
+      - name: Verify UI callbacks on Windows PowerShell 5.1
         shell: powershell
-        run: .\Build.ps1
+        run: .\tests\Run-UiCallbackTests.ps1
+      - name: Verify UI callbacks on PowerShell 7
+        shell: pwsh
+        run: .\tests\Run-UiCallbackTests.ps1
