@@ -155,7 +155,7 @@ SQLite 保存轻量文件游标；只把变化文件的新增完整 JSONL 行写
     ↓
 读取 session_meta，建立会话、项目和父子任务关系；按顺序读取 turn_context 与 token_count
     ↓
-将 last_token_usage 绑定到当时使用的模型，剔除基线继承记录和任务树中的共享重复记录
+将 last_token_usage 绑定到当时使用的模型；以 total_token_usage 的累计变化识别真实新调用，剔除状态刷新产生的重复快照、基线继承记录和任务树中的共享重复记录
     ↓
 计算缓存/未缓存输入、输出、总 token 和缓存命中率
     ↓

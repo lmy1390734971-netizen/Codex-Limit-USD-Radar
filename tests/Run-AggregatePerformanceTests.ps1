@@ -78,16 +78,16 @@ $thresholds['gpt-5.6-sol'] = 272000L
 $none = [Threading.CancellationToken]::None
 $startedAt = [DateTimeOffset]::Parse('2026-01-01T00:00:00Z')
 
-# Small semantic fixture: an exact parent/child copy is removed, while the
-# same token counters at a different timestamp are retained. Offset-zero
-# legacy rows never enter a frozen interval.
+# Small semantic fixture: an exact parent/child copy is removed, while two real
+# calls with equal per-call usage are retained because their cumulative totals
+# advance. Offset-zero legacy rows never enter a frozen interval.
 $correctness = New-Object System.Data.SQLite.SQLiteConnection 'Data Source=:memory:;Version=3;New=True;'
 $correctness.Open()
 try {
     [TokenRaderIndexer]::CreateSchema($correctness)
     Add-TestAggregateRow $correctness 'parent' '2026-08-28T00:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://parent' 10 'root'
     Add-TestAggregateRow $correctness 'child' '2026-08-28T00:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://child' 10 'root'
-    Add-TestAggregateRow $correctness 'parent' '2026-08-28T00:00:01Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://parent' 20 'root'
+    Add-TestAggregateRow $correctness 'parent' '2026-08-28T00:00:01Z' 'gpt-5.5' 2000 200 200 1000 100 100 'fp-standard-2' 'synthetic://parent' 20 'root'
     Add-TestAggregateRow $correctness 'long' '2026-08-28T00:00:02Z' 'gpt-5.6-sol' 300001 100001 200 300001 100001 200 'fp-long' 'synthetic://long' 10 'long-root'
     Add-TestAggregateRow $correctness 'unknown' '2026-08-28T00:00:03Z' 'synthetic-unknown' 500 0 50 500 0 50 'fp-unknown' 'synthetic://unknown' 10 'unknown-root'
     Add-TestAggregateRow $correctness 'legacy' '2026-08-28T00:00:04Z' 'gpt-5.5' 999999 0 0 999999 0 0 'fp-legacy' '' 0 'legacy-root'
@@ -110,6 +110,20 @@ try {
     Assert-AggregateTest ($aggregate.TotalOutput -eq 450) 'aggregated output total changed'
     Assert-AggregateTest ($aggregate.Buckets.Count -eq 3) 'model/context buckets are not compact'
     Assert-AggregateTest (@($aggregate.Buckets | Where-Object { $_.Model -eq 'gpt-5.6-sol' -and $_.LongContext }).Count -eq 1) 'long-context call was not bucketed separately'
+
+    # The first row after a frozen start may only repeat the last pre-start
+    # snapshot. It must be removed even though its timestamp changed; the next
+    # row advances cumulative usage and is one real call.
+    Add-TestAggregateRow $correctness 'baseline' '2026-08-28T00:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-before' 'synthetic://baseline' 10 'baseline-root'
+    Add-TestAggregateRow $correctness 'baseline' '2026-08-28T00:00:01Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-refresh' 'synthetic://baseline' 20 'baseline-root'
+    Add-TestAggregateRow $correctness 'baseline' '2026-08-28T00:00:02Z' 'gpt-5.5' 2000 200 200 1000 100 100 'fp-next-call' 'synthetic://baseline' 30 'baseline-root'
+    $seeded = [TokenRaderIndexer]::AggregateIntervalRecords(
+        $correctness, @{ 'synthetic://baseline' = 10L }, @{ 'synthetic://baseline' = 30L },
+        $startedAt, $thresholds, $none, $null)
+    Assert-AggregateTest ($seeded.RawEvents -eq 2) 'baseline-seeded interval raw row count changed'
+    Assert-AggregateTest ($seeded.CountedEvents -eq 1) 'pre-start cumulative snapshot was billed again'
+    Assert-AggregateTest ($seeded.DuplicateEventsDropped -eq 1) 'repeated cumulative snapshot was not diagnosed'
+    Assert-AggregateTest ($seeded.TotalInput -eq 1000 -and $seeded.TotalOutput -eq 100) 'baseline-seeded interval usage changed'
 
     $parentOnly = [TokenRaderIndexer]::AggregateIntervalRecords(
         $correctness, $starts, @{ 'synthetic://parent' = 20L }, $startedAt, $thresholds, $none, $null)

@@ -734,6 +734,12 @@ public static class TokenRaderIndexer
         var baselinePaths = ReadOffsetPathSet(startOffsets);
         var result = new TokenRaderIntervalAggregateResult();
         var seen = new HashSet<string>(StringComparer.Ordinal);
+        // token_count is also emitted for status/rate-limit refreshes. Those
+        // rows can carry the same cumulative total_token_usage and the same
+        // last_token_usage at a later timestamp; they are snapshots of one
+        // call, not additional calls. Keep a per-session cumulative identity
+        // so timestamp-only refreshes cannot be billed repeatedly.
+        var seenCumulativeSnapshots = new HashSet<string>(StringComparer.Ordinal);
         var activeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var buckets = new Dictionary<string, TokenRaderIntervalAggregateBucket>(StringComparer.OrdinalIgnoreCase);
@@ -744,6 +750,7 @@ public static class TokenRaderIndexer
         {
             cancellationToken.ThrowIfCancellationRequested();
             OffsetRange range = ranges[rangeIndex];
+            SeedAggregateCumulativeSnapshot(db, range, seenCumulativeSnapshots);
             using (var cmd = db.CreateCommand())
             {
                 // Select only columns required by the existing interval
@@ -751,7 +758,8 @@ public static class TokenRaderIndexer
                 cmd.CommandText =
                     "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                     "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id " +
-                    "FROM token_records WHERE source_path=@path AND source_offset_end>@start AND source_offset_end<=@end";
+                    "FROM token_records WHERE source_path=@path AND source_offset_end>@start AND source_offset_end<=@end " +
+                    "ORDER BY source_offset_end ASC";
                 cmd.Parameters.AddWithValue("@path", range.Path);
                 cmd.Parameters.AddWithValue("@start", range.Start);
                 cmd.Parameters.AddWithValue("@end", range.End);
@@ -784,6 +792,14 @@ public static class TokenRaderIndexer
                         string rootSessionId = ReadReaderString(reader, 14);
 
                         if (callInput <= 0L && callOutput <= 0L) continue;
+
+                        string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
+                            totalInput, totalCached, totalOutput, totalReasoning);
+                        if (!seenCumulativeSnapshots.Add(cumulativeKey))
+                        {
+                            result.DuplicateEventsDropped++;
+                            continue;
+                        }
 
                         DateTimeOffset eventAt;
                         bool hasTimestamp = TryParseTimestamp(timestampText, out eventAt);
@@ -943,6 +959,45 @@ public static class TokenRaderIndexer
             }
         }
         return bestThreshold;
+    }
+
+    private static void SeedAggregateCumulativeSnapshot(
+        SQLiteConnection db,
+        OffsetRange range,
+        HashSet<string> seenCumulativeSnapshots)
+    {
+        if (db == null || range == null || range.Start <= 0L || seenCumulativeSnapshots == null) return;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT session_id,total_input,total_cached,total_output,total_reasoning " +
+                "FROM token_records WHERE source_path=@path AND source_offset_end<=@start " +
+                "ORDER BY source_offset_end DESC LIMIT 1";
+            cmd.Parameters.AddWithValue("@path", range.Path);
+            cmd.Parameters.AddWithValue("@start", range.Start);
+            using (var reader = cmd.ExecuteReader())
+            {
+                if (!reader.Read()) return;
+                seenCumulativeSnapshots.Add(BuildAggregateCumulativeKey(
+                    ReadReaderString(reader, 0),
+                    ReadReaderInt64(reader, 1),
+                    ReadReaderInt64(reader, 2),
+                    ReadReaderInt64(reader, 3),
+                    ReadReaderInt64(reader, 4)));
+            }
+        }
+    }
+
+    private static string BuildAggregateCumulativeKey(
+        string sessionId,
+        long totalInput,
+        long totalCached,
+        long totalOutput,
+        long totalReasoning)
+    {
+        return (sessionId ?? "").ToLowerInvariant() + "|" +
+            string.Format(CultureInfo.InvariantCulture, "{0}:{1}:{2}:{3}",
+                totalInput, totalCached, totalOutput, totalReasoning);
     }
 
     private static string BuildAggregateEventKey(

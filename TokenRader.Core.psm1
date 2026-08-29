@@ -372,6 +372,14 @@ function New-TokenRaderUsageFingerprint {
     ) -join ':'
 }
 
+function New-TokenRaderCumulativeFingerprint {
+    param([Parameter(Mandatory = $true)]$TotalUsage)
+
+    @(
+        $TotalUsage.Input, $TotalUsage.Cached, $TotalUsage.Output, $TotalUsage.ReasoningOutput
+    ) -join ':'
+}
+
 function ConvertFrom-TokenRaderRateWindowTextFast {
     param(
         [Parameter(Mandatory = $true)][string]$InnerText,
@@ -1251,6 +1259,10 @@ function Get-TokenRaderIntervalResult {
         $bytesRead += [Int64]$parsed.BytesRead
         if (@($parsed.Events).Count -gt 0) { [void]$activeFiles.Add($changePath) }
         $fallbackModel = [string]$parsed.LastModel
+        $seenCumulativeSnapshots = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        if ($null -ne $baselineTask) {
+            [void]$seenCumulativeSnapshots.Add((New-TokenRaderCumulativeFingerprint -TotalUsage $baselineTask))
+        }
 
         foreach ($event in @($parsed.Events)) {
             $rawEventCount++
@@ -1260,6 +1272,16 @@ function Get-TokenRaderIntervalResult {
                 $latestRateObserved = $event.RateLimits.ObservedAt
             }
             $usageFingerprint = [string]$event.UsageFingerprint
+            $cumulativeFingerprint = New-TokenRaderCumulativeFingerprint -TotalUsage $event.Total
+            # Codex may emit a later token_count record only to refresh status
+            # or rate limits. If total_token_usage did not change, the attached
+            # last_token_usage still describes the previous call and must not
+            # be charged again. Seeding from the baseline also protects the
+            # first record immediately after the measurement boundary.
+            if (-not $seenCumulativeSnapshots.Add($cumulativeFingerprint)) {
+                $duplicateEventCount++
+                continue
+            }
             if ($change.IsNew -and $null -ne $ancestorEventFingerprints -and $ancestorEventFingerprints.Contains($usageFingerprint)) {
                 $inheritedEventCount++
                 continue

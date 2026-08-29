@@ -459,8 +459,9 @@ try {
 
     # The compiled aggregator must remain numerically identical to the legacy
     # byte parser across multiple models, long-context pricing and an unknown
-    # model. Two calls with identical counters but different timestamps are
-    # deliberately retained as separate real calls.
+    # model. A timestamp-only repeat of the same cumulative snapshot is dropped,
+    # while two real calls with identical per-call usage are retained because
+    # total_token_usage advances.
     $indexedParityRoot = Join-Path $tempRoot 'indexed-pricing-parity'
     New-Item -ItemType Directory -Path $indexedParityRoot | Out-Null
     $indexedParityPath = Join-Path $indexedParityRoot 'rollout-indexed-pricing.jsonl'
@@ -477,10 +478,11 @@ try {
     $indexedParityNewRecords = @(
         (New-TestTokenRecord -Timestamp $indexedParityCallAt.ToString('o') -TotalInput 2000 -TotalCached 200 -TotalOutput 200 -CallInput 1000 -CallCached 100 -CallOutput 100),
         (New-TestTokenRecord -Timestamp $indexedParityCallAt.AddMilliseconds(1).ToString('o') -TotalInput 2000 -TotalCached 200 -TotalOutput 200 -CallInput 1000 -CallCached 100 -CallOutput 100),
-        [ordered]@{ timestamp = $indexedParityCallAt.AddMilliseconds(2).ToString('o'); type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.6-sol' } },
-        (New-TestTokenRecord -Timestamp $indexedParityCallAt.AddMilliseconds(3).ToString('o') -TotalInput 302001 -TotalCached 100201 -TotalOutput 400 -CallInput 300001 -CallCached 100001 -CallOutput 200),
-        [ordered]@{ timestamp = $indexedParityCallAt.AddMilliseconds(4).ToString('o'); type = 'turn_context'; payload = [ordered]@{ model = 'synthetic-unknown-model' } },
-        (New-TestTokenRecord -Timestamp $indexedParityCallAt.AddMilliseconds(5).ToString('o') -TotalInput 302501 -TotalCached 100201 -TotalOutput 450 -CallInput 500 -CallCached 0 -CallOutput 50)
+        (New-TestTokenRecord -Timestamp $indexedParityCallAt.AddMilliseconds(2).ToString('o') -TotalInput 3000 -TotalCached 300 -TotalOutput 300 -CallInput 1000 -CallCached 100 -CallOutput 100),
+        [ordered]@{ timestamp = $indexedParityCallAt.AddMilliseconds(3).ToString('o'); type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.6-sol' } },
+        (New-TestTokenRecord -Timestamp $indexedParityCallAt.AddMilliseconds(4).ToString('o') -TotalInput 303001 -TotalCached 100301 -TotalOutput 500 -CallInput 300001 -CallCached 100001 -CallOutput 200),
+        [ordered]@{ timestamp = $indexedParityCallAt.AddMilliseconds(5).ToString('o'); type = 'turn_context'; payload = [ordered]@{ model = 'synthetic-unknown-model' } },
+        (New-TestTokenRecord -Timestamp $indexedParityCallAt.AddMilliseconds(6).ToString('o') -TotalInput 303501 -TotalCached 100301 -TotalOutput 550 -CallInput 500 -CallCached 0 -CallOutput 50)
     )
     @($indexedParityNewRecords | ForEach-Object { ($_ | ConvertTo-Json -Depth 8 -Compress) }) | Add-Content -LiteralPath $indexedParityPath -Encoding UTF8
     $indexedParityDeadline = [DateTime]::UtcNow.AddSeconds(2)
@@ -490,7 +492,8 @@ try {
     $indexedParityLegacy = Get-TokenRaderIntervalResult -Baseline $indexedParityBaseline -PricingDocument $prices -EndOffsets $indexedParityEnd.EndOffsets
     $indexedParityCompiled = Get-TokenRaderIndexedIntervalResult -Baseline $indexedParityBaseline -PricingDocument $prices `
         -EndOffsets $indexedParityEnd.EndOffsets -EndRevision $indexedParityEnd.EndRevision -ScanRateLimits $false
-    Assert-Equal 4 $indexedParityCompiled.CountedEvents 'compiled aggregator keeps identical-token calls at different timestamps'
+    Assert-Equal 4 $indexedParityCompiled.CountedEvents 'compiled aggregator drops refresh snapshots and keeps real equal-usage calls'
+    Assert-Equal 1 $indexedParityCompiled.DuplicateEventsDropped 'compiled aggregator diagnoses one timestamp-only cumulative repeat'
     Assert-Equal $indexedParityLegacy.CountedEvents $indexedParityCompiled.CountedEvents 'compiled and legacy event count parity'
     Assert-Equal $indexedParityLegacy.Usage.Input $indexedParityCompiled.Usage.Input 'compiled and legacy input parity'
     Assert-Equal $indexedParityLegacy.Usage.Cached $indexedParityCompiled.Usage.Cached 'compiled and legacy cached input parity'
@@ -500,7 +503,7 @@ try {
     Assert-Equal $false $indexedParityCompiled.CostComplete 'compiled aggregator preserves compatibility cost state'
     Assert-Equal 3 @($indexedParityCompiled.Models).Count 'compiled aggregator returns all known and unknown models'
     Assert-Equal 1 @($indexedParityCompiled.Items | Where-Object { $_.Model -eq 'gpt-5.6-sol' -and $_.LongContext }).Count 'compiled aggregator preserves long-context bucket'
-    Assert-Equal 4 ([Int64]$indexedParityCompiled.ProcessedRows) 'compiled diagnostics report streamed rows'
+    Assert-Equal 5 ([Int64]$indexedParityCompiled.ProcessedRows) 'compiled diagnostics report streamed rows'
 
     # A real Codex task tree copies parent token_count history into sibling subagent
     # logs. Only exact copies within the same root task may be deduplicated; an
@@ -834,7 +837,7 @@ try {
     Assert-Equal 2 $unfrozenAfterAppend.CountedEvents 'unfrozen interval sees the appended event'
     Assert-Near 30.0 $unfrozenAfterAppend.EndRateLimits.FiveHour.UsedPercent 0.0001 'unfrozen interval sees latest rate snapshot'
 
-    # --- Same token counts at different times are distinct; copied task-tree events dedupe ---
+    # --- Cumulative snapshots dedupe; equal-usage real calls and task-tree copies stay correct ---
     $repeatRoot = Join-Path $tempRoot 'repeat-event-sessions'
     New-Item -ItemType Directory -Path $repeatRoot | Out-Null
     $repeatParentId = '50000000-0000-0000-0000-000000000001'
@@ -846,19 +849,20 @@ try {
     @($repeatInitial | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress }) | Set-Content -LiteralPath $repeatParentPath -Encoding UTF8
     $repeatBaseline = New-TokenRaderMeasurementBaseline -SessionsRoot $repeatRoot
     $repeatEventOne = New-TestTokenRecord -Timestamp '2026-07-14T09:01:00Z' -TotalInput 1000 -TotalCached 0 -TotalOutput 100 -CallInput 1000 -CallCached 0 -CallOutput 100
-    $repeatEventTwo = New-TestTokenRecord -Timestamp '2026-07-14T09:01:01Z' -TotalInput 1000 -TotalCached 0 -TotalOutput 100 -CallInput 1000 -CallCached 0 -CallOutput 100
-    @($repeatEventOne, $repeatEventTwo | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress }) | Add-Content -LiteralPath $repeatParentPath -Encoding UTF8
+    $repeatEventTwo = New-TestTokenRecord -Timestamp '2026-07-14T09:01:01Z' -TotalInput 2000 -TotalCached 0 -TotalOutput 200 -CallInput 1000 -CallCached 0 -CallOutput 100
+    $repeatSnapshot = New-TestTokenRecord -Timestamp '2026-07-14T09:01:02Z' -TotalInput 2000 -TotalCached 0 -TotalOutput 200 -CallInput 1000 -CallCached 0 -CallOutput 100
+    @($repeatEventOne, $repeatEventTwo, $repeatSnapshot | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress }) | Add-Content -LiteralPath $repeatParentPath -Encoding UTF8
     $repeatChildId = '50000000-0000-0000-0000-000000000002'
     $repeatChildPath = Join-Path $repeatRoot 'rollout-repeat-child.jsonl'
     $repeatChildRecords = @(
-        [ordered]@{ timestamp = '2026-07-14T09:01:02Z'; type = 'session_meta'; payload = [ordered]@{ id = $repeatChildId; parent_thread_id = $repeatParentId; forked_from_id = $repeatParentId; model_provider = 'openai' } },
-        [ordered]@{ timestamp = '2026-07-14T09:01:03Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.5' } },
+        [ordered]@{ timestamp = '2026-07-14T09:01:03Z'; type = 'session_meta'; payload = [ordered]@{ id = $repeatChildId; parent_thread_id = $repeatParentId; forked_from_id = $repeatParentId; model_provider = 'openai' } },
+        [ordered]@{ timestamp = '2026-07-14T09:01:04Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.5' } },
         $repeatEventOne
     )
     @($repeatChildRecords | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress }) | Set-Content -LiteralPath $repeatChildPath -Encoding UTF8
     $repeatResult = Get-TokenRaderIntervalResult -Baseline $repeatBaseline -PricingDocument $prices
-    Assert-Equal 2 $repeatResult.CountedEvents 'same token counts at different timestamps remain distinct'
-    Assert-Equal 1 $repeatResult.DuplicateEventsDropped 'exact copied task-tree event is deduplicated once'
+    Assert-Equal 2 $repeatResult.CountedEvents 'equal per-call token counts with advancing cumulative totals remain distinct'
+    Assert-Equal 2 $repeatResult.DuplicateEventsDropped 'refresh snapshot and exact task-tree copy are both deduplicated'
     Assert-Equal 2000 $repeatResult.Usage.Input 'repeated calls with same token count are both included'
     Assert-Equal 200 $repeatResult.Usage.Output 'repeated calls with same output count are both included'
 
@@ -1267,7 +1271,7 @@ try {
     $largeCount = 5000
     $largeBuilder = New-Object System.Text.StringBuilder
     for ($i = 1; $i -le $largeCount; $i++) {
-        [void]$largeBuilder.AppendLine(('{{"timestamp":"2026-07-14T04:00:{0:D2}Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{1},"cached_input_tokens":{2},"output_tokens":{3},"reasoning_output_tokens":{4},"total_tokens":{5}}},"last_token_usage":{{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":10,"reasoning_output_tokens":2,"total_tokens":1010}},"model_context_window":1050000}}}}}}' -f ($i % 60), ($i * 1000), ($i * 100), ($i * 10), ($i * 2), ($i * 1010)))
+        [void]$largeBuilder.AppendLine(('{{"timestamp":"2026-07-14T04:00:{0:D2}Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{1},"cached_input_tokens":{2},"output_tokens":{3},"reasoning_output_tokens":{4},"total_tokens":{5}}},"last_token_usage":{{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":10,"reasoning_output_tokens":2,"total_tokens":1010}},"model_context_window":1050000}}}}}}' -f ($i % 60), (($i + 1) * 1000), (($i + 1) * 100), (($i + 1) * 10), (($i + 1) * 2), (($i + 1) * 1010)))
     }
     [System.IO.File]::AppendAllText($largePath, $largeBuilder.ToString(), (New-Object System.Text.UTF8Encoding($false)))
 
