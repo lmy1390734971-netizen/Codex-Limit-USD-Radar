@@ -389,7 +389,7 @@
                             </Border>
                             <Border Grid.Column="4" Background="#102C29" BorderBrush="#28554C" BorderThickness="1" CornerRadius="10" Padding="14">
                                 <StackPanel VerticalAlignment="Center">
-                                    <TextBlock Text="API 等价美元" Foreground="#A8C7C0" FontSize="10"/>
+                                    <TextBlock Text="API 等价美元（仅可观察 Token）" Foreground="#A8C7C0" FontSize="10"/>
                                     <TextBlock x:Name="UsageHistoryUsdText" Text="$0.0000" Foreground="{StaticResource AccentBrush}" FontSize="25" FontWeight="SemiBold" Margin="0,7,0,0"/>
                                     <TextBlock x:Name="UsageHistoryStatusText" Text="等待汇总" Foreground="#7FA39B" FontSize="9" Margin="0,3,0,0"/>
                                 </StackPanel>
@@ -401,7 +401,7 @@
                                     <DataGridTextColumn Header="未缓存输入" Binding="{Binding Uncached}" Width="105"/>
                                     <DataGridTextColumn Header="输出" Binding="{Binding Output}" Width="95"/>
                                     <DataGridTextColumn Header="总 Token" Binding="{Binding Total}" Width="105"/>
-                                    <DataGridTextColumn Header="API 等价美元" Binding="{Binding Cost}" Width="115"/>
+                                    <DataGridTextColumn Header="API 等价美元（Token）" Binding="{Binding Cost}" Width="145"/>
                                 </DataGrid.Columns>
                             </DataGrid>
                         </Grid>
@@ -456,7 +456,9 @@
                                 </DataGrid.Columns>
                             </DataGrid>
                             <TextBlock x:Name="ToolUsageStatusText" Text="等待本地工具元数据" Foreground="#78909A" FontSize="9" Margin="1,8,0,0" TextWrapping="Wrap"/>
-                            <TextBlock Text="工具参数、命令、图片内容、URL和输出正文均不保存；本地日志缺少统一计费参数，因此次数不并入美元总额。"
+                            <TextBlock x:Name="UnpricedUsageText" Text="未单独计价：工具 0 次 · 输入图片 0 张 · 生成图片 0 张"
+                                       Foreground="#9FB0B7" FontSize="10" Margin="1,6,0,0" TextWrapping="Wrap"/>
+                            <TextBlock Text="工具参数、命令、图片内容、URL和输出正文均不保存；本地日志缺少统一计费参数。"
                                        Foreground="#6F858F" FontSize="9" Margin="1,4,0,0" TextWrapping="Wrap"/>
                         </StackPanel>
                     </Border>
@@ -474,7 +476,7 @@
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
                             <StackPanel>
-                                <TextBlock Text="官方 API 等价成本" Foreground="#A8C7C0" FontSize="12"/>
+                                <TextBlock Text="API 等价美元（仅可观察 Token）" Foreground="#A8C7C0" FontSize="12"/>
                                 <TextBlock x:Name="UsdCostText" Text="$0.0000" Foreground="{StaticResource AccentBrush}" FontSize="36" FontWeight="SemiBold" Margin="0,5,0,0"/>
                                 <TextBlock x:Name="CostBreakdownText" Text="未缓存 $0 · 缓存 $0 · 输出 $0" Foreground="#8FA9A5" FontSize="11" Margin="0,4,0,0"/>
                             </StackPanel>

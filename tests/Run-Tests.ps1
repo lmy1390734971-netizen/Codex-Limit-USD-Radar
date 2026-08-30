@@ -1692,7 +1692,7 @@ try {
     [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
-    foreach ($controlName in @('ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'IntervalStatusText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText', 'TotalMetricText', 'HitRateMetricText', 'UsdCostText', 'FiveHourUsageText', 'FiveHourDollarText', 'WeeklyUsageText', 'WeeklyDollarText', 'PricingDataGrid', 'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText', 'UsageHistoryModelText', 'UsageHistoryStatusText', 'UsageHistoryModelGrid', 'BackfillToolUsageButton', 'ToolCallCountText', 'InputImageCountText', 'GeneratedImageCountText', 'ComputerScreenshotCountText', 'ToolUsageGrid', 'ToolUsageStatusText')) {
+    foreach ($controlName in @('ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'IntervalStatusText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText', 'TotalMetricText', 'HitRateMetricText', 'UsdCostText', 'FiveHourUsageText', 'FiveHourDollarText', 'WeeklyUsageText', 'WeeklyDollarText', 'PricingDataGrid', 'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText', 'UsageHistoryModelText', 'UsageHistoryStatusText', 'UsageHistoryModelGrid', 'BackfillToolUsageButton', 'ToolCallCountText', 'InputImageCountText', 'GeneratedImageCountText', 'ComputerScreenshotCountText', 'ToolUsageGrid', 'ToolUsageStatusText', 'UnpricedUsageText')) {
         if ($null -eq $window.FindName($controlName)) { throw "ASSERT FAILED: missing XAML control $controlName" }
     }
     $historyRange = $window.FindName('HistoryRangeComboBox')
@@ -1713,11 +1713,19 @@ try {
         [string]$window.FindName('BackfillToolUsageButton').Content -ne '回填最近7天工具记录') {
         throw 'UI CONTRACT FAILED: tool/image usage card or one-time recent backfill action is incomplete'
     }
+    $xamlSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'MainWindow.xaml'))
+    if ([regex]::Matches($xamlSource, 'API 等价美元（仅可观察 Token）').Count -lt 2 -or
+        [string]$window.FindName('UnpricedUsageText').Text -ne '未单独计价：工具 0 次 · 输入图片 0 张 · 生成图片 0 张') {
+        throw 'UI CONTRACT FAILED: observable-token dollars and separately unpriced tool/image usage are not semantically separated'
+    }
 
     # Interval view must be a cheap state/cache operation. It must not scan the
     # whole session tree synchronously on every click, and the background
     # compute path must not fall back to invoking the parser on the UI thread.
     $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
+    if ($uiSource -notmatch '未单独计价：工具 \{0:N0\} 次 · 输入图片 \{1:N0\} 张 · 生成图片 \{2:N0\} 张') {
+        throw 'UI CONTRACT FAILED: runtime unpriced tool/image summary text is missing'
+    }
     if ($uiSource -notmatch 'HistoryRangeComboBox\.IsEnabled\s*=\s*\(\$NewState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)\)' -or
         $uiSource -notmatch 'UsageHistoryRangeComboBox\.IsEnabled\s*=\s*\(\$NewState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)\)' -or
         $uiSource -notmatch 'State\.UiState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)') {

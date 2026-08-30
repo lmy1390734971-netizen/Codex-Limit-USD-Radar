@@ -345,6 +345,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Render-Prev
 
 “图片与工具用量”卡片与上方滚动 24 小时下拉框使用同一时间边界，显示工具调用总数、完成/失败数、输入图片、生成图片和 computer 截图，并按工具名称汇总。识别依据是本地 JSONL 中可确认的结构化调用类型；[OpenAI Responses 参考](https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses)也将 function、custom、shell、MCP、computer、file search、code interpreter、image generation 和 input image 区分为不同项目类型。
 
+界面将两类数据明确分开：`API 等价美元（仅可观察 Token）：$X`，以及`未单独计价：工具 M 次 · 输入图片 N 张 · 生成图片 G 张`。后者只报告次数，不暗示费用为零，也不混入 Token 美元估算。
+
 性能与保留策略固定为：
 
 - **新日志**：增量解析新增字节时立即识别，不重扫历史文件；

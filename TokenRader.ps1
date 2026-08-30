@@ -264,7 +264,7 @@ $controlNames = @(
     'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText',
     'UsageHistoryModelText', 'UsageHistoryStatusText', 'UsageHistoryModelGrid',
     'BackfillToolUsageButton', 'ToolCallCountText', 'InputImageCountText', 'GeneratedImageCountText',
-    'ComputerScreenshotCountText', 'ToolUsageGrid', 'ToolUsageStatusText'
+    'ComputerScreenshotCountText', 'ToolUsageGrid', 'ToolUsageStatusText', 'UnpricedUsageText'
 )
 foreach ($name in $controlNames) {
     Set-Variable -Name $name -Scope Script -Value $script:Window.FindName($name)
@@ -808,6 +808,10 @@ function Show-TokenRaderUsageHistoryResult {
     $script:InputImageCountText.Text = Format-TokenRaderNumber $(if ($null -ne $toolUsage) { [Int64]$toolUsage.InputImages } else { 0L })
     $script:GeneratedImageCountText.Text = Format-TokenRaderNumber $(if ($null -ne $toolUsage) { [Int64]$toolUsage.GeneratedImages } else { 0L })
     $script:ComputerScreenshotCountText.Text = Format-TokenRaderNumber $(if ($null -ne $toolUsage) { [Int64]$toolUsage.ComputerScreenshots } else { 0L })
+    $script:UnpricedUsageText.Text = ('未单独计价：工具 {0:N0} 次 · 输入图片 {1:N0} 张 · 生成图片 {2:N0} 张' -f
+        $(if ($null -ne $toolUsage) { [Int64]$toolUsage.TotalToolCalls } else { 0L }),
+        $(if ($null -ne $toolUsage) { [Int64]$toolUsage.InputImages } else { 0L }),
+        $(if ($null -ne $toolUsage) { [Int64]$toolUsage.GeneratedImages } else { 0L }))
     $toolRows = foreach ($item in @($(if ($null -ne $toolUsage) { $toolUsage.Items } else { @() }))) {
         $kindLabel = switch ([string]$item.EventKind) {
             'tool_call' { '工具'; break }
