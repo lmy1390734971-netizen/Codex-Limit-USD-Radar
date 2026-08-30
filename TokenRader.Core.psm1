@@ -2810,8 +2810,13 @@ function Get-TokenRaderIndexedIntervalResult {
 function Get-TokenRaderPricingCacheKey {
     param([Parameter(Mandatory = $true)]$PricingDocument)
     $modelParts = foreach ($entry in @($PricingDocument.models | Sort-Object id)) {
+        $aliasValues = if ($null -ne $entry.PSObject.Properties['aliases']) { @($entry.aliases) } else { @() }
+        $aliases = @($aliasValues | ForEach-Object {
+            ([string]$_).Trim().ToLowerInvariant()
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique) -join ','
         @(
             [string]$entry.id,
+            $aliases,
             [string]$entry.input,
             [string]$entry.cachedInput,
             [string]$entry.output,
@@ -2820,7 +2825,7 @@ function Get-TokenRaderPricingCacheKey {
             $(if ($null -ne $entry.PSObject.Properties['longContextOutputMultiplier']) { [string]$entry.longContextOutputMultiplier } else { '' })
         ) -join ':'
     }
-    return (@([string]$PricingDocument.verifiedAt, [string]$PricingDocument.unitTokens, ($modelParts -join ';')) -join '|')
+    return (@('usage-history-v2', [string]$PricingDocument.verifiedAt, [string]$PricingDocument.unitTokens, ($modelParts -join ';')) -join '|')
 }
 
 function ConvertFrom-TokenRaderUsageHistorySnapshot {
@@ -2907,7 +2912,18 @@ function Get-TokenRaderUsageHistoryWindow {
     $startTicks = [Int64]$windowStart.UtcDateTime.Ticks
     $endTicks = [Int64]$windowEnd.UtcDateTime.Ticks
     $pricingKey = Get-TokenRaderPricingCacheKey -PricingDocument $PricingDocument
-    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '同步最新日志后冻结24小时边界'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+    # A history selection is itself a freshness boundary: do not rely on the
+    # five-minute timer or a prior View Result having already consumed the file
+    # watcher queue. The compiled catalog pass also catches delayed/lost file
+    # notifications before the timestamp aggregate is evaluated.
+    $index = Sync-TokenRaderMeasurementBoundary `
+        -SessionsRoot $SessionsRoot `
+        -ProgressState $ProgressState `
+        -TimeoutSeconds 25
     $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
     try {
         $revision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)

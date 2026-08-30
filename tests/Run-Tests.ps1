@@ -201,6 +201,16 @@ foreach ($pricingModelId in @('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'g
         throw "ASSERT FAILED: pricing values must be non-negative for $pricingModelId"
     }
 }
+$coreModule = Get-Module TokenRader.Core
+$basePricingCacheKey = & $coreModule { param($document) Get-TokenRaderPricingCacheKey -PricingDocument $document } $prices
+$aliasPricingDocument = ($prices | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
+$aliasPricingEntry = @($aliasPricingDocument.models | Where-Object { [string]$_.id -eq 'gpt-5.5' })[0]
+$aliasPricingEntry.aliases = @('synthetic-gpt-5.5-alias')
+$aliasPricingCacheKey = & $coreModule { param($document) Get-TokenRaderPricingCacheKey -PricingDocument $document } $aliasPricingDocument
+Assert-Equal $false ($basePricingCacheKey -eq $aliasPricingCacheKey) 'usage-history pricing cache invalidates when model aliases change'
+if (-not $basePricingCacheKey.StartsWith('usage-history-v2|', [StringComparison]::Ordinal)) {
+    throw 'ASSERT FAILED: usage-history pricing cache key is missing its algorithm version'
+}
 
 $tempRoot = Join-Path $env:TEMP ('token-rader-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
@@ -1361,11 +1371,31 @@ try {
         Assert-Equal 2 @($historyCached.ModelBreakdown).Count 'rolling history cached model breakdown count'
         Assert-Near ([double]$historyResult.TotalCost) ([double]$historyCached.TotalCost) 0.0000001 'rolling history cached API cost'
 
+        # Append another completed call, then deliberately consume its watcher
+        # notification before querying history. The history query itself must
+        # reconcile the lightweight catalog and import the new bytes; callers
+        # must not need a separate Refresh operation to obtain a fresh result.
+        $parallelAppend3 = New-TestTokenRecord -Timestamp $parallelAppendAt.AddMilliseconds(20).ToString('o') -TotalInput 4000 -TotalCached 400 -TotalOutput 400 -CallInput 1000 -CallCached 100 -CallOutput 100
+        [IO.File]::AppendAllText($parallelRootPath, (($parallelAppend3 | ConvertTo-Json -Depth 10 -Compress) + [Environment]::NewLine), $parallelUtf8)
+        Start-Sleep -Milliseconds 50
+        [void][TokenRaderIndexer]::DrainChangedPaths($parallelSessions)
+        $historyUpdated = Get-TokenRaderUsageHistoryWindow `
+            -SessionsRoot $parallelSessions `
+            -PricingDocument $prices `
+            -DayOffset 0 `
+            -AnchorAt $historyAnchor `
+            -ForceRefresh
+        Assert-Greater ([Int64]$historyResult.IndexRevision) ([Int64]$historyUpdated.IndexRevision) 'rolling history independently synchronizes a missed file notification'
+        Assert-Equal 4 ([Int64]$historyUpdated.CountedEvents) 'fresh rolling history unique call count'
+        Assert-Equal 4000 ([Int64]$historyUpdated.Usage.Input) 'fresh rolling history input total'
+        $historyUpdated56 = @($historyUpdated.ModelBreakdown | Where-Object { [string]$_.Model -eq 'gpt-5.6-sol' })[0]
+        Assert-Equal 2000 ([Int64]$historyUpdated56.Usage.Input) 'fresh rolling history per-model token total'
+
         $expiredSnapshot = New-Object TokenRaderUsageHistorySnapshot
         $expiredSnapshot.WindowStartTicks = $historyAnchor.AddDays(-9).UtcDateTime.Ticks
         $expiredSnapshot.WindowEndTicks = $historyAnchor.AddDays(-8).UtcDateTime.Ticks
         $expiredSnapshot.ComputedAtTicks = $historyAnchor.AddDays(-8).UtcDateTime.Ticks
-        $expiredSnapshot.IndexRevision = [Int64]$historyResult.IndexRevision
+        $expiredSnapshot.IndexRevision = [Int64]$historyUpdated.IndexRevision
         $expiredSnapshot.PricingKey = 'expired-test'
         [TokenRaderIndexer]::SaveUsageHistorySnapshot((Get-TokenRaderIndex).Connection, $expiredSnapshot)
         $historyRemoved = Remove-TokenRaderUsageHistory -SessionsRoot $parallelSessions -RetentionDays 7 -ReferenceAt $historyAnchor
@@ -1632,6 +1662,13 @@ try {
         $uiSource -notmatch 'Get-TokenRaderUsageHistoryWindow' -or
         $uiSource -notmatch "Model\s*=\s*'总计'") {
         throw 'UI CONTRACT FAILED: final settlement must asynchronously refresh and purge the disk-backed seven-day usage history'
+    }
+    if ($uiSource -notmatch '(?s)elseif\s*\(\$succeeded\s+-and\s+\$accepted\s+-and\s+-not\s+\$hasPendingInterval\).*?Start-TokenRaderUsageHistoryRefresh') {
+        throw 'UI CONTRACT FAILED: a successful measuring preview must refresh the rolling 24-hour card'
+    }
+    $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
+    if ($coreSource -notmatch '(?s)function Get-TokenRaderUsageHistoryWindow\b.*?Sync-TokenRaderMeasurementBoundary') {
+        throw 'HISTORY CONTRACT FAILED: every rolling history query must synchronize a stable latest index boundary'
     }
     if ($uiSource -notmatch 'Get-TokenRaderBackgroundErrorMessage' -or
         $uiSource -notmatch 'Streams\.Error' -or $uiSource -notmatch "-notmatch\s+'EndInvoke'") {

@@ -854,7 +854,7 @@ function Start-TokenRaderUsageHistoryRefresh {
         -CompletionHandler 'Complete-TokenRaderUsageHistoryJob' `
         -FailureHandler 'Fail-TokenRaderUsageHistoryJob' `
         -CallbackContext @{} `
-        -TimeoutSeconds 30 `
+        -TimeoutSeconds 60 `
         -SoftWarningSeconds 3 `
         -ProgressState $progressState `
         -CancellationSource $cancellationSource `
@@ -1580,12 +1580,19 @@ function Complete-TokenRaderIntervalCompute {
             $script:State.IntervalActiveScanRateLimits = $false
             $script:State.IntervalComputeRequestId = 0
         }
+        $hasPendingInterval = [bool]$script:State.IntervalComputePending
         if ($succeeded -and $Final) {
             Set-TokenRaderUiState -NewState 'Ready'
             # The final interval has already synchronized the index. Refresh
             # the selected rolling window from disk and remove snapshots whose
             # window ended more than seven days ago.
             Start-TokenRaderUsageHistoryRefresh -PurgeExpired $true
+        } elseif ($succeeded -and $accepted -and -not $hasPendingInterval) {
+            # During Measuring the five-minute timer runs an interval preview
+            # instead of the idle index-sync path. Refresh the rolling card
+            # after that preview so it cannot remain stale throughout a long
+            # measurement.
+            Start-TokenRaderUsageHistoryRefresh
         }
         if (-not $script:WindowClosing -and $succeeded -and $script:State.IntervalComputePending -and
             [Int64]$script:State.MeasurementGeneration -eq $effectiveGeneration -and
