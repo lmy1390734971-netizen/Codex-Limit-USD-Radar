@@ -1718,6 +1718,15 @@ try {
         [string]$window.FindName('UnpricedUsageText').Text -ne '未单独计价：工具 0 次 · 输入图片 0 张 · 生成图片 0 张') {
         throw 'UI CONTRACT FAILED: observable-token dollars and separately unpriced tool/image usage are not semantically separated'
     }
+    $usdCardPosition = $xamlSource.IndexOf('x:Name="UsdCostText"', [StringComparison]::Ordinal)
+    $quotaPosition = $xamlSource.IndexOf('x:Name="FiveHourUsageText"', [StringComparison]::Ordinal)
+    $periodPosition = $xamlSource.IndexOf('Text="周期用量"', [StringComparison]::Ordinal)
+    $toolCardPosition = $xamlSource.IndexOf('Text="图片与工具用量"', [StringComparison]::Ordinal)
+    if ($usdCardPosition -lt 0 -or $quotaPosition -lt 0 -or $periodPosition -lt 0 -or
+        $usdCardPosition -ge $periodPosition -or $quotaPosition -ge $periodPosition -or
+        $toolCardPosition -le $periodPosition -or $xamlSource.Contains('Text="滚动 24 小时用量"')) {
+        throw 'UI CONTRACT FAILED: API cost and quota cards must precede the renamed period-usage section'
+    }
 
     # Interval view must be a cheap state/cache operation. It must not scan the
     # whole session tree synchronously on every click, and the background
