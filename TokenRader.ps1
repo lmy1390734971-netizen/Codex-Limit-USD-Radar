@@ -49,6 +49,9 @@ $script:State = @{
     UsageHistoryRequestId = [Int64]0
     UsageHistoryPending = $false
     UsageHistoryPendingRequest = $null
+    ToolBackfillRunning = $false
+    ToolBackfillRequestId = [Int64]0
+    ToolBackfillCompleted = $false
     PendingMeasurementStart = $false
     RateLimits = $null
     RateLimitSnapshotCache = @{}
@@ -223,6 +226,27 @@ $script:UsageHistoryScript = {
     }
 }
 
+$script:ToolBackfillScript = {
+    param(
+        [string]$SessionsRoot,
+        [string]$ModulePath,
+        [Threading.CancellationToken]$CancellationToken,
+        [hashtable]$ProgressState
+    )
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+    Import-Module $ModulePath -Force
+    try {
+        Invoke-TokenRaderToolBackfill `
+            -SessionsRoot $SessionsRoot `
+            -Days 7 `
+            -CancellationToken $CancellationToken `
+            -ProgressState $ProgressState
+    } finally {
+        Close-TokenRaderIndex -KeepWatcher
+    }
+}
+
 [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $PSScriptRoot 'MainWindow.xaml')
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $script:Window = [Windows.Markup.XamlReader]::Load($reader)
@@ -238,7 +262,9 @@ $controlNames = @(
     'FiveHourUsageText', 'FiveHourProgress', 'FiveHourDollarText', 'FiveHourResetText',
     'WeeklyUsageText', 'WeeklyProgress', 'WeeklyDollarText', 'WeeklyResetText', 'QuotaEstimateHintText',
     'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText',
-    'UsageHistoryModelText', 'UsageHistoryStatusText', 'UsageHistoryModelGrid'
+    'UsageHistoryModelText', 'UsageHistoryStatusText', 'UsageHistoryModelGrid',
+    'BackfillToolUsageButton', 'ToolCallCountText', 'InputImageCountText', 'GeneratedImageCountText',
+    'ComputerScreenshotCountText', 'ToolUsageGrid', 'ToolUsageStatusText'
 )
 foreach ($name in $controlNames) {
     Set-Variable -Name $name -Scope Script -Value $script:Window.FindName($name)
@@ -311,6 +337,9 @@ function Set-TokenRaderUiState {
     $script:RefreshButton.IsEnabled = ($canOperate -and -not [bool]$script:State.IndexSyncing)
     $script:RebuildIndexButton.IsEnabled = ($canOperate -and $indexReady)
     $script:PurgeOldIndexButton.IsEnabled = ($canOperate -and $indexReady)
+    $script:BackfillToolUsageButton.IsEnabled = ($canOperate -and $indexReady -and
+        -not [bool]$script:State.ToolBackfillRunning -and -not [bool]$script:State.ToolBackfillCompleted -and
+        -not [bool]$script:State.UsageHistoryRefreshing -and -not [bool]$script:State.IndexSyncing)
     # 历史浏览范围不参与开始/结束时间段的计量边界，测量进行中也可切换。
     $script:HistoryRangeComboBox.IsEnabled = ($NewState -in @('Idle', 'Measuring', 'Ready', 'Error'))
     $script:UsageHistoryRangeComboBox.IsEnabled = ($NewState -in @('Idle', 'Measuring', 'Ready', 'Error'))
@@ -406,6 +435,8 @@ function Reset-TokenRaderBackgroundFailureState {
     $script:State.UsageHistoryRequestId = 0L
     $script:State.UsageHistoryPending = $false
     $script:State.UsageHistoryPendingRequest = $null
+    $script:State.ToolBackfillRunning = $false
+    $script:State.ToolBackfillRequestId = 0L
     $script:State.PendingMeasurementStart = $false
     $script:State.QuotaEstimates = $null
     $script:State.QuotaCalibrationMessage = $Message
@@ -553,6 +584,17 @@ function Start-TokenRaderBackgroundPoller {
                     $detail = if ($processedRows -gt 0) { ' · {0:N0} 条记录' -f $processedRows } else { '' }
                     $script:UsageHistoryStatusText.Text = ('{0}{1} · {2:0} 秒' -f $stage, $detail, $elapsed.TotalSeconds)
                 }
+                if ([string]$job.Kind -eq 'ToolBackfill' -and
+                    [Int64]$script:State.ToolBackfillRequestId -eq [Int64]$job.RequestId -and
+                    ($now - [DateTimeOffset]$job.LastProgressUiAt).TotalMilliseconds -ge 500) {
+                    $job.LastProgressUiAt = $now
+                    $stage = [string](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'Stage' -Default '回填工具元数据')
+                    $processed = [int](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'ProcessedFiles' -Default 0)
+                    $total = [int](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'TotalFiles' -Default 0)
+                    $detected = [Int64](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'DetectedRecords' -Default 0L)
+                    $script:ToolUsageStatusText.Text = ('{0} · {1}/{2} 个文件 · {3:N0} 条元数据 · {4:0} 秒' -f
+                        $stage, $processed, $total, $detected, $elapsed.TotalSeconds)
+                }
 
                 $totalTimedOut = ([int]$job.TimeoutSeconds -gt 0 -and $elapsed.TotalSeconds -ge [int]$job.TimeoutSeconds)
                 $lastProgressAt = [DateTimeOffset]$job.StartedAt
@@ -690,6 +732,7 @@ function Complete-TokenRaderIndexSyncJob {
     $script:State.IndexCatalogAvailable = $true
     $script:State.ProjectCache = @{}
     $script:State.RateLimitSnapshotCache = @{}
+    Update-TokenRaderToolBackfillButton
     if ($null -ne $Payload -and $null -ne $Payload.PSObject.Properties['LatestRateLimits']) {
         Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits
     }
@@ -759,6 +802,36 @@ function Show-TokenRaderUsageHistoryResult {
     })
     $script:UsageHistoryModelGrid.ItemsSource = $null
     $script:UsageHistoryModelGrid.ItemsSource = $rows
+
+    $toolUsage = if ($null -ne $Result.PSObject.Properties['ToolUsage']) { $Result.ToolUsage } else { $null }
+    $script:ToolCallCountText.Text = Format-TokenRaderNumber $(if ($null -ne $toolUsage) { [Int64]$toolUsage.TotalToolCalls } else { 0L })
+    $script:InputImageCountText.Text = Format-TokenRaderNumber $(if ($null -ne $toolUsage) { [Int64]$toolUsage.InputImages } else { 0L })
+    $script:GeneratedImageCountText.Text = Format-TokenRaderNumber $(if ($null -ne $toolUsage) { [Int64]$toolUsage.GeneratedImages } else { 0L })
+    $script:ComputerScreenshotCountText.Text = Format-TokenRaderNumber $(if ($null -ne $toolUsage) { [Int64]$toolUsage.ComputerScreenshots } else { 0L })
+    $toolRows = foreach ($item in @($(if ($null -ne $toolUsage) { $toolUsage.Items } else { @() }))) {
+        $kindLabel = switch ([string]$item.EventKind) {
+            'tool_call' { '工具'; break }
+            'image_generation' { '图片生成'; break }
+            'image_input' { '输入图片'; break }
+            'computer_screenshot' { '电脑截图'; break }
+            default { [string]$item.EventKind }
+        }
+        [pscustomobject]@{
+            Kind = $kindLabel
+            Tool = [string]$item.ToolName
+            Calls = Format-TokenRaderNumber ([Int64]$item.Calls)
+            Completed = Format-TokenRaderNumber ([Int64]$item.Completed)
+            Failed = Format-TokenRaderNumber ([Int64]$item.Failed)
+        }
+    }
+    $script:ToolUsageGrid.ItemsSource = $null
+    $script:ToolUsageGrid.ItemsSource = @($toolRows)
+    if (-not [bool]$script:State.ToolBackfillCompleted) {
+        $script:ToolUsageStatusText.Text = '新日志已增量识别；旧日志需点击一次“回填最近7天工具记录”。'
+    } elseif ($null -ne $toolUsage) {
+        $script:ToolUsageStatusText.Text = ('本窗口工具调用 {0:N0} 次，完成 {1:N0}、失败 {2:N0}；仅统计本地可观察元数据，不并入美元总额。' -f
+            [Int64]$toolUsage.TotalToolCalls, [Int64]$toolUsage.CompletedToolCalls, [Int64]$toolUsage.FailedToolCalls)
+    }
 }
 
 function Start-TokenRaderPendingUsageHistory {
@@ -780,6 +853,7 @@ function Complete-TokenRaderUsageHistoryJob {
     $script:State.UsageHistoryRefreshing = $false
     $script:State.UsageHistoryStopping = $false
     if ($null -ne $Payload) { Show-TokenRaderUsageHistoryResult -Result $Payload }
+    Update-TokenRaderToolBackfillButton
     [void](Start-TokenRaderPendingUsageHistory)
 }
 
@@ -795,6 +869,7 @@ function Fail-TokenRaderUsageHistoryJob {
     $script:State.UsageHistoryRequestId = 0L
     $script:State.UsageHistoryRefreshing = $false
     $script:State.UsageHistoryStopping = $false
+    Update-TokenRaderToolBackfillButton
     [void](Start-TokenRaderPendingUsageHistory)
 }
 
@@ -804,6 +879,7 @@ function Complete-TokenRaderUsageHistoryStopJob {
     $script:State.UsageHistoryRequestId = 0L
     $script:State.UsageHistoryRefreshing = $false
     $script:State.UsageHistoryStopping = $false
+    Update-TokenRaderToolBackfillButton
     [void](Start-TokenRaderPendingUsageHistory)
 }
 
@@ -830,6 +906,7 @@ function Start-TokenRaderUsageHistoryRefresh {
     $script:State.UsageHistoryRequestId = $requestId
     $script:State.UsageHistoryRefreshing = $true
     $script:State.UsageHistoryStopping = $false
+    $script:BackfillToolUsageButton.IsEnabled = $false
     $script:UsageHistoryStatusText.Text = '正在读取磁盘汇总…'
     $progressState = [hashtable]::Synchronized(@{
         Stage = '打开24小时磁盘数据'
@@ -859,6 +936,104 @@ function Start-TokenRaderUsageHistoryRefresh {
         -ProgressState $progressState `
         -CancellationSource $cancellationSource `
         -StopCompletionHandler 'Complete-TokenRaderUsageHistoryStopJob')
+}
+
+function Update-TokenRaderToolBackfillButton {
+    if (-not [bool]$script:State.IndexCatalogAvailable) { return }
+    try {
+        $status = Get-TokenRaderToolBackfillStatus -SessionsRoot $script:Paths.SessionsRoot
+        $script:State.ToolBackfillCompleted = [bool]$status.Completed
+    } catch {
+        $script:State.ToolBackfillCompleted = $false
+    }
+    $script:BackfillToolUsageButton.Content = if ([bool]$script:State.ToolBackfillCompleted) {
+        '最近7天工具记录已回填'
+    } else { '回填最近7天工具记录' }
+    $canOperate = [string]$script:State.UiState -in @('Idle', 'Ready', 'Error')
+    $script:BackfillToolUsageButton.IsEnabled = ($canOperate -and [bool]$script:State.IndexReady -and
+        -not [bool]$script:State.ToolBackfillRunning -and -not [bool]$script:State.ToolBackfillCompleted -and
+        -not [bool]$script:State.UsageHistoryRefreshing -and -not [bool]$script:State.IndexSyncing)
+}
+
+function Complete-TokenRaderToolBackfillJob {
+    param($Payload, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
+    if ($script:WindowClosing -or [Int64]$script:State.ToolBackfillRequestId -ne $RequestId) { return }
+    $script:State.ToolBackfillRequestId = 0L
+    $script:State.ToolBackfillRunning = $false
+    $script:State.ToolBackfillCompleted = $true
+    Set-TokenRaderUiState -NewState ([string]$script:State.UiState)
+    $script:BackfillToolUsageButton.Content = '最近7天工具记录已回填'
+    $script:BackfillToolUsageButton.IsEnabled = $false
+    if ($null -ne $Payload -and [bool]$Payload.AlreadyCompleted) {
+        $script:ToolUsageStatusText.Text = '最近7天工具元数据此前已经回填。'
+    } elseif ($null -ne $Payload) {
+        $script:ToolUsageStatusText.Text = ('回填完成：扫描 {0}/{1} 个文件，识别 {2:N0} 条工具/图片元数据。' -f
+            [int]$Payload.ProcessedFiles, [int]$Payload.CandidateFiles, [Int64]$Payload.DetectedRecords)
+    }
+    Start-TokenRaderUsageHistoryRefresh -ForceRefresh $true
+}
+
+function Fail-TokenRaderToolBackfillJob {
+    param($ErrorMessage, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
+    if ($script:WindowClosing -or [Int64]$script:State.ToolBackfillRequestId -ne $RequestId) { return }
+    $stopPending = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'StopPending' -Default $false)
+    $script:ToolUsageStatusText.Text = '工具元数据回填失败：' + [string]$ErrorMessage
+    if ($stopPending) { return }
+    $script:State.ToolBackfillRequestId = 0L
+    $script:State.ToolBackfillRunning = $false
+    Set-TokenRaderUiState -NewState ([string]$script:State.UiState)
+    Update-TokenRaderToolBackfillButton
+}
+
+function Complete-TokenRaderToolBackfillStopJob {
+    param($Payload, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
+    if ($script:WindowClosing -or [Int64]$script:State.ToolBackfillRequestId -ne $RequestId) { return }
+    $script:State.ToolBackfillRequestId = 0L
+    $script:State.ToolBackfillRunning = $false
+    Set-TokenRaderUiState -NewState ([string]$script:State.UiState)
+    Update-TokenRaderToolBackfillButton
+}
+
+function Start-TokenRaderToolBackfill {
+    if ($script:WindowClosing -or [bool]$script:State.ToolBackfillRunning -or
+        [bool]$script:State.ToolBackfillCompleted -or -not [bool]$script:State.IndexReady -or
+        [bool]$script:State.UsageHistoryRefreshing -or [bool]$script:State.IndexSyncing -or
+        [string]$script:State.UiState -notin @('Idle', 'Ready', 'Error')) { return }
+    $requestId = New-TokenRaderRequestId
+    $script:State.ToolBackfillRequestId = $requestId
+    $script:State.ToolBackfillRunning = $true
+    $script:BackfillToolUsageButton.IsEnabled = $false
+    $script:StartMeasureButton.IsEnabled = $false
+    $script:RefreshButton.IsEnabled = $false
+    $script:RebuildIndexButton.IsEnabled = $false
+    $script:PurgeOldIndexButton.IsEnabled = $false
+    $script:UsageHistoryRangeComboBox.IsEnabled = $false
+    $script:ToolUsageStatusText.Text = '正在后台回填最近7天工具元数据；不会保存参数、图片或输出正文…'
+    $progressState = [hashtable]::Synchronized(@{
+        Stage = '准备最近7天工具元数据回填'
+        ProcessedFiles = 0
+        TotalFiles = 0
+        DetectedRecords = [Int64]0
+        LastProgressAt = [DateTimeOffset]::Now
+    })
+    $cancellationSource = [Threading.CancellationTokenSource]::new()
+    [void](Start-TokenRaderBackgroundJob `
+        -ScriptBlock $script:ToolBackfillScript `
+        -Parameters @{
+            SessionsRoot = $script:Paths.SessionsRoot
+            ModulePath = (Join-Path $PSScriptRoot 'TokenRader.Core.psm1')
+            CancellationToken = $cancellationSource.Token
+            ProgressState = $progressState
+        } `
+        -Kind 'ToolBackfill' `
+        -RequestId $requestId `
+        -CompletionHandler 'Complete-TokenRaderToolBackfillJob' `
+        -FailureHandler 'Fail-TokenRaderToolBackfillJob' `
+        -CallbackContext @{} `
+        -StallTimeoutSeconds 300 `
+        -ProgressState $progressState `
+        -CancellationSource $cancellationSource `
+        -StopCompletionHandler 'Complete-TokenRaderToolBackfillStopJob')
 }
 
 function Complete-TokenRaderIntervalComputeJob {
@@ -2127,8 +2302,10 @@ $script:RebuildIndexButton.Add_Click({
         New-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot -Force | Out-Null
         $script:State.ProjectCache = @{}
         $script:State.RateLimitSnapshotCache = @{}
+        $script:State.ToolBackfillCompleted = $false
         Refresh-Application
         $script:StatusText.Text = '本地索引已完整重建。'
+        Update-TokenRaderToolBackfillButton
         Start-TokenRaderUsageHistoryRefresh -ForceRefresh $true
     } catch {
         $script:StatusText.Text = '索引重建失败：' + $_.Exception.Message
@@ -2169,6 +2346,7 @@ $script:UsageHistoryRangeComboBox.Add_SelectionChanged({
         Start-TokenRaderUsageHistoryRefresh -DayOffset (Get-SelectedUsageHistoryDayOffset)
     }
 })
+$script:BackfillToolUsageButton.Add_Click({ Start-TokenRaderToolBackfill })
 $script:SessionListBox.Add_SelectionChanged({
     if (-not $script:State.Refreshing -and [string]$script:State.UiState -in @('Idle', 'Ready', 'Error')) {
         $script:State.ViewMode = 'session'

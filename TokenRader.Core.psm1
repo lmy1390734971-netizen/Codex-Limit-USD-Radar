@@ -1914,6 +1914,7 @@ function Sync-TokenRaderIndexFiles {
             if ($requiresReplacement) {
                 if ([string]::IsNullOrWhiteSpace($knownSessionId)) { $knownSessionId = [string]$metadata.SessionId }
                 [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $knownSessionId)
+                [void][TokenRaderIndexer]::DeleteToolRecordsBySourcePath($conn, $canonical)
                 $startOffset = 0L
             }
 
@@ -1960,6 +1961,7 @@ function Sync-TokenRaderIndexFiles {
             $sessionId = [string]$row['session_id']
             if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-TokenRaderSessionIdFromPath -FilePath $path }
             [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $sessionId)
+            [void][TokenRaderIndexer]::DeleteToolRecordsBySourcePath($conn, $path)
             [TokenRaderIndexer]::RemoveFileMetadata($conn, $path)
             $changed = $true
         }
@@ -1971,6 +1973,7 @@ function Sync-TokenRaderIndexFiles {
             $sessionId = [string]$row['session_id']
             if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-TokenRaderSessionIdFromPath -FilePath $path }
             [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $sessionId)
+            [void][TokenRaderIndexer]::DeleteToolRecordsBySourcePath($conn, $path)
             [TokenRaderIndexer]::RemoveFileMetadata($conn, $path)
             $changed = $true
         }
@@ -2889,6 +2892,21 @@ function ConvertFrom-TokenRaderUsageHistorySnapshot {
     }
 }
 
+function Add-TokenRaderToolUsageToHistoryResult {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)]$Connection
+    )
+    $toolUsage = [TokenRaderIndexer]::AggregateToolUsage(
+        $Connection, [DateTimeOffset]$Result.WindowStart, [DateTimeOffset]$Result.WindowEnd)
+    if ($null -ne $Result.PSObject.Properties['ToolUsage']) {
+        $Result.ToolUsage = $toolUsage
+    } else {
+        Add-Member -InputObject $Result -NotePropertyName ToolUsage -NotePropertyValue $toolUsage
+    }
+    return $Result
+}
+
 function Get-TokenRaderUsageHistoryWindow {
     param(
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
@@ -2934,7 +2952,10 @@ function Get-TokenRaderUsageHistoryWindow {
         if (-not $ForceRefresh) {
             $cached = [TokenRaderIndexer]::GetUsageHistorySnapshot(
                 $index.Connection, $startTicks, $endTicks, $revision, $pricingKey)
-            if ($null -ne $cached) { return ConvertFrom-TokenRaderUsageHistorySnapshot -Snapshot $cached -FromCache $true }
+            if ($null -ne $cached) {
+                $cachedResult = ConvertFrom-TokenRaderUsageHistorySnapshot -Snapshot $cached -FromCache $true
+                return Add-TokenRaderToolUsageToHistoryResult -Result $cachedResult -Connection $index.Connection
+            }
         }
 
         $thresholds = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
@@ -3047,7 +3068,64 @@ function Get-TokenRaderUsageHistoryWindow {
         }
         $snapshot.ModelBreakdown = [TokenRaderUsageHistoryModelSnapshot[]]@($modelSnapshots)
         [TokenRaderIndexer]::SaveUsageHistorySnapshot($index.Connection, $snapshot)
-        return ConvertFrom-TokenRaderUsageHistorySnapshot -Snapshot $snapshot -FromCache $false
+        $freshResult = ConvertFrom-TokenRaderUsageHistorySnapshot -Snapshot $snapshot -FromCache $false
+        return Add-TokenRaderToolUsageToHistoryResult -Result $freshResult -Connection $index.Connection
+    } finally {
+        if ($null -ne $crossProcessLock) { $crossProcessLock.Dispose() }
+    }
+}
+
+function Get-TokenRaderToolBackfillStatus {
+    param([Parameter(Mandatory = $true)][string]$SessionsRoot)
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    $version = [string][TokenRaderIndexer]::GetSetting($index.Connection, 'tool_metadata_backfill_version')
+    $completedAt = [string][TokenRaderIndexer]::GetSetting($index.Connection, 'tool_metadata_backfill_completed_at')
+    [pscustomobject]@{
+        Completed = $version -eq '1'
+        Version = $version
+        CompletedAt = $completedAt
+    }
+}
+
+function Invoke-TokenRaderToolBackfill {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [ValidateRange(1, 7)][int]$Days = 7,
+        [switch]$Force,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None,
+        [hashtable]$ProgressState = $null
+    )
+    $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $SessionsRoot -ProgressState $ProgressState -TimeoutSeconds 25
+    $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+    try {
+        $currentVersion = [string][TokenRaderIndexer]::GetSetting($index.Connection, 'tool_metadata_backfill_version')
+        if (-not $Force -and $currentVersion -eq '1') {
+            return [pscustomobject]@{
+                AlreadyCompleted = $true
+                ProcessedFiles = 0
+                CandidateFiles = 0
+                DetectedRecords = 0L
+                ScannedBytes = 0L
+            }
+        }
+        $cutoffTicks = [Int64][DateTimeOffset]::Now.AddDays(-$Days).UtcDateTime.Ticks
+        $nextRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) + 1L
+        $backfill = [TokenRaderIndexer]::BackfillRecentToolRecords(
+            $index.Connection, $cutoffTicks, $nextRevision, $CancellationToken, $ProgressState)
+        if ([Int64]$backfill.DetectedRecords -gt 0) {
+            $index.IndexRevision = [Int64][TokenRaderIndexer]::IncrementIndexRevision($index.Connection)
+        }
+        $completedAt = [DateTimeOffset]::Now.ToString('o')
+        [TokenRaderIndexer]::SetSetting($index.Connection, 'tool_metadata_backfill_version', '1')
+        [TokenRaderIndexer]::SetSetting($index.Connection, 'tool_metadata_backfill_completed_at', $completedAt)
+        [pscustomobject]@{
+            AlreadyCompleted = $false
+            ProcessedFiles = [int]$backfill.ProcessedFiles
+            CandidateFiles = [int]$backfill.CandidateFiles
+            DetectedRecords = [Int64]$backfill.DetectedRecords
+            ScannedBytes = [Int64]$backfill.ScannedBytes
+            CompletedAt = $completedAt
+        }
     } finally {
         if ($null -ne $crossProcessLock) { $crossProcessLock.Dispose() }
     }
@@ -3070,4 +3148,4 @@ function Remove-TokenRaderUsageHistory {
     }
 }
 
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision, Get-TokenRaderUsageHistoryWindow, Remove-TokenRaderUsageHistory
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision, Get-TokenRaderUsageHistoryWindow, Remove-TokenRaderUsageHistory, Get-TokenRaderToolBackfillStatus, Invoke-TokenRaderToolBackfill

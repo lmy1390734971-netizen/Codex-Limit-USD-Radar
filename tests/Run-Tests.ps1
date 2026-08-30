@@ -1391,6 +1391,55 @@ try {
         $historyUpdated56 = @($historyUpdated.ModelBreakdown | Where-Object { [string]$_.Model -eq 'gpt-5.6-sol' })[0]
         Assert-Equal 2000 ([Int64]$historyUpdated56.Usage.Input) 'fresh rolling history per-model token total'
 
+        # New tool/image lines are indexed incrementally. Store deliberately
+        # sensitive-looking arguments and URLs in the source fixture, then
+        # prove that only compact metadata reaches SQLite. The same call_id in
+        # a parent/child copy is counted once, while different calls remain.
+        $toolSentinel = 'PRIVATE_TOOL_ARGUMENT_MUST_NOT_BE_STORED'
+        $toolAt = $parallelAppendAt.AddMilliseconds(30)
+        $toolLines = @(
+            ([ordered]@{ timestamp = $toolAt.ToString('o'); type = 'response_item'; payload = [ordered]@{ type = 'function_call'; name = 'exec_command'; call_id = 'shared-tool-call'; status = 'completed'; arguments = $toolSentinel } } | ConvertTo-Json -Depth 8 -Compress),
+            ([ordered]@{ timestamp = $toolAt.AddMilliseconds(1).ToString('o'); type = 'response_item'; payload = [ordered]@{ type = 'message'; content = @([ordered]@{ type = 'input_image'; image_url = 'https://private.invalid/image.png' }) } } | ConvertTo-Json -Depth 8 -Compress),
+            ([ordered]@{ timestamp = $toolAt.AddMilliseconds(2).ToString('o'); type = 'response_item'; payload = [ordered]@{ type = 'image_generation_call'; id = 'image-call-1'; status = 'completed'; prompt = $toolSentinel } } | ConvertTo-Json -Depth 8 -Compress),
+            ([ordered]@{ timestamp = $toolAt.AddMilliseconds(3).ToString('o'); type = 'response_item'; payload = [ordered]@{ type = 'computer_call_output'; output = @([ordered]@{ type = 'computer_screenshot'; image_url = 'https://private.invalid/screenshot.png' }) } } | ConvertTo-Json -Depth 8 -Compress),
+            ([ordered]@{ timestamp = $toolAt.AddMilliseconds(4).ToString('o'); type = 'response_item'; payload = [ordered]@{ type = 'mcp_call'; name = 'mcp__synthetic__lookup'; call_id = 'failed-mcp-call'; status = 'failed'; arguments = $toolSentinel } } | ConvertTo-Json -Depth 8 -Compress),
+            ([ordered]@{ timestamp = $parallelAt.AddDays(-8).ToString('o'); type = 'response_item'; payload = [ordered]@{ type = 'function_call'; name = 'old_tool'; call_id = 'old-tool-call'; status = 'completed'; arguments = $toolSentinel } } | ConvertTo-Json -Depth 8 -Compress)
+        )
+        foreach ($line in $toolLines) { [IO.File]::AppendAllText($parallelRootPath, ($line + [Environment]::NewLine), $parallelUtf8) }
+        $copiedToolLine = [ordered]@{ timestamp = $toolAt.ToString('o'); type = 'response_item'; payload = [ordered]@{ type = 'function_call'; name = 'exec_command'; call_id = 'shared-tool-call'; status = 'completed'; arguments = $toolSentinel } } | ConvertTo-Json -Depth 8 -Compress
+        [IO.File]::AppendAllText($parallelChildPath, ($copiedToolLine + [Environment]::NewLine), $parallelUtf8)
+        $toolHistory = Get-TokenRaderUsageHistoryWindow -SessionsRoot $parallelSessions -PricingDocument $prices -DayOffset 0 -AnchorAt $historyAnchor -ForceRefresh
+        Assert-Equal 3 ([Int64]$toolHistory.ToolUsage.TotalToolCalls) 'incremental tool call count with parent/child copy deduplication'
+        Assert-Equal 2 ([Int64]$toolHistory.ToolUsage.CompletedToolCalls) 'incremental completed tool call count'
+        Assert-Equal 1 ([Int64]$toolHistory.ToolUsage.FailedToolCalls) 'incremental failed tool call count'
+        Assert-Equal 1 ([Int64]$toolHistory.ToolUsage.InputImages) 'incremental input image count'
+        Assert-Equal 1 ([Int64]$toolHistory.ToolUsage.GeneratedImages) 'incremental generated image count'
+        Assert-Equal 1 ([Int64]$toolHistory.ToolUsage.ComputerScreenshots) 'incremental computer screenshot count'
+        Assert-Equal 7 ([int][TokenRaderIndexer]::GetToolRecordCount((Get-TokenRaderIndex).Connection)) 'source-specific tool metadata row count'
+        $toolPrivacyCommand = (Get-TokenRaderIndex).Connection.CreateCommand()
+        try {
+            $toolPrivacyCommand.CommandText = "SELECT GROUP_CONCAT(event_key || '|' || call_key || '|' || session_id || '|' || timestamp || '|' || model || '|' || event_kind || '|' || tool_name || '|' || status || '|' || source_path || '|' || root_session_id,'') FROM tool_records"
+            $storedToolMetadata = [string]$toolPrivacyCommand.ExecuteScalar()
+        } finally { $toolPrivacyCommand.Dispose() }
+        Assert-Equal $false ($storedToolMetadata.Contains($toolSentinel)) 'tool arguments leaked into persistent metadata'
+        Assert-Equal $false ($storedToolMetadata.Contains('private.invalid')) 'image URL leaked into persistent metadata'
+
+        # Seven-day cleanup removes the deliberately old metadata row. Then
+        # delete the recent source rows to simulate an index created by an
+        # older build and verify the one-time recent-log backfill restores them.
+        [void](Remove-TokenRaderUsageHistory -SessionsRoot $parallelSessions -RetentionDays 7 -ReferenceAt $historyAnchor)
+        Assert-Equal 6 ([int][TokenRaderIndexer]::GetToolRecordCount((Get-TokenRaderIndex).Connection)) 'seven-day cleanup did not remove old tool metadata'
+        [void][TokenRaderIndexer]::DeleteToolRecordsBySourcePath((Get-TokenRaderIndex).Connection, $parallelRootPath)
+        [void][TokenRaderIndexer]::DeleteToolRecordsBySourcePath((Get-TokenRaderIndex).Connection, $parallelChildPath)
+        Assert-Equal 0 ([int][TokenRaderIndexer]::GetToolRecordCount((Get-TokenRaderIndex).Connection)) 'synthetic pre-feature tool metadata reset'
+        $toolBackfill = Invoke-TokenRaderToolBackfill -SessionsRoot $parallelSessions -Days 7
+        Assert-Equal $false ([bool]$toolBackfill.AlreadyCompleted) 'first recent tool backfill was skipped'
+        Assert-Equal 6 ([int][TokenRaderIndexer]::GetToolRecordCount((Get-TokenRaderIndex).Connection)) 'recent tool backfill metadata row count'
+        $toolBackfillAgain = Invoke-TokenRaderToolBackfill -SessionsRoot $parallelSessions -Days 7
+        Assert-Equal $true ([bool]$toolBackfillAgain.AlreadyCompleted) 'recent tool backfill was not one-time'
+        $toolHistoryAfterBackfill = Get-TokenRaderUsageHistoryWindow -SessionsRoot $parallelSessions -PricingDocument $prices -DayOffset 0 -AnchorAt $historyAnchor -ForceRefresh
+        Assert-Equal 3 ([Int64]$toolHistoryAfterBackfill.ToolUsage.TotalToolCalls) 'backfilled tool aggregate count'
+
         $expiredSnapshot = New-Object TokenRaderUsageHistorySnapshot
         $expiredSnapshot.WindowStartTicks = $historyAnchor.AddDays(-9).UtcDateTime.Ticks
         $expiredSnapshot.WindowEndTicks = $historyAnchor.AddDays(-8).UtcDateTime.Ticks
@@ -1514,8 +1563,8 @@ try {
         New-Item -ItemType Directory -Path $performanceRoot -Force | Out-Null
         New-Item -ItemType Directory -Path $performancePrivate -Force | Out-Null
         $performanceProfiles = @(
-            [pscustomobject]@{ Name = '2k'; Files = 2000; Changed = 2; StartTargetMs = 1000; ViewTargetMs = 100; EndTargetMs = 250; ComputeTargetMs = 1000 },
-            [pscustomobject]@{ Name = '5k'; Files = 5000; Changed = 4; StartTargetMs = 3000; ViewTargetMs = 100; EndTargetMs = 500; ComputeTargetMs = 1500 }
+            [pscustomobject]@{ Name = '2k'; Files = 2000; Changed = 2; StartTargetMs = 1000; ViewTargetMs = 100; EndTargetMs = 250; ComputeTargetMs = 1000; BackfillTargetMs = 6000 },
+            [pscustomobject]@{ Name = '5k'; Files = 5000; Changed = 4; StartTargetMs = 3000; ViewTargetMs = 100; EndTargetMs = 500; ComputeTargetMs = 1500; BackfillTargetMs = 15000 }
         )
         $previousPerformanceIndex = [Environment]::GetEnvironmentVariable('TOKEN_RADER_INDEX_DB', 'Process')
         try {
@@ -1539,6 +1588,19 @@ try {
                 $coldWatch = [Diagnostics.Stopwatch]::StartNew()
                 New-TokenRaderIndex -SessionsRoot $profileRoot -Force | Out-Null
                 $coldWatch.Stop()
+                $backfillWatch = [Diagnostics.Stopwatch]::StartNew()
+                $backfillResult = [TokenRaderIndexer]::BackfillRecentToolRecords(
+                    (Get-TokenRaderIndex).Connection,
+                    [DateTimeOffset]::UtcNow.AddDays(-7).UtcDateTime.Ticks,
+                    ([Int64][TokenRaderIndexer]::GetIndexRevision((Get-TokenRaderIndex).Connection) + 1L),
+                    [Threading.CancellationToken]::None,
+                    $null)
+                $backfillWatch.Stop()
+                Assert-Equal ([int]$profile.Files) ([int]$backfillResult.ProcessedFiles) ($profile.Name + ' one-time tool backfill file count')
+                Assert-Equal 0 ([Int64]$backfillResult.DetectedRecords) ($profile.Name + ' tool-free backfill metadata count')
+                if ($backfillWatch.Elapsed.TotalMilliseconds -gt [double]$profile.BackfillTargetMs) {
+                    throw "PERFORMANCE FAILED: $($profile.Name) tool backfill=$($backfillWatch.Elapsed.TotalMilliseconds) ms"
+                }
                 $startSamples = New-Object System.Collections.Generic.List[double]
                 $baseline = $null
                 for ($sample = 0; $sample -lt 5; $sample++) {
@@ -1611,8 +1673,8 @@ try {
                 if ($viewP95 -gt [double]$profile.ViewTargetMs) { throw "PERFORMANCE FAILED: $($profile.Name) view P95=$viewP95 ms" }
                 if ($endWatch.Elapsed.TotalMilliseconds -gt [double]$profile.EndTargetMs * 1.5) { throw "PERFORMANCE FAILED: $($profile.Name) end capture=$($endWatch.Elapsed.TotalMilliseconds) ms" }
                 if ($computeP95 -gt [double]$profile.ComputeTargetMs * 1.5) { throw "PERFORMANCE FAILED: $($profile.Name) compute P95=$computeP95 ms" }
-                Write-Output ('PERF_INDEXED name={0} files={1} changed={2} coldCatalogMs={3:0.0} warmStartP95Ms={4:0.0} viewP95Ms={5:0.0} endMs={6:0.0} computeP95Ms={7:0.0} bytesRead={8}' -f
-                    $profile.Name, $profile.Files, $profile.Changed, $coldWatch.Elapsed.TotalMilliseconds, $startP95, $viewP95, $endWatch.Elapsed.TotalMilliseconds, $computeP95, [Int64]$result.BytesRead)
+                Write-Output ('PERF_INDEXED name={0} files={1} changed={2} coldCatalogMs={3:0.0} toolBackfillMs={4:0.0} warmStartP95Ms={5:0.0} viewP95Ms={6:0.0} endMs={7:0.0} computeP95Ms={8:0.0} bytesRead={9}' -f
+                    $profile.Name, $profile.Files, $profile.Changed, $coldWatch.Elapsed.TotalMilliseconds, $backfillWatch.Elapsed.TotalMilliseconds, $startP95, $viewP95, $endWatch.Elapsed.TotalMilliseconds, $computeP95, [Int64]$result.BytesRead)
                 Close-TokenRaderIndex
             }
         } finally {
@@ -1630,7 +1692,7 @@ try {
     [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
-    foreach ($controlName in @('ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'IntervalStatusText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText', 'TotalMetricText', 'HitRateMetricText', 'UsdCostText', 'FiveHourUsageText', 'FiveHourDollarText', 'WeeklyUsageText', 'WeeklyDollarText', 'PricingDataGrid', 'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText', 'UsageHistoryModelText', 'UsageHistoryStatusText', 'UsageHistoryModelGrid')) {
+    foreach ($controlName in @('ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'IntervalStatusText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText', 'TotalMetricText', 'HitRateMetricText', 'UsdCostText', 'FiveHourUsageText', 'FiveHourDollarText', 'WeeklyUsageText', 'WeeklyDollarText', 'PricingDataGrid', 'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText', 'UsageHistoryModelText', 'UsageHistoryStatusText', 'UsageHistoryModelGrid', 'BackfillToolUsageButton', 'ToolCallCountText', 'InputImageCountText', 'GeneratedImageCountText', 'ComputerScreenshotCountText', 'ToolUsageGrid', 'ToolUsageStatusText')) {
         if ($null -eq $window.FindName($controlName)) { throw "ASSERT FAILED: missing XAML control $controlName" }
     }
     $historyRange = $window.FindName('HistoryRangeComboBox')
@@ -1646,6 +1708,10 @@ try {
     }
     if ($window.FindName('UsageHistoryModelGrid').Columns.Count -ne 6) {
         throw 'UI CONTRACT FAILED: rolling history must show per-model cached, uncached, output, total token and API cost columns'
+    }
+    if ($window.FindName('ToolUsageGrid').Columns.Count -ne 5 -or
+        [string]$window.FindName('BackfillToolUsageButton').Content -ne '回填最近7天工具记录') {
+        throw 'UI CONTRACT FAILED: tool/image usage card or one-time recent backfill action is incomplete'
     }
 
     # Interval view must be a cheap state/cache operation. It must not scan the
@@ -1680,6 +1746,20 @@ try {
         $indexerSource -notmatch 'MAX\(CASE WHEN weekly_used IS NOT NULL THEN source_offset_end END\)' -or
         $indexerSource -match 'DataTable candidates = QueryRowsByOffsetRanges\(db, ReadOffsetRanges\([^;]+true\)') {
         throw 'INDEX CONTRACT FAILED: latest quota lookup must reduce historical rows inside SQLite'
+    }
+    $toolSchemaMatch = [regex]::Match($indexerSource, 'CREATE TABLE IF NOT EXISTS tool_records \(([^;]+)\)"')
+    if (-not $toolSchemaMatch.Success -or $toolSchemaMatch.Groups[1].Value -match '(?i)argument|prompt|output|url|content|command') {
+        throw 'PRIVACY CONTRACT FAILED: tool_records must contain metadata only'
+    }
+    if ($indexerSource -notmatch 'MightContainToolMetadata' -or
+        $indexerSource -notmatch 'BackfillRecentToolRecords' -or
+        $coreSource -notmatch 'Invoke-TokenRaderToolBackfill') {
+        throw 'TOOL CONTRACT FAILED: incremental detection or one-time seven-day backfill is missing'
+    }
+    foreach ($localOnlySource in @($uiSource, $coreSource, $indexerSource)) {
+        if ($localOnlySource -match '(?i)Invoke-WebRequest|Invoke-RestMethod|System\.Net\.HttpClient|HttpListener|TcpListener|WebProxy') {
+            throw 'LOCAL-ONLY CONTRACT FAILED: runtime network or reverse-proxy code was introduced'
+        }
     }
     if ($uiSource -match '\.BeginInvoke\(\s*\[System\.AsyncCallback\]') {
         throw 'UI CONTRACT FAILED: PowerShell has no compatible two-argument AsyncCallback BeginInvoke overload'

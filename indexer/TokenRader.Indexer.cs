@@ -51,6 +51,10 @@ internal sealed class TokenRaderJsonRateLimits
 internal sealed class TokenRaderJsonPayload
 {
     [DataMember(Name = "type", EmitDefaultValue = false)] public string Type { get; set; }
+    [DataMember(Name = "name", EmitDefaultValue = false)] public string Name { get; set; }
+    [DataMember(Name = "call_id", EmitDefaultValue = false)] public string CallId { get; set; }
+    [DataMember(Name = "id", EmitDefaultValue = false)] public string Id { get; set; }
+    [DataMember(Name = "status", EmitDefaultValue = false)] public string Status { get; set; }
     [DataMember(Name = "info", EmitDefaultValue = false)] public TokenRaderJsonInfo Info { get; set; }
     [DataMember(Name = "rate_limits", EmitDefaultValue = false)] public TokenRaderJsonRateLimits RateLimits { get; set; }
 }
@@ -166,6 +170,49 @@ public sealed class TokenRaderUsageHistorySnapshot
         Models = "";
         ModelBreakdown = new TokenRaderUsageHistoryModelSnapshot[0];
     }
+}
+
+/// <summary>Compact aggregate for one locally observed tool/image category.</summary>
+public sealed class TokenRaderToolUsageItem
+{
+    public string EventKind { get; set; }
+    public string ToolName { get; set; }
+    public long Calls { get; set; }
+    public long Completed { get; set; }
+    public long Failed { get; set; }
+    public long ImageCount { get; set; }
+
+    public TokenRaderToolUsageItem()
+    {
+        EventKind = "";
+        ToolName = "";
+    }
+}
+
+/// <summary>Disk-backed tool/image totals for one rolling time window.</summary>
+public sealed class TokenRaderToolUsageAggregateResult
+{
+    public long TotalToolCalls { get; set; }
+    public long CompletedToolCalls { get; set; }
+    public long FailedToolCalls { get; set; }
+    public long InputImages { get; set; }
+    public long GeneratedImages { get; set; }
+    public long ComputerScreenshots { get; set; }
+    public TokenRaderToolUsageItem[] Items { get; set; }
+
+    public TokenRaderToolUsageAggregateResult()
+    {
+        Items = new TokenRaderToolUsageItem[0];
+    }
+}
+
+/// <summary>One-time recent-log metadata backfill diagnostics.</summary>
+public sealed class TokenRaderToolBackfillResult
+{
+    public int ProcessedFiles { get; set; }
+    public int CandidateFiles { get; set; }
+    public long DetectedRecords { get; set; }
+    public long ScannedBytes { get; set; }
 }
 
 /// <summary>
@@ -442,6 +489,18 @@ public static class TokenRaderIndexer
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_file_metadata_session ON file_metadata(session_id)";
             cmd.ExecuteNonQuery();
 
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS tool_records (event_key TEXT PRIMARY KEY, call_key TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', event_ticks INTEGER NOT NULL DEFAULT 0, timestamp TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', event_kind TEXT NOT NULL DEFAULT '', tool_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT '', image_count INTEGER NOT NULL DEFAULT 0, source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0)";
+            cmd.ExecuteNonQuery();
+            EnsureToolRecordColumn(db, "call_key", "TEXT NOT NULL DEFAULT ''");
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_tool_records_time ON tool_records(event_ticks)";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_tool_records_kind_name ON tool_records(event_kind,tool_name,event_ticks)";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_tool_records_source ON tool_records(source_path,source_offset_end)";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_tool_records_call ON tool_records(call_key,event_kind,event_ticks)";
+            cmd.ExecuteNonQuery();
+
             cmd.CommandText = "CREATE TABLE IF NOT EXISTS index_settings (key TEXT PRIMARY KEY, value TEXT)";
             cmd.ExecuteNonQuery();
             cmd.CommandText = "INSERT OR IGNORE INTO index_settings (key, value) VALUES ('IndexRevision', '0')";
@@ -569,6 +628,13 @@ public static class TokenRaderIndexer
         if (db == null) throw new ArgumentNullException("db");
         using (var tx = db.BeginTransaction())
         {
+            using (var toolCmd = db.CreateCommand())
+            {
+                toolCmd.Transaction = tx;
+                toolCmd.CommandText = "DELETE FROM tool_records WHERE event_ticks < @cutoff";
+                toolCmd.Parameters.AddWithValue("@cutoff", cutoffWindowEndTicks);
+                toolCmd.ExecuteNonQuery();
+            }
             using (var childCmd = db.CreateCommand())
             {
                 childCmd.Transaction = tx;
@@ -667,6 +733,22 @@ public static class TokenRaderIndexer
     private static readonly Regex _sessionIdFromPath = new Regex(
         @"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
         RegexOptions.Compiled);
+
+    private static readonly Regex _inputImageType = new Regex(
+        @"""type""\s*:\s*""(?:input_image|image_url|local_image)""",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly Regex _computerScreenshotType = new Regex(
+        @"""type""\s*:\s*""computer_screenshot""",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly HashSet<string> _canonicalToolCallTypes =
+        new HashSet<string>(new[] {
+            "function_call", "custom_tool_call", "tool_call", "local_shell_call", "shell_call",
+            "apply_patch_call", "web_search_call", "file_search_call", "computer_call",
+            "code_interpreter_call", "image_generation_call", "mcp_call", "mcp_tool_call",
+            "tool_search_call", "programmatic_tool_call"
+        }, StringComparer.OrdinalIgnoreCase);
 
     [ThreadStatic]
     private static DataContractJsonSerializer _jsonSerializer;
@@ -777,6 +859,21 @@ public static class TokenRaderIndexer
                             if (m.Success) currentModel = m.Groups[1].Value;
                             continue;
                         }
+                        if (MightContainToolMetadata(line))
+                        {
+                            try
+                            {
+                                IndexToolMetadataLine(db, tx, line, sessionId, effectiveRootSessionId,
+                                    currentModel, sourcePath, lineEndOffset, indexRevision, 0L);
+                            }
+                            catch
+                            {
+                                // Tool metadata is auxiliary. A malformed or
+                                // newly introduced event shape must never stop
+                                // token indexing or advance an incomplete file
+                                // cursor incorrectly.
+                            }
+                        }
                         if (!line.Contains("token_count")) continue;
 
                         try
@@ -858,6 +955,375 @@ public static class TokenRaderIndexer
             tx.Commit();
         }
         return count;
+    }
+
+    private static bool MightContainToolMetadata(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return false;
+        return line.IndexOf("function_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("custom_tool_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("tool_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("shell_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("apply_patch_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("search_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("computer_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("code_interpreter_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("image_generation_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("mcp_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("input_image", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("local_image", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("computer_screenshot", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static int IndexToolMetadataLine(
+        SQLiteConnection db,
+        SQLiteTransaction transaction,
+        string line,
+        string sessionId,
+        string rootSessionId,
+        string currentModel,
+        string sourcePath,
+        long sourceOffsetEnd,
+        long indexRevision,
+        long cutoffEventTicks)
+    {
+        TokenRaderJsonRecord record = DeserializeLogRecord(line);
+        if (record == null) return 0;
+        DateTimeOffset observedAt;
+        if (!TryParseTimestamp(record.Timestamp, out observedAt)) return 0;
+        long eventTicks = observedAt.UtcDateTime.Ticks;
+        if (cutoffEventTicks > 0L && eventTicks < cutoffEventTicks) return 0;
+
+        int detected = 0;
+        TokenRaderJsonPayload payload = record.Payload;
+        string payloadType = payload == null ? "" : (payload.Type ?? "");
+        string candidateType = string.IsNullOrWhiteSpace(payloadType) ? (record.Type ?? "") : payloadType;
+        if (_canonicalToolCallTypes.Contains(candidateType))
+        {
+            string status = NormalizeToolStatus(payload == null ? "" : payload.Status);
+            string toolName = ResolveToolName(candidateType, payload == null ? "" : payload.Name);
+            string eventKind = string.Equals(candidateType, "image_generation_call", StringComparison.OrdinalIgnoreCase)
+                ? "image_generation"
+                : "tool_call";
+            string callId = payload == null ? "" : (payload.CallId ?? "");
+            if (string.IsNullOrWhiteSpace(callId) && payload != null) callId = payload.Id ?? "";
+            string eventKey = BuildToolSourceEventKey(sourcePath, sourceOffsetEnd, eventKind, toolName);
+            int imageCount = eventKind == "image_generation" &&
+                status != "failed" && status != "in_progress" ? 1 : 0;
+            UpsertToolRecord(db, transaction, eventKey, callId, sessionId, eventTicks,
+                observedAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                currentModel, eventKind, toolName, status, imageCount,
+                sourcePath, sourceOffsetEnd, rootSessionId, indexRevision);
+            detected++;
+        }
+
+        int inputImages = _inputImageType.Matches(line).Count;
+        if (inputImages > 0)
+        {
+            UpsertToolRecord(db, transaction,
+                BuildToolSourceEventKey(sourcePath, sourceOffsetEnd, "image_input", "image_input"),
+                "", sessionId, eventTicks, observedAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                currentModel, "image_input", "image_input", "observed", inputImages,
+                sourcePath, sourceOffsetEnd, rootSessionId, indexRevision);
+            detected++;
+        }
+
+        int screenshots = _computerScreenshotType.Matches(line).Count;
+        if (screenshots > 0)
+        {
+            UpsertToolRecord(db, transaction,
+                BuildToolSourceEventKey(sourcePath, sourceOffsetEnd, "computer_screenshot", "computer_screenshot"),
+                "", sessionId, eventTicks, observedAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+                currentModel, "computer_screenshot", "computer_screenshot", "observed", screenshots,
+                sourcePath, sourceOffsetEnd, rootSessionId, indexRevision);
+            detected++;
+        }
+        return detected;
+    }
+
+    private static string NormalizeToolStatus(string status)
+    {
+        string normalized = (status ?? "").Trim().ToLowerInvariant();
+        if (normalized == "completed" || normalized == "success" || normalized == "succeeded") return "completed";
+        if (normalized == "failed" || normalized == "error" || normalized == "cancelled" || normalized == "canceled") return "failed";
+        if (normalized == "in_progress" || normalized == "running" || normalized == "started") return "in_progress";
+        return "observed";
+    }
+
+    private static string ResolveToolName(string callType, string payloadName)
+    {
+        if (!string.IsNullOrWhiteSpace(payloadName)) return payloadName.Trim();
+        string value = (callType ?? "tool_call").Trim().ToLowerInvariant();
+        if (value.EndsWith("_call", StringComparison.Ordinal)) value = value.Substring(0, value.Length - 5);
+        return value.Length == 0 ? "tool" : value;
+    }
+
+    private static string BuildToolSourceEventKey(
+        string sourcePath, long sourceOffsetEnd, string eventKind, string toolName)
+    {
+        return "source|" + (sourcePath ?? "").ToLowerInvariant() + "|" +
+            sourceOffsetEnd.ToString(CultureInfo.InvariantCulture) + "|" +
+            (eventKind ?? "").ToLowerInvariant() + "|" + (toolName ?? "").ToLowerInvariant();
+    }
+
+    private static void UpsertToolRecord(
+        SQLiteConnection db,
+        SQLiteTransaction transaction,
+        string eventKey,
+        string callKey,
+        string sessionId,
+        long eventTicks,
+        string timestamp,
+        string model,
+        string eventKind,
+        string toolName,
+        string status,
+        int imageCount,
+        string sourcePath,
+        long sourceOffsetEnd,
+        string rootSessionId,
+        long indexRevision)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.Transaction = transaction;
+            cmd.CommandText =
+                "INSERT OR REPLACE INTO tool_records (event_key,call_key,session_id,event_ticks,timestamp,model,event_kind,tool_name,status,image_count,source_path,source_offset_end,root_session_id,index_revision) " +
+                "VALUES (@key,@call,@session,@ticks,@timestamp,@model,@kind,@name,@status,@images,@path,@offset,@root,@revision)";
+            cmd.Parameters.AddWithValue("@key", eventKey ?? "");
+            cmd.Parameters.AddWithValue("@call", callKey ?? "");
+            cmd.Parameters.AddWithValue("@session", sessionId ?? "");
+            cmd.Parameters.AddWithValue("@ticks", eventTicks);
+            cmd.Parameters.AddWithValue("@timestamp", timestamp ?? "");
+            cmd.Parameters.AddWithValue("@model", model ?? "");
+            cmd.Parameters.AddWithValue("@kind", eventKind ?? "");
+            cmd.Parameters.AddWithValue("@name", toolName ?? "");
+            cmd.Parameters.AddWithValue("@status", status ?? "observed");
+            cmd.Parameters.AddWithValue("@images", Math.Max(0, imageCount));
+            cmd.Parameters.AddWithValue("@path", sourcePath ?? "");
+            cmd.Parameters.AddWithValue("@offset", sourceOffsetEnd);
+            cmd.Parameters.AddWithValue("@root", rootSessionId ?? "");
+            cmd.Parameters.AddWithValue("@revision", indexRevision);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public static TokenRaderToolUsageAggregateResult AggregateToolUsage(
+        SQLiteConnection db, DateTimeOffset startedAt, DateTimeOffset endedAt)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        if (endedAt <= startedAt) throw new ArgumentException("endedAt must be later than startedAt");
+        var result = new TokenRaderToolUsageAggregateResult();
+        var observed = new Dictionary<string, ToolObservedRecord>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT event_key,call_key,event_kind,tool_name,status,image_count,event_ticks " +
+                "FROM tool_records WHERE event_ticks>=@start AND event_ticks<@end " +
+                "ORDER BY event_ticks ASC,event_key ASC";
+            cmd.Parameters.AddWithValue("@start", startedAt.UtcDateTime.Ticks);
+            cmd.Parameters.AddWithValue("@end", endedAt.UtcDateTime.Ticks);
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string eventKey = ReadReaderString(reader, 0);
+                    string callKey = ReadReaderString(reader, 1);
+                    string kind = ReadReaderString(reader, 2);
+                    string name = ReadReaderString(reader, 3);
+                    string status = ReadReaderString(reader, 4);
+                    long images = ReadReaderInt64(reader, 5);
+                    long ticks = ReadReaderInt64(reader, 6);
+                    string identity = !string.IsNullOrWhiteSpace(callKey) &&
+                        (kind == "tool_call" || kind == "image_generation")
+                        ? "call|" + kind + "|" + callKey
+                        : eventKey;
+                    ToolObservedRecord current;
+                    if (!observed.TryGetValue(identity, out current))
+                    {
+                        observed[identity] = new ToolObservedRecord {
+                            EventKind = kind, ToolName = name, Status = status,
+                            ImageCount = images, EventTicks = ticks
+                        };
+                    }
+                    else if (GetToolStatusRank(status) > GetToolStatusRank(current.Status) ||
+                        (GetToolStatusRank(status) == GetToolStatusRank(current.Status) && ticks >= current.EventTicks))
+                    {
+                        current.EventKind = kind;
+                        current.ToolName = name;
+                        current.Status = status;
+                        current.ImageCount = Math.Max(current.ImageCount, images);
+                        current.EventTicks = ticks;
+                    }
+                }
+            }
+        }
+
+        var grouped = new Dictionary<string, TokenRaderToolUsageItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (ToolObservedRecord record in observed.Values)
+        {
+            string groupKey = record.EventKind + "|" + record.ToolName;
+            TokenRaderToolUsageItem item;
+            if (!grouped.TryGetValue(groupKey, out item))
+            {
+                item = new TokenRaderToolUsageItem {
+                    EventKind = record.EventKind,
+                    ToolName = record.ToolName
+                };
+                grouped[groupKey] = item;
+            }
+            item.Calls++;
+            if (record.Status == "completed") item.Completed++;
+            else if (record.Status == "failed") item.Failed++;
+            item.ImageCount += record.ImageCount;
+        }
+        var items = new List<TokenRaderToolUsageItem>(grouped.Values);
+        items.Sort(delegate(TokenRaderToolUsageItem left, TokenRaderToolUsageItem right) {
+            int kindComparison = StringComparer.OrdinalIgnoreCase.Compare(left.EventKind, right.EventKind);
+            return kindComparison != 0 ? kindComparison : StringComparer.OrdinalIgnoreCase.Compare(left.ToolName, right.ToolName);
+        });
+        foreach (TokenRaderToolUsageItem item in items)
+        {
+            if (item.EventKind == "tool_call" || item.EventKind == "image_generation")
+            {
+                result.TotalToolCalls += item.Calls;
+                result.CompletedToolCalls += item.Completed;
+                result.FailedToolCalls += item.Failed;
+            }
+            if (item.EventKind == "image_input") result.InputImages += item.ImageCount;
+            else if (item.EventKind == "image_generation") result.GeneratedImages += item.ImageCount;
+            else if (item.EventKind == "computer_screenshot") result.ComputerScreenshots += item.ImageCount;
+        }
+        result.Items = items.ToArray();
+        return result;
+    }
+
+    private sealed class ToolObservedRecord
+    {
+        public string EventKind;
+        public string ToolName;
+        public string Status;
+        public long ImageCount;
+        public long EventTicks;
+    }
+
+    private static int GetToolStatusRank(string status)
+    {
+        if (status == "completed" || status == "failed") return 3;
+        if (status == "observed") return 2;
+        if (status == "in_progress") return 1;
+        return 0;
+    }
+
+    public static int GetToolRecordCount(SQLiteConnection db)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(*) FROM tool_records";
+            return Convert.ToInt32(cmd.ExecuteScalar(), CultureInfo.InvariantCulture);
+        }
+    }
+
+    public static TokenRaderToolBackfillResult BackfillRecentToolRecords(
+        SQLiteConnection db,
+        long cutoffEventTicks,
+        long indexRevision,
+        CancellationToken cancellationToken,
+        IDictionary progressState = null)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        var files = new List<ToolBackfillFile>();
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT path,session_id,root_session_id FROM file_metadata " +
+                "WHERE content_retained<>0 AND last_write_ticks>=@cutoff ORDER BY last_write_ticks ASC,path ASC";
+            cmd.Parameters.AddWithValue("@cutoff", cutoffEventTicks);
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    files.Add(new ToolBackfillFile {
+                        Path = ReadReaderString(reader, 0),
+                        SessionId = ReadReaderString(reader, 1),
+                        RootSessionId = ReadReaderString(reader, 2)
+                    });
+                }
+            }
+        }
+
+        var result = new TokenRaderToolBackfillResult { CandidateFiles = files.Count };
+        SetToolBackfillProgress(progressState, "扫描最近7天工具元数据", 0, files.Count, 0L);
+        for (int fileIndex = 0; fileIndex < files.Count; fileIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ToolBackfillFile file = files[fileIndex];
+            if (string.IsNullOrWhiteSpace(file.Path) || !File.Exists(file.Path)) continue;
+            long length;
+            try { length = new FileInfo(file.Path).Length; }
+            catch (IOException) { continue; }
+            catch (UnauthorizedAccessException) { continue; }
+            string sessionId = string.IsNullOrWhiteSpace(file.SessionId) ? ExtractSessionId(file.Path) : file.SessionId;
+            string rootSessionId = string.IsNullOrWhiteSpace(file.RootSessionId) ? sessionId : file.RootSessionId;
+            int detectedInFile = 0;
+            using (var tx = db.BeginTransaction())
+            using (var stream = new FileStream(file.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var lineReader = new Utf8JsonlLineReader(stream, 0L, Math.Min(length, stream.Length)))
+            {
+                string currentModel = "";
+                string line; long lineEndOffset; bool lineTerminated;
+                while (lineReader.ReadLine(out line, out lineEndOffset, out lineTerminated))
+                {
+                    if (!lineTerminated) break;
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    line = line.TrimStart('\uFEFF');
+                    if (line.Contains("turn_context"))
+                    {
+                        var modelMatch = _turnContextModel.Match(line);
+                        if (modelMatch.Success) currentModel = modelMatch.Groups[1].Value;
+                        continue;
+                    }
+                    if (!MightContainToolMetadata(line)) continue;
+                    try
+                    {
+                        detectedInFile += IndexToolMetadataLine(db, tx, line, sessionId, rootSessionId,
+                            currentModel, GetCanonicalPath(file.Path), lineEndOffset, indexRevision, cutoffEventTicks);
+                    }
+                    catch { }
+                }
+                tx.Commit();
+            }
+            result.ProcessedFiles++;
+            result.DetectedRecords += detectedInFile;
+            result.ScannedBytes += length;
+            SetToolBackfillProgress(progressState, "扫描最近7天工具元数据",
+                result.ProcessedFiles, files.Count, result.DetectedRecords);
+        }
+        SetToolBackfillProgress(progressState, "工具元数据回填完成",
+            result.ProcessedFiles, files.Count, result.DetectedRecords);
+        return result;
+    }
+
+    private sealed class ToolBackfillFile
+    {
+        public string Path;
+        public string SessionId;
+        public string RootSessionId;
+    }
+
+    private static void SetToolBackfillProgress(
+        IDictionary progressState, string stage, int processedFiles, int totalFiles, long detectedRecords)
+    {
+        if (progressState == null) return;
+        try
+        {
+            progressState["Stage"] = stage;
+            progressState["ProcessedFiles"] = processedFiles;
+            progressState["TotalFiles"] = totalFiles;
+            progressState["DetectedRecords"] = detectedRecords;
+            progressState["LastProgressAt"] = DateTimeOffset.Now;
+        }
+        catch { }
     }
 
     // ── Queries ─────────────────────────────────────────────────────────
@@ -1964,6 +2430,7 @@ public static class TokenRaderIndexer
         using (var tx = db.BeginTransaction())
         using (var metadata = db.CreateCommand())
         using (var records = db.CreateCommand())
+        using (var toolRecords = db.CreateCommand())
         {
             metadata.Transaction = tx;
             metadata.CommandText =
@@ -1980,6 +2447,14 @@ public static class TokenRaderIndexer
             records.Parameters.Add(new SQLiteParameter("@revision"));
             records.Parameters.Add(new SQLiteParameter("@session"));
 
+            toolRecords.Transaction = tx;
+            toolRecords.CommandText =
+                "UPDATE tool_records SET root_session_id=@root,index_revision=@revision " +
+                "WHERE session_id=@session AND (root_session_id IS NULL OR root_session_id<>@root)";
+            toolRecords.Parameters.Add(new SQLiteParameter("@root"));
+            toolRecords.Parameters.Add(new SQLiteParameter("@revision"));
+            toolRecords.Parameters.Add(new SQLiteParameter("@session"));
+
             foreach (DictionaryEntry entry in sessionRoots)
             {
                 string session = entry.Key == null ? "" : Convert.ToString(entry.Key, CultureInfo.InvariantCulture);
@@ -1994,6 +2469,11 @@ public static class TokenRaderIndexer
                 records.Parameters["@revision"].Value = Math.Max(0L, indexRevision);
                 records.Parameters["@session"].Value = session;
                 affected += records.ExecuteNonQuery();
+
+                toolRecords.Parameters["@root"].Value = root;
+                toolRecords.Parameters["@revision"].Value = Math.Max(0L, indexRevision);
+                toolRecords.Parameters["@session"].Value = session;
+                affected += toolRecords.ExecuteNonQuery();
             }
             tx.Commit();
         }
@@ -2071,6 +2551,18 @@ public static class TokenRaderIndexer
         {
             cmd.CommandText = "DELETE FROM token_records WHERE session_id = @p";
             cmd.Parameters.AddWithValue("@p", sessionId);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>删除某个源日志的工具/图片元数据；不接触原始 JSONL。</summary>
+    public static int DeleteToolRecordsBySourcePath(SQLiteConnection db, string sourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath)) return 0;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "DELETE FROM tool_records WHERE source_path = @path";
+            cmd.Parameters.AddWithValue("@path", sourcePath);
             return cmd.ExecuteNonQuery();
         }
     }
@@ -2620,6 +3112,33 @@ public static class TokenRaderIndexer
             // Column names and definitions are private constants at every
             // call site; no user-provided SQL is interpolated here.
             cmd.CommandText = "ALTER TABLE token_records ADD COLUMN " + columnName + " " + columnDefinition;
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    private static void EnsureToolRecordColumn(SQLiteConnection db, string columnName, string columnDefinition)
+    {
+        bool exists = false;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(tool_records)";
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string existingName = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                    if (string.Equals(existingName, columnName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (exists) return;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "ALTER TABLE tool_records ADD COLUMN " + columnName + " " + columnDefinition;
             cmd.ExecuteNonQuery();
         }
     }

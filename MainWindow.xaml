@@ -407,6 +407,60 @@
                         </Grid>
                     </Border>
 
+                    <Border Style="{StaticResource CardStyle}" Margin="4,6,4,8" Padding="18">
+                        <StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel>
+                                    <TextBlock Text="图片与工具用量" FontSize="16" FontWeight="SemiBold"/>
+                                    <TextBlock Text="与上方所选滚动24小时窗口一致 · 仅保存调用元数据" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,3,0,0"/>
+                                </StackPanel>
+                                <Button x:Name="BackfillToolUsageButton" Grid.Column="1" Content="回填最近7天工具记录" Padding="10,6" FontSize="11"/>
+                            </Grid>
+                            <UniformGrid Columns="4" Margin="0,14,0,0">
+                                <Border Background="#101B22" CornerRadius="9" Padding="12" Margin="0,0,4,0">
+                                    <StackPanel>
+                                        <TextBlock Text="工具调用" Foreground="{StaticResource MutedBrush}" FontSize="9"/>
+                                        <TextBlock x:Name="ToolCallCountText" Text="0" Foreground="#F4F7FA" FontSize="22" FontWeight="SemiBold" Margin="0,5,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                                <Border Background="#101B22" CornerRadius="9" Padding="12" Margin="2,0">
+                                    <StackPanel>
+                                        <TextBlock Text="输入图片" Foreground="{StaticResource MutedBrush}" FontSize="9"/>
+                                        <TextBlock x:Name="InputImageCountText" Text="0" Foreground="#7BC4FF" FontSize="22" FontWeight="SemiBold" Margin="0,5,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                                <Border Background="#101B22" CornerRadius="9" Padding="12" Margin="2,0">
+                                    <StackPanel>
+                                        <TextBlock Text="生成图片" Foreground="{StaticResource MutedBrush}" FontSize="9"/>
+                                        <TextBlock x:Name="GeneratedImageCountText" Text="0" Foreground="{StaticResource AccentBrush}" FontSize="22" FontWeight="SemiBold" Margin="0,5,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                                <Border Background="#101B22" CornerRadius="9" Padding="12" Margin="4,0,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="电脑截图" Foreground="{StaticResource MutedBrush}" FontSize="9"/>
+                                        <TextBlock x:Name="ComputerScreenshotCountText" Text="0" Foreground="#C9A7FF" FontSize="22" FontWeight="SemiBold" Margin="0,5,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                            </UniformGrid>
+                            <DataGrid x:Name="ToolUsageGrid" AutoGenerateColumns="False" Height="150" AlternationCount="2" Margin="0,12,0,0">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="类别" Binding="{Binding Kind}" Width="120"/>
+                                    <DataGridTextColumn Header="工具" Binding="{Binding Tool}" Width="*"/>
+                                    <DataGridTextColumn Header="次数" Binding="{Binding Calls}" Width="80"/>
+                                    <DataGridTextColumn Header="完成" Binding="{Binding Completed}" Width="80"/>
+                                    <DataGridTextColumn Header="失败" Binding="{Binding Failed}" Width="80"/>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                            <TextBlock x:Name="ToolUsageStatusText" Text="等待本地工具元数据" Foreground="#78909A" FontSize="9" Margin="1,8,0,0" TextWrapping="Wrap"/>
+                            <TextBlock Text="工具参数、命令、图片内容、URL和输出正文均不保存；本地日志缺少统一计费参数，因此次数不并入美元总额。"
+                                       Foreground="#6F858F" FontSize="9" Margin="1,4,0,0" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
                     <Border Margin="4,14,4,8" CornerRadius="15" BorderBrush="#28554C" BorderThickness="1">
                         <Border.Background>
                             <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
