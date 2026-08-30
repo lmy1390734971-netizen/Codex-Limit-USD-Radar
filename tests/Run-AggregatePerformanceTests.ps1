@@ -66,6 +66,29 @@ VALUES
     } finally { $command.Dispose() }
 }
 
+function Add-TestAggregateRelationship {
+    param(
+        [Parameter(Mandatory = $true)]$Connection,
+        [string]$SessionId,
+        [string]$ParentId,
+        [string]$RootId,
+        [string]$SourcePath
+    )
+    $command = $Connection.CreateCommand()
+    try {
+        $command.CommandText = @'
+INSERT OR REPLACE INTO file_metadata
+(path,length,last_write_ticks,parsed_offset,session_id,cwd,parent_thread_id,forked_from_id,content_retained,root_session_id)
+VALUES (@path,10,0,10,@session,'',@parent,@parent,1,@root)
+'@
+        [void]$command.Parameters.AddWithValue('@path', $SourcePath)
+        [void]$command.Parameters.AddWithValue('@session', $SessionId)
+        [void]$command.Parameters.AddWithValue('@parent', $ParentId)
+        [void]$command.Parameters.AddWithValue('@root', $RootId)
+        [void]$command.ExecuteNonQuery()
+    } finally { $command.Dispose() }
+}
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $sqliteDll = Join-Path $projectRoot 'indexer\System.Data.SQLite.dll'
 $indexerDll = Join-Path $projectRoot 'indexer\TokenRader.Indexer.dll'
@@ -85,6 +108,8 @@ $correctness = New-Object System.Data.SQLite.SQLiteConnection 'Data Source=:memo
 $correctness.Open()
 try {
     [TokenRaderIndexer]::CreateSchema($correctness)
+    Add-TestAggregateRelationship $correctness 'parent' 'root' 'root' 'synthetic://parent'
+    Add-TestAggregateRelationship $correctness 'child' 'parent' 'root' 'synthetic://child'
     Add-TestAggregateRow $correctness 'parent' '2026-08-28T00:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://parent' 10 'root'
     Add-TestAggregateRow $correctness 'child' '2026-08-28T00:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://child' 10 'root'
     Add-TestAggregateRow $correctness 'parent' '2026-08-28T00:00:01Z' 'gpt-5.5' 2000 200 200 1000 100 100 'fp-standard-2' 'synthetic://parent' 20 'root'
@@ -133,6 +158,18 @@ try {
     $withNewFile = [TokenRaderIndexer]::AggregateIntervalRecords(
         $correctness, $starts, ($ends + @{ 'synthetic://new' = 10L }), $startedAt, $thresholds, $none, $null)
     Assert-AggregateTest ($withNewFile.CountedEvents -eq 5) 'end-only file did not start at byte zero'
+
+    # Equal usage at the exact same timestamp in two sibling subagents is two
+    # independent calls. Shared task root alone must not collapse them.
+    Add-TestAggregateRelationship $correctness 'sibling-a' 'sibling-root' 'sibling-root' 'synthetic://sibling-a'
+    Add-TestAggregateRelationship $correctness 'sibling-b' 'sibling-root' 'sibling-root' 'synthetic://sibling-b'
+    Add-TestAggregateRow $correctness 'sibling-a' '2026-08-28T00:00:10.1234567Z' 'gpt-5.5' 700 70 70 700 70 70 'fp-sibling' 'synthetic://sibling-a' 10 'sibling-root'
+    Add-TestAggregateRow $correctness 'sibling-b' '2026-08-28T00:00:10.1234567Z' 'gpt-5.5' 700 70 70 700 70 70 'fp-sibling' 'synthetic://sibling-b' 10 'sibling-root'
+    $siblings = [TokenRaderIndexer]::AggregateIntervalRecords(
+        $correctness, @{}, @{ 'synthetic://sibling-a' = 10L; 'synthetic://sibling-b' = 10L },
+        $startedAt, $thresholds, $none, $null)
+    Assert-AggregateTest ($siblings.RawEvents -eq 2 -and $siblings.CountedEvents -eq 2) 'independent sibling calls were collapsed by shared-root deduplication'
+    Assert-AggregateTest ($siblings.TotalInput -eq 1400 -and $siblings.TotalOutput -eq 140) 'independent sibling token totals changed'
 
     $cancelled = [Threading.CancellationTokenSource]::new()
     try {

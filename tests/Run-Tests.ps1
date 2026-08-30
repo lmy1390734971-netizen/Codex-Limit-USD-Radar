@@ -492,7 +492,21 @@ try {
     $indexedParityLegacy = Get-TokenRaderIntervalResult -Baseline $indexedParityBaseline -PricingDocument $prices -EndOffsets $indexedParityEnd.EndOffsets
     $indexedParityCompiled = Get-TokenRaderIndexedIntervalResult -Baseline $indexedParityBaseline -PricingDocument $prices `
         -EndOffsets $indexedParityEnd.EndOffsets -EndRevision $indexedParityEnd.EndRevision -ScanRateLimits $false
-    Assert-Equal 4 $indexedParityCompiled.CountedEvents 'compiled aggregator drops refresh snapshots and keeps real equal-usage calls'
+    if ([Int64]$indexedParityCompiled.CountedEvents -ne 4L) {
+        $parityDebugRows = QueryIntervalRecords -StartOffsets $indexedParityBaseline.StartOffsets -EndOffsets $indexedParityEnd.EndOffsets -SessionsRoot $indexedParityRoot
+        $parityDebug = if ($null -eq $parityDebugRows) { 'none' } else {
+            @($parityDebugRows.Rows | ForEach-Object {
+                '{0}:{1}:{2}' -f [Int64]$_['source_offset_end'], [Int64]$_['total_input'], [string]$_['model']
+            }) -join ','
+        }
+        throw ('ASSERT FAILED: compiled aggregator drops refresh snapshots and keeps real equal-usage calls. Expected=[4] Actual=[{0}] Raw=[{1}] Duplicate=[{2}] Processed=[{3}] StartPaths=[{4}] StartOffset=[{5}] EndOffset=[{6}]' -f
+            $indexedParityCompiled.CountedEvents, $indexedParityCompiled.RawEvents,
+            $indexedParityCompiled.DuplicateEventsDropped, $indexedParityCompiled.ProcessedRows,
+            @($indexedParityBaseline.StartOffsets.Keys).Count,
+            $(if ($indexedParityBaseline.StartOffsets.ContainsKey($indexedParityPath)) { [Int64]$indexedParityBaseline.StartOffsets[$indexedParityPath] } else { -1 }),
+            $(if ($indexedParityEnd.EndOffsets.ContainsKey($indexedParityPath)) { [Int64]$indexedParityEnd.EndOffsets[$indexedParityPath] } else { -1 })) +
+            ' Rows=[' + $parityDebug + ']'
+    }
     Assert-Equal 1 $indexedParityCompiled.DuplicateEventsDropped 'compiled aggregator diagnoses one timestamp-only cumulative repeat'
     Assert-Equal $indexedParityLegacy.CountedEvents $indexedParityCompiled.CountedEvents 'compiled and legacy event count parity'
     Assert-Equal $indexedParityLegacy.Usage.Input $indexedParityCompiled.Usage.Input 'compiled and legacy input parity'
@@ -1216,6 +1230,130 @@ try {
         throw 'INDEX TEST FAILED: Clear-TokenRaderIndex left the private test database behind'
     }
     Assert-Equal $previousIndexOverride ([Environment]::GetEnvironmentVariable('TOKEN_RADER_INDEX_DB', 'Process')) 'index database override environment restoration'
+
+    # --- Ultra/multi-agent concurrency correctness ---
+    # Build a separate synthetic index in deliberately reversed task-tree
+    # order. No real Codex log or account data is read by this fixture.
+    $parallelRoot = Join-Path $tempRoot 'parallel-index-project'
+    $parallelSessions = Join-Path $parallelRoot 'sessions'
+    $parallelPrivate = Join-Path $parallelRoot 'data\private\index'
+    New-Item -ItemType Directory -Path $parallelSessions -Force | Out-Null
+    New-Item -ItemType Directory -Path $parallelPrivate -Force | Out-Null
+    $parallelDb = Join-Path $parallelPrivate 'index.db'
+    $parallelPreviousOverride = [Environment]::GetEnvironmentVariable('TOKEN_RADER_INDEX_DB', 'Process')
+    $parallelLeftBehind = $false
+    try {
+        $env:TOKEN_RADER_INDEX_DB = $parallelDb
+        $parallelAt = [DateTimeOffset]::UtcNow
+        $parallelRootId = '71000000-0000-0000-0000-000000000001'
+        $parallelChildId = '71000000-0000-0000-0000-000000000002'
+        $parallelGrandId = '71000000-0000-0000-0000-000000000003'
+        $parallelRootPath = Join-Path $parallelSessions ('rollout-' + $parallelRootId + '.jsonl')
+        $parallelChildPath = Join-Path $parallelSessions ('rollout-' + $parallelChildId + '.jsonl')
+        $parallelGrandPath = Join-Path $parallelSessions ('rollout-' + $parallelGrandId + '.jsonl')
+        $parallelUtf8 = New-Object Text.UTF8Encoding($false)
+        $writeParallelLog = {
+            param([string]$Path, [string]$SessionId, [string]$ParentId)
+            $metadata = [ordered]@{ id = $SessionId; cwd = $parallelRoot; model_provider = 'openai' }
+            if (-not [string]::IsNullOrWhiteSpace($ParentId)) {
+                $metadata['parent_thread_id'] = $ParentId
+                $metadata['forked_from_id'] = $ParentId
+            }
+            $records = @(
+                [ordered]@{ timestamp = $parallelAt.AddSeconds(-2).ToString('o'); type = 'session_meta'; payload = $metadata },
+                [ordered]@{ timestamp = $parallelAt.AddSeconds(-1).ToString('o'); type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.5' } },
+                (New-TestTokenRecord -Timestamp $parallelAt.ToString('o') -TotalInput 1000 -TotalCached 100 -TotalOutput 100 -CallInput 1000 -CallCached 100 -CallOutput 100)
+            )
+            $content = (@($records | ForEach-Object { $_ | ConvertTo-Json -Depth 10 -Compress }) -join [Environment]::NewLine) + [Environment]::NewLine
+            [IO.File]::WriteAllText($Path, $content, $parallelUtf8)
+        }
+
+        New-TokenRaderIndex -SessionsRoot $parallelSessions -Force | Out-Null
+        & $writeParallelLog $parallelGrandPath $parallelGrandId $parallelChildId
+        Update-TokenRaderIndex -SessionsRoot $parallelSessions -CandidateFiles @($parallelGrandPath) | Out-Null
+        & $writeParallelLog $parallelChildPath $parallelChildId $parallelRootId
+        Update-TokenRaderIndex -SessionsRoot $parallelSessions -CandidateFiles @($parallelChildPath) | Out-Null
+        & $writeParallelLog $parallelRootPath $parallelRootId ''
+        Update-TokenRaderIndex -SessionsRoot $parallelSessions -CandidateFiles @($parallelRootPath) | Out-Null
+
+        $parallelIndex = Get-TokenRaderIndex
+        $parallelCursorTable = [TokenRaderIndexer]::CaptureFileCursorTable($parallelIndex.Connection)
+        $parallelRoots = @{}
+        foreach ($row in @($parallelCursorTable.Rows)) { $parallelRoots[[string]$row['session_id']] = [string]$row['root_session_id'] }
+        Assert-Equal $parallelRootId ([string]$parallelRoots[$parallelRootId]) 'root task keeps its canonical root'
+        Assert-Equal $parallelRootId ([string]$parallelRoots[$parallelChildId]) 'child task resolves to canonical root'
+        Assert-Equal $parallelRootId ([string]$parallelRoots[$parallelGrandId]) 'grandchild root is backfilled after late parent arrival'
+        $parallelEnds = [TokenRaderIndexer]::CaptureFileCursorOffsets($parallelIndex.Connection)
+        $parallelAggregate = [TokenRaderIndexer]::AggregateIntervalRecords(
+            $parallelIndex.Connection, @{}, $parallelEnds, $parallelAt.AddMinutes(-1), @{},
+            [Threading.CancellationToken]::None, $null)
+        Assert-Equal 3 ([Int64]$parallelAggregate.RawEvents) 'nested copied event raw row count'
+        Assert-Equal 1 ([Int64]$parallelAggregate.CountedEvents) 'late-parent nested copies are counted once'
+        Assert-Equal 1000 ([Int64]$parallelAggregate.TotalInput) 'late-parent nested copy token total'
+
+        # A drained candidate that is temporarily locked must be reported and
+        # requeued. Releasing the lock and running an ordinary update must
+        # import it without another filesystem notification.
+        $parallelBaseline = CaptureMeasurementBaseline -SessionsRoot $parallelSessions
+        $parallelAppendAt = [DateTimeOffset]::UtcNow.AddMilliseconds(10)
+        $parallelAppend = New-TestTokenRecord -Timestamp $parallelAppendAt.ToString('o') -TotalInput 2000 -TotalCached 200 -TotalOutput 200 -CallInput 1000 -CallCached 100 -CallOutput 100
+        [IO.File]::AppendAllText($parallelRootPath, (($parallelAppend | ConvertTo-Json -Depth 10 -Compress) + [Environment]::NewLine), $parallelUtf8)
+        $exclusive = [IO.File]::Open($parallelRootPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        try {
+            $incomplete = Update-TokenRaderIndex -SessionsRoot $parallelSessions -CandidateFiles @($parallelRootPath) -AllowIncomplete
+        } finally { $exclusive.Dispose() }
+        Assert-Equal $false ([bool]$incomplete.SyncComplete) 'temporarily locked candidate is not reported as a complete sync'
+        Assert-Equal 1 @($incomplete.LastFailedFiles).Count 'temporarily locked candidate remains queued once'
+        Update-TokenRaderIndex -SessionsRoot $parallelSessions | Out-Null
+        $afterRetryOffsets = [TokenRaderIndexer]::CaptureFileCursorOffsets((Get-TokenRaderIndex).Connection)
+        Assert-Equal ([Int64](Get-Item -LiteralPath $parallelRootPath).Length) ([Int64]$afterRetryOffsets[$parallelRootPath]) 'requeued candidate imports after its lock is released'
+
+        # Simulate a delayed/lost watcher notification by draining it manually.
+        # Boundary capture must still find the completed line via lightweight
+        # full reconciliation before it freezes EndOffsets.
+        $parallelAppend2 = New-TestTokenRecord -Timestamp $parallelAppendAt.AddMilliseconds(10).ToString('o') -TotalInput 3000 -TotalCached 300 -TotalOutput 300 -CallInput 1000 -CallCached 100 -CallOutput 100
+        [IO.File]::AppendAllText($parallelRootPath, (($parallelAppend2 | ConvertTo-Json -Depth 10 -Compress) + [Environment]::NewLine), $parallelUtf8)
+        Start-Sleep -Milliseconds 50
+        [void][TokenRaderIndexer]::DrainChangedPaths($parallelSessions)
+        $parallelEnding = CaptureMeasurementEnd -Baseline $parallelBaseline
+        Assert-Equal ([Int64](Get-Item -LiteralPath $parallelRootPath).Length) ([Int64]$parallelEnding.EndOffsets[$parallelRootPath]) 'end boundary reconciles a missing watcher notification'
+        $parallelInterval = [TokenRaderIndexer]::AggregateIntervalRecords(
+            (Get-TokenRaderIndex).Connection, $parallelBaseline.StartOffsets, $parallelEnding.EndOffsets,
+            [DateTimeOffset]$parallelBaseline.StartedAt, @{}, [Threading.CancellationToken]::None, $null)
+        Assert-Equal 2 ([Int64]$parallelInterval.CountedEvents) 'stable end boundary retains both post-baseline calls'
+        Assert-Equal 2000 ([Int64]$parallelInterval.TotalInput) 'stable end boundary post-baseline token total'
+
+        # The writer lock must be exclusive even when a second acquisition is
+        # attempted independently, and the on-disk database must use WAL.
+        $lockProbePath = $parallelDb + '.lock-probe'
+        $firstWriterLock = [TokenRaderIndexer]::AcquireFileLock($lockProbePath, 100)
+        $secondWriterLock = $null
+        $secondWriterTimedOut = $false
+        try {
+            try { $secondWriterLock = [TokenRaderIndexer]::AcquireFileLock($lockProbePath, 150) }
+            catch {
+                $lockError = $_.Exception
+                while ($null -ne $lockError -and $lockError -isnot [TimeoutException]) { $lockError = $lockError.InnerException }
+                $secondWriterTimedOut = $null -ne $lockError
+            }
+        } finally {
+            if ($null -ne $secondWriterLock) { $secondWriterLock.Dispose() }
+            $firstWriterLock.Dispose()
+        }
+        Assert-Equal $true $secondWriterTimedOut 'cross-process writer lock rejects a concurrent writer'
+        $journalCommand = (Get-TokenRaderIndex).Connection.CreateCommand()
+        try { $journalCommand.CommandText = 'PRAGMA journal_mode'; $journalMode = [string]$journalCommand.ExecuteScalar() }
+        finally { $journalCommand.Dispose() }
+        Assert-Equal 'wal' $journalMode.ToLowerInvariant() 'persistent index enables SQLite WAL mode'
+    } finally {
+        try { Close-TokenRaderIndex } catch { }
+        try { Clear-TokenRaderIndex } catch { }
+        $parallelLeftBehind = Test-Path -LiteralPath $parallelDb
+        if ($null -eq $parallelPreviousOverride) { Remove-Item Env:TOKEN_RADER_INDEX_DB -ErrorAction SilentlyContinue }
+        else { $env:TOKEN_RADER_INDEX_DB = $parallelPreviousOverride }
+    }
+    if ($parallelLeftBehind) { throw 'INDEX TEST FAILED: parallel synthetic database was not cleared' }
+    Assert-Equal $parallelPreviousOverride ([Environment]::GetEnvironmentVariable('TOKEN_RADER_INDEX_DB', 'Process')) 'parallel index database override restoration'
 
     # --- Session tree signature stability ---
     $sigBefore = Get-TokenRaderSessionTreeSignature -SessionsRoot $cacheRoot

@@ -1593,9 +1593,29 @@ function Open-TokenRaderIndex {
 
     $dbPath = Get-TokenRaderIndexerDbPath
     $wasPresent = Test-Path -LiteralPath $dbPath
-    $conn = New-Object System.Data.SQLite.SQLiteConnection ('Data Source=' + $dbPath + ';Version=3;')
-    $conn.Open()
-    [TokenRaderIndexer]::CreateSchema($conn)
+    $schemaLock = [TokenRaderIndexer]::AcquireFileLock(($dbPath + '.lock'), 10000)
+    $conn = $null
+    try {
+        $conn = New-Object System.Data.SQLite.SQLiteConnection ('Data Source=' + $dbPath + ';Version=3;Default Timeout=30;')
+        $conn.Open()
+        $pragma = $conn.CreateCommand()
+        try {
+            # WAL lets readers retain a stable snapshot while another Radar
+            # process commits an index batch; busy_timeout handles brief SQLite
+            # lock hand-offs that occur before the explicit writer lock is held.
+            $pragma.CommandText = 'PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;'
+            [void]$pragma.ExecuteNonQuery()
+        } finally { $pragma.Dispose() }
+        [TokenRaderIndexer]::CreateSchema($conn)
+    } catch {
+        if ($null -ne $conn) {
+            try { $conn.Close(); $conn.Dispose() } catch { }
+            $conn = $null
+        }
+        throw
+    } finally {
+        if ($null -ne $schemaLock) { $schemaLock.Dispose() }
+    }
     try { [TokenRaderIndexer]::StartWatcher($canonicalRoot) } catch { }
     $metadata = [TokenRaderIndexer]::GetFileMetadata($conn)
     $catalogInitialized = [string][TokenRaderIndexer]::GetSetting($conn, 'catalog_initialized') -eq '1'
@@ -1615,6 +1635,10 @@ function Open-TokenRaderIndex {
         IndexedFileCount = [int]$metadata.Rows.Count
         LastImportedFiles = 0
         LastImportedRecords = 0
+        LastFailedFiles = @()
+        LastFailureMessages = @()
+        SyncComplete = $true
+        RootBackfilledRows = 0
     }
     return $script:TokenRaderIndex
 }
@@ -1680,6 +1704,9 @@ function Sync-TokenRaderIndexFiles {
         [hashtable]$ProgressState
     )
 
+    $crossProcessLock = $null
+    try {
+    $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$Index.DbPath + '.lock'), 10000)
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '读取索引游标'
         $ProgressState.ProcessedFiles = 0
@@ -1687,7 +1714,11 @@ function Sync-TokenRaderIndexFiles {
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
     }
     $conn = $Index.Connection
-    $metadataTable = [TokenRaderIndexer]::CaptureFileCursorTable($conn)
+    $candidateMetadataOnly = -not $FullReconcile -and $null -ne $CandidateFiles
+    $metadataTable = $null
+    if ($candidateMetadataOnly) {
+        $metadataTable = [TokenRaderIndexer]::CaptureFileCursorTableForPaths($conn, [System.Collections.IEnumerable]@($CandidateFiles))
+    } else { $metadataTable = [TokenRaderIndexer]::CaptureFileCursorTable($conn) }
     $known = ConvertTo-TokenRaderMetadataMap -Table $metadataTable
     $retentionCutoff = Get-TokenRaderIndexRetentionCutoff -Connection $conn
     if ($null -ne $ProgressState) {
@@ -1715,15 +1746,8 @@ function Sync-TokenRaderIndexFiles {
     }
     $seen = @{}
     $relationshipBySession = @{}
-    foreach ($row in @($metadataTable.Rows)) {
-        $sessionId = [string]$row['session_id']
-        if ([string]::IsNullOrWhiteSpace($sessionId)) { continue }
-        $relationshipBySession[$sessionId.ToLowerInvariant()] = [pscustomobject]@{
-            SessionId = $sessionId
-            ParentThreadId = [string]$row['parent_thread_id']
-            ForkedFromId = [string]$row['forked_from_id']
-        }
-    }
+    $storedRootBySession = @{}
+    $hasRelationshipChanges = $false
 
     $workItems = New-Object System.Collections.ArrayList
     $catalogProcessed = 0
@@ -1747,6 +1771,11 @@ function Sync-TokenRaderIndexFiles {
         if (-not [string]::IsNullOrWhiteSpace([string]$sessionMetadata.SessionId)) {
             $relationshipBySession[([string]$sessionMetadata.SessionId).ToLowerInvariant()] = $sessionMetadata
         }
+        $relationshipChanged = $null -eq $knownRow -or
+            -not [string]::Equals([string]$knownRow['session_id'], [string]$sessionMetadata.SessionId, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$knownRow['parent_thread_id'], [string]$sessionMetadata.ParentThreadId, [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$knownRow['forked_from_id'], [string]$sessionMetadata.ForkedFromId, [StringComparison]::OrdinalIgnoreCase)
+        if ($relationshipChanged) { $hasRelationshipChanges = $true }
         [void]$workItems.Add([pscustomobject]@{
             File = $file
             Canonical = $canonical
@@ -1754,7 +1783,29 @@ function Sync-TokenRaderIndexFiles {
             KnownRow = $knownRow
             Metadata = $sessionMetadata
             Unchanged = $unchanged
+            RelationshipChanged = $relationshipChanged
         })
+    }
+    if ($hasRelationshipChanges) {
+        # Relationship traversal/backfill is only needed when a candidate adds
+        # or changes task ancestry. Ordinary token appends reuse the already
+        # resolved root from their cursor row and avoid walking the whole
+        # catalog on every refresh.
+        $relationshipTable = $metadataTable
+        if ($candidateMetadataOnly) { $relationshipTable = [TokenRaderIndexer]::CaptureFileCursorTable($conn) }
+        foreach ($row in @($relationshipTable.Rows)) {
+            $sessionId = [string]$row['session_id']
+            if ([string]::IsNullOrWhiteSpace($sessionId)) { continue }
+            $sessionKey = $sessionId.ToLowerInvariant()
+            if (-not $relationshipBySession.ContainsKey($sessionKey)) {
+                $relationshipBySession[$sessionKey] = [pscustomobject]@{
+                    SessionId = $sessionId
+                    ParentThreadId = [string]$row['parent_thread_id']
+                    ForkedFromId = [string]$row['forked_from_id']
+                }
+            }
+            $storedRootBySession[$sessionKey] = [string]$row['root_session_id']
+        }
     }
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '处理变化日志'
@@ -1789,6 +1840,26 @@ function Sync-TokenRaderIndexFiles {
     $importedRecords = 0
     $changed = $false
     $nextRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($conn) + 1L
+    $failedFiles = New-Object System.Collections.ArrayList
+    $failureMessages = New-Object System.Collections.ArrayList
+    $canonicalRoots = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+    if ($hasRelationshipChanges) {
+        foreach ($relationship in @($relationshipBySession.Values)) {
+            $sessionId = [string]$relationship.SessionId
+            if ([string]::IsNullOrWhiteSpace($sessionId)) { continue }
+            $canonicalRoot = [string](& $resolveRoot $relationship)
+            $sessionKey = $sessionId.ToLowerInvariant()
+            if ($storedRootBySession.ContainsKey($sessionKey) -and
+                -not [string]::IsNullOrWhiteSpace($canonicalRoot) -and
+                -not [string]::Equals([string]$storedRootBySession[$sessionKey], $canonicalRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                $canonicalRoots[$sessionId] = $canonicalRoot
+            }
+        }
+    }
+    $rootBackfilledRows = if ($canonicalRoots.Count -gt 0) {
+        [int][TokenRaderIndexer]::BackfillSessionRoots($conn, $canonicalRoots, $nextRevision)
+    } else { 0 }
+    if ($rootBackfilledRows -gt 0) { $changed = $true }
     $workProcessed = 0
     foreach ($work in @($workItems)) {
         $workProcessed++
@@ -1800,7 +1871,10 @@ function Sync-TokenRaderIndexFiles {
         $canonical = [string]$work.Canonical
         $knownRow = $work.KnownRow
         $metadata = $work.Metadata
-        $rootSessionId = & $resolveRoot $metadata
+        $storedRoot = if ($null -ne $knownRow) { [string]$knownRow['root_session_id'] } else { '' }
+        $rootSessionId = if (-not [bool]$work.RelationshipChanged -and -not [string]::IsNullOrWhiteSpace($storedRoot)) {
+            $storedRoot
+        } else { & $resolveRoot $metadata }
         $length = [Int64]$file.Length
         $lastWrite = [Int64]$file.LastWriteTimeUtc.Ticks
         $startOffset = if ($null -ne $knownRow) { [Int64]$knownRow['parsed_offset'] } else { 0L }
@@ -1855,8 +1929,12 @@ function Sync-TokenRaderIndexFiles {
             $importedRecords += [int]$count
             $changed = $true
         } catch {
-            # parsed_offset is not advanced on failure; the changed path stays
-            # eligible for a later reconciliation.
+            # The watcher notification was already drained before this import.
+            # Put the path back so a transient lock or replacement can never
+            # silently disappear from the next synchronization attempt.
+            [void]$failedFiles.Add($canonical)
+            [void]$failureMessages.Add([string]$_.Exception.Message)
+            [TokenRaderIndexer]::RequeueChangedPath($SessionsRoot, $canonical)
             continue
         }
     }
@@ -1874,12 +1952,22 @@ function Sync-TokenRaderIndexFiles {
             $candidatePaths[$canonical.ToLowerInvariant()] = $canonical
         }
     }
-    if ($FullReconcile -or $null -ne $CandidateFiles) {
+    if ($FullReconcile) {
         foreach ($row in @($metadataTable.Rows)) {
             $path = [string]$row['path']
             $key = $path.ToLowerInvariant()
-            $shouldCheck = if ($FullReconcile) { -not $seen.ContainsKey($key) } else { $candidatePaths.ContainsKey($key) }
-            if (-not $shouldCheck -or (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            if ($seen.ContainsKey($key) -or (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $sessionId = [string]$row['session_id']
+            if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-TokenRaderSessionIdFromPath -FilePath $path }
+            [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $sessionId)
+            [TokenRaderIndexer]::RemoveFileMetadata($conn, $path)
+            $changed = $true
+        }
+    } elseif ($null -ne $CandidateFiles) {
+        foreach ($key in @($candidatePaths.Keys)) {
+            $path = [string]$candidatePaths[$key]
+            if ((Test-Path -LiteralPath $path -PathType Leaf) -or -not $known.ContainsKey($key)) { continue }
+            $row = $known[$key]
             $sessionId = [string]$row['session_id']
             if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = Get-TokenRaderSessionIdFromPath -FilePath $path }
             [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $sessionId)
@@ -1900,6 +1988,10 @@ function Sync-TokenRaderIndexFiles {
     $Index.IsNew = $false
     $Index.LastImportedFiles = $importedFiles
     $Index.LastImportedRecords = $importedRecords
+    $Index.LastFailedFiles = @($failedFiles)
+    $Index.LastFailureMessages = @($failureMessages)
+    $Index.SyncComplete = $failedFiles.Count -eq 0
+    $Index.RootBackfilledRows = $rootBackfilledRows
     $Index.IndexedFileCount = [int][TokenRaderIndexer]::GetFileCursorCount($conn)
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '同步完成'
@@ -1907,6 +1999,21 @@ function Sync-TokenRaderIndexFiles {
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
     }
     return $Index
+    } catch {
+        # Candidate watcher events may already have been drained before the
+        # cross-process lock or SQLite operation failed. Requeue the complete
+        # batch so a later refresh can retry it.
+        if ($null -ne $CandidateFiles) {
+            foreach ($candidate in @($CandidateFiles)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$candidate)) {
+                    [TokenRaderIndexer]::RequeueChangedPath($SessionsRoot, [string]$candidate)
+                }
+            }
+        }
+        throw
+    } finally {
+        if ($null -ne $crossProcessLock) { $crossProcessLock.Dispose() }
+    }
 }
 
 <#
@@ -1925,14 +2032,23 @@ function New-TokenRaderIndex {
 
     $dbPath = Get-TokenRaderIndexerDbPath
     if ($Force) {
-        Close-TokenRaderIndex
-        foreach ($suffix in @('', '-wal', '-shm')) {
-            $target = $dbPath + $suffix
-            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction Stop }
+        $rebuildLock = [TokenRaderIndexer]::AcquireFileLock(($dbPath + '.lock'), 10000)
+        try {
+            Close-TokenRaderIndex
+            foreach ($suffix in @('', '-wal', '-shm')) {
+                $target = $dbPath + $suffix
+                if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction Stop }
+            }
+        } finally {
+            if ($null -ne $rebuildLock) { $rebuildLock.Dispose() }
         }
     }
     $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
-    return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile
+    $result = Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile
+    if (-not [bool]$result.SyncComplete) {
+        throw ('索引构建有 {0} 个日志暂时无法读取；已保留待重试路径，未将不完整索引视为成功。' -f @($result.LastFailedFiles).Count)
+    }
+    return $result
 }
 
 <#
@@ -1944,6 +2060,7 @@ function Update-TokenRaderIndex {
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
         [AllowNull()][string[]]$CandidateFiles,
         [switch]$FullReconcile,
+        [switch]$AllowIncomplete,
         [hashtable]$ProgressState
     )
 
@@ -1953,28 +2070,37 @@ function Update-TokenRaderIndex {
     }
     $watcherWasActive = [TokenRaderIndexer]::IsWatcherActive($SessionsRoot)
     if (-not $watcherWasActive) { [TokenRaderIndexer]::StartWatcher($SessionsRoot) }
-    if ($PSBoundParameters.ContainsKey('CandidateFiles')) {
-        return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $CandidateFiles -ProgressState $ProgressState
-    }
-    if ($FullReconcile -or [bool]$index.IsNew -or (-not $watcherWasActive -and (Test-Path -LiteralPath $SessionsRoot)) -or
+    $result = if ($PSBoundParameters.ContainsKey('CandidateFiles')) {
+        Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $CandidateFiles -ProgressState $ProgressState
+    } elseif ($FullReconcile -or [bool]$index.IsNew -or (-not $watcherWasActive -and (Test-Path -LiteralPath $SessionsRoot)) -or
         [TokenRaderIndexer]::ConsumeWatcherOverflow($SessionsRoot)) {
-        return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile -ProgressState $ProgressState
+        Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile -ProgressState $ProgressState
+    } else {
+        $changedPaths = @([TokenRaderIndexer]::DrainChangedPaths($SessionsRoot))
+        if ($changedPaths.Count -gt 0) {
+            Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $changedPaths -ProgressState $ProgressState
+        } else {
+            $index.IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
+            $index.ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot)
+            $index.LastImportedFiles = 0
+            $index.LastImportedRecords = 0
+            $index.LastFailedFiles = @()
+            $index.LastFailureMessages = @()
+            $index.SyncComplete = $true
+            $index.RootBackfilledRows = 0
+            if ($null -ne $ProgressState) {
+                $ProgressState.Stage = '同步完成'
+                $ProgressState.ProcessedFiles = 0
+                $ProgressState.TotalFiles = 0
+                $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+            }
+            $index
+        }
     }
-    $changedPaths = @([TokenRaderIndexer]::DrainChangedPaths($SessionsRoot))
-    if ($changedPaths.Count -gt 0) {
-        return Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $changedPaths -ProgressState $ProgressState
+    if (-not $AllowIncomplete -and -not [bool]$result.SyncComplete) {
+        throw ('索引同步有 {0} 个日志暂时无法读取；路径已重新排队，请稍后重试。' -f @($result.LastFailedFiles).Count)
     }
-    $index.IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
-    $index.ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot)
-    $index.LastImportedFiles = 0
-    $index.LastImportedRecords = 0
-    if ($null -ne $ProgressState) {
-        $ProgressState.Stage = '同步完成'
-        $ProgressState.ProcessedFiles = 0
-        $ProgressState.TotalFiles = 0
-        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
-    }
-    return $index
+    return $result
 }
 
 <#
@@ -1982,13 +2108,18 @@ function Update-TokenRaderIndex {
     删除可重建的本地索引；不会修改 Codex 原始日志。
 #>
 function Clear-TokenRaderIndex {
-    Close-TokenRaderIndex
     $dbPath = Get-TokenRaderIndexerDbPath
-    foreach ($suffix in @('', '-wal', '-shm')) {
-        $target = $dbPath + $suffix
-        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
+    $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(($dbPath + '.lock'), 10000)
+    try {
+        Close-TokenRaderIndex
+        foreach ($suffix in @('', '-wal', '-shm')) {
+            $target = $dbPath + $suffix
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
+        }
+        [GC]::Collect()
+    } finally {
+        if ($null -ne $crossProcessLock) { $crossProcessLock.Dispose() }
     }
-    [GC]::Collect()
 }
 
 function Remove-TokenRaderIndexHistory {
@@ -1998,20 +2129,25 @@ function Remove-TokenRaderIndexHistory {
     if ($null -eq $index -or $null -eq $index.Connection) {
         throw '本地索引尚未打开。'
     }
-    $requestedCutoff = [DateTime]::UtcNow.AddDays(-$Days).Ticks
-    $existingCutoff = Get-TokenRaderIndexRetentionCutoff -Connection $index.Connection
-    $effectiveCutoff = [Math]::Max([Int64]$requestedCutoff, [Int64]$existingCutoff)
-    $removed = [TokenRaderIndexer]::PurgeIndexBefore($index.Connection, $effectiveCutoff)
-    [TokenRaderIndexer]::SetSetting($index.Connection, 'retention_cutoff_ticks', ([Int64]$effectiveCutoff).ToString([Globalization.CultureInfo]::InvariantCulture))
-    if ([int]$removed -gt 0) { $index.IndexRevision = [Int64][TokenRaderIndexer]::IncrementIndexRevision($index.Connection) }
-    else { $index.IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) }
-    $index.LastSync = [DateTimeOffset]::Now
-    $index.IndexedFileCount = [int]([TokenRaderIndexer]::GetFileMetadata($index.Connection).Rows.Count)
-    [pscustomobject]@{
-        Days = $Days
-        CutoffUtc = [DateTime]::new([Int64]$effectiveCutoff, [DateTimeKind]::Utc)
-        RemovedFiles = [int]$removed
-        DbPath = [string]$index.DbPath
+    $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+    try {
+        $requestedCutoff = [DateTime]::UtcNow.AddDays(-$Days).Ticks
+        $existingCutoff = Get-TokenRaderIndexRetentionCutoff -Connection $index.Connection
+        $effectiveCutoff = [Math]::Max([Int64]$requestedCutoff, [Int64]$existingCutoff)
+        $removed = [TokenRaderIndexer]::PurgeIndexBefore($index.Connection, $effectiveCutoff)
+        [TokenRaderIndexer]::SetSetting($index.Connection, 'retention_cutoff_ticks', ([Int64]$effectiveCutoff).ToString([Globalization.CultureInfo]::InvariantCulture))
+        if ([int]$removed -gt 0) { $index.IndexRevision = [Int64][TokenRaderIndexer]::IncrementIndexRevision($index.Connection) }
+        else { $index.IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) }
+        $index.LastSync = [DateTimeOffset]::Now
+        $index.IndexedFileCount = [int]([TokenRaderIndexer]::GetFileMetadata($index.Connection).Rows.Count)
+        [pscustomobject]@{
+            Days = $Days
+            CutoffUtc = [DateTime]::new([Int64]$effectiveCutoff, [DateTimeKind]::Utc)
+            RemovedFiles = [int]$removed
+            DbPath = [string]$index.DbPath
+        }
+    } finally {
+        if ($null -ne $crossProcessLock) { $crossProcessLock.Dispose() }
     }
 }
 
@@ -2338,6 +2474,115 @@ function Get-TokenRaderChangeRevision {
     return [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot)
 }
 
+function Sync-TokenRaderMeasurementBoundary {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [hashtable]$ProgressState = $null,
+        [ValidateRange(1, 120)][int]$TimeoutSeconds = 25
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $stableCatalogPasses = 0
+    $attempt = 0
+    $totalImportedFiles = 0
+    $totalImportedRecords = 0
+    $totalRootBackfills = 0
+    $lastSyncError = ''
+    do {
+        $attempt++
+        if ($null -ne $ProgressState) {
+            $ProgressState.Stage = '核对全部日志边界'
+            $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+        }
+
+        # Compare every lightweight cursor in compiled code on every pass and
+        # merge the watcher queue before import. A subsequent catalog with no
+        # changed path defines the frozen boundary without depending on watcher
+        # delivery latency or processing the same notification twice.
+        $openIndex = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+        $changedFiles = @()
+        $catalogChangedFiles = @()
+        $indexWasNew = [bool]$openIndex.IsNew
+        $revisionBeforePass = [Int64][TokenRaderIndexer]::GetIndexRevision($openIndex.Connection)
+        if (-not $indexWasNew) {
+            $catalogChangedFiles = @([TokenRaderIndexer]::FindChangedFiles($openIndex.Connection, $SessionsRoot))
+            $changedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($path in @($catalogChangedFiles)) { [void]$changedSet.Add([string]$path) }
+            foreach ($path in @([TokenRaderIndexer]::DrainChangedPaths($SessionsRoot))) { [void]$changedSet.Add([string]$path) }
+            $changedFiles = @($changedSet)
+        }
+        if ($null -ne $ProgressState) {
+            $ProgressState.Stage = '同步边界变化日志'
+            $ProgressState.TotalFiles = $changedFiles.Count
+            $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+        }
+        try {
+            $index = if ($indexWasNew) {
+                Update-TokenRaderIndex -SessionsRoot $SessionsRoot -FullReconcile -AllowIncomplete -ProgressState $ProgressState
+            } elseif ($changedFiles.Count -gt 0) {
+                Update-TokenRaderIndex -SessionsRoot $SessionsRoot -CandidateFiles $changedFiles -AllowIncomplete -ProgressState $ProgressState
+            } else {
+                Update-TokenRaderIndex -SessionsRoot $SessionsRoot -AllowIncomplete -ProgressState $ProgressState
+            }
+        } catch {
+            # A competing Radar process, file replacement, or brief SQLite
+            # hand-off can fail before a per-file incomplete result exists.
+            # Sync-TokenRaderIndexFiles has already requeued the candidates;
+            # keep retrying within the same bounded boundary capture.
+            $lastSyncError = [string]$_.Exception.Message
+            $stableCatalogPasses = 0
+            if ($null -ne $ProgressState) {
+                $ProgressState.Stage = '等待并发索引写入完成后重试'
+                $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+            }
+            if ([DateTimeOffset]::Now -ge $deadline) { break }
+            Start-Sleep -Milliseconds ([Math]::Min(500, 50 + ($attempt * 25)))
+            continue
+        }
+        $totalImportedFiles += [int]$index.LastImportedFiles
+        $totalImportedRecords += [int]$index.LastImportedRecords
+        $totalRootBackfills += [int]$index.RootBackfilledRows
+        $failedCount = @($index.LastFailedFiles).Count
+        if ($failedCount -gt 0) {
+            $stableCatalogPasses = 0
+            if ($null -ne $ProgressState) {
+                $ProgressState.Stage = ('重试 {0} 个暂时不可读日志' -f $failedCount)
+                $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+            }
+            if ([DateTimeOffset]::Now -ge $deadline) { break }
+            Start-Sleep -Milliseconds ([Math]::Min(500, 50 + ($attempt * 25)))
+            continue
+        }
+
+        # A late duplicate watcher notification can name a file that the
+        # previous pass already imported. It is still verified above, but it
+        # must not force an unnecessary third catalog scan. Only a real catalog
+        # difference or an actual index revision advance counts as new work.
+        $didWork = $indexWasNew -or $catalogChangedFiles.Count -gt 0 -or
+            [Int64]$index.IndexRevision -gt $revisionBeforePass -or
+            [int]$index.LastImportedFiles -gt 0 -or [int]$index.RootBackfilledRows -gt 0
+        if ($didWork) {
+            $stableCatalogPasses = 0
+        } else {
+            $stableCatalogPasses++
+        }
+        if ($stableCatalogPasses -ge 1) {
+            $index.LastImportedFiles = $totalImportedFiles
+            $index.LastImportedRecords = $totalImportedRecords
+            $index.RootBackfilledRows = $totalRootBackfills
+            if ($null -ne $ProgressState) {
+                $ProgressState.Stage = '日志边界已稳定'
+                $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+            }
+            return $index
+        }
+    } while ([DateTimeOffset]::Now -lt $deadline)
+
+    $remaining = if ($null -ne $index) { @($index.LastFailedFiles).Count } else { 0 }
+    $detail = if ([string]::IsNullOrWhiteSpace($lastSyncError)) { '' } else { ' 最近错误：' + $lastSyncError }
+    throw ('无法在 {0} 秒内获得完整且稳定的日志边界（仍有 {1} 个日志待同步）；未冻结不完整结果。{2}' -f $TimeoutSeconds, $remaining, $detail)
+}
+
 function CaptureMeasurementBaseline {
     param(
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
@@ -2347,7 +2592,7 @@ function CaptureMeasurementBaseline {
     $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
     $gate = [TokenRaderIndexer]::AcquireIndexGate($SessionsRoot)
     try {
-        $index = Update-TokenRaderIndex -SessionsRoot $SessionsRoot
+        $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $SessionsRoot
         $startOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
         $startRateLimits = Get-TokenRaderIndexedRateLimitsAtOffsets -Connection $index.Connection -EndOffsets $startOffsets
         $files = foreach ($path in @($startOffsets.Keys)) {
@@ -2390,7 +2635,7 @@ function CaptureMeasurementEnd {
     $index = Open-TokenRaderIndex -SessionsRoot $sessionsRoot
     $gate = [TokenRaderIndexer]::AcquireIndexGate($sessionsRoot)
     try {
-        $index = Update-TokenRaderIndex -SessionsRoot $sessionsRoot -ProgressState $ProgressState
+        $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $sessionsRoot -ProgressState $ProgressState
         $endOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
         # The UI only needs immutable offsets/revision to finish Stopping.
         # Quota lookup is intentionally deferred to interval settlement, where

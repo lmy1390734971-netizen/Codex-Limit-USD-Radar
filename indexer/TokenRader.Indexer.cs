@@ -188,6 +188,17 @@ public static class TokenRaderIndexer
         }
     }
 
+    private sealed class FileLockReleaser : IDisposable
+    {
+        private FileStream _stream;
+        public FileLockReleaser(FileStream stream) { _stream = stream; }
+        public void Dispose()
+        {
+            FileStream stream = Interlocked.Exchange(ref _stream, null);
+            if (stream != null) stream.Dispose();
+        }
+    }
+
     /// <summary>
     /// Serializes drain/import/cursor capture sequences across PowerShell
     /// runspaces. Monitor is re-entrant, so a capture may safely call the
@@ -201,6 +212,45 @@ public static class TokenRaderIndexer
         object gate = _indexGates.GetOrAdd(root, delegate(string ignored) { return new object(); });
         Monitor.Enter(gate);
         return new MonitorReleaser(gate);
+    }
+
+    /// <summary>
+    /// Acquires an operating-system file lock so separate Token Radar processes
+    /// cannot mutate the same SQLite index concurrently. The lock file contains
+    /// no data and remains reusable after a clean exit or process crash.
+    /// </summary>
+    public static IDisposable AcquireFileLock(string lockFilePath, int timeoutMilliseconds)
+    {
+        if (string.IsNullOrWhiteSpace(lockFilePath))
+            throw new ArgumentException("A lock file path is required.", "lockFilePath");
+
+        string canonical = GetCanonicalPath(lockFilePath);
+        string directory = Path.GetDirectoryName(canonical);
+        if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+        int timeout = Math.Max(0, timeoutMilliseconds);
+        var stopwatch = Stopwatch.StartNew();
+        Exception lastError = null;
+        while (true)
+        {
+            try
+            {
+                var stream = new FileStream(canonical, FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite, FileShare.None, 1, FileOptions.WriteThrough);
+                return new FileLockReleaser(stream);
+            }
+            catch (IOException ex)
+            {
+                lastError = ex;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                lastError = ex;
+            }
+
+            if (stopwatch.ElapsedMilliseconds >= timeout)
+                throw new TimeoutException("Timed out waiting for the Token Radar index lock: " + canonical, lastError);
+            Thread.Sleep(25);
+        }
     }
 
     /// <summary>为会话目录建立一次性递归变化监视；重复调用会复用现有监视器。</summary>
@@ -230,6 +280,23 @@ public static class TokenRaderIndexer
         }
         paths.Sort(StringComparer.OrdinalIgnoreCase);
         return paths.ToArray();
+    }
+
+    /// <summary>
+    /// Requeues a path after a transient read/import failure. A drained watcher
+    /// notification must never disappear merely because the source file was
+    /// temporarily locked or still being replaced.
+    /// </summary>
+    public static void RequeueChangedPath(string sessionsRoot, string path)
+    {
+        if (string.IsNullOrWhiteSpace(sessionsRoot) || string.IsNullOrWhiteSpace(path)) return;
+        string root = GetCanonicalPath(sessionsRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        WatchState state;
+        lock (_watcherGate) { if (!_watchers.TryGetValue(root, out state)) return; }
+        string canonical = GetCanonicalPath(path);
+        if (!string.Equals(Path.GetExtension(canonical), ".jsonl", StringComparison.OrdinalIgnoreCase)) return;
+        state.ChangedPaths[canonical] = 0;
+        Interlocked.Increment(ref state.ChangeRevision);
     }
 
     public static long GetChangeRevision(string sessionsRoot)
@@ -654,6 +721,60 @@ public static class TokenRaderIndexer
     }
 
     /// <summary>
+    /// Captures cursor rows only for the supplied candidate paths. Normal
+    /// incremental updates usually contain 1-4 files, so this avoids copying
+    /// the complete catalog into PowerShell merely to locate those rows.
+    /// </summary>
+    public static DataTable CaptureFileCursorTableForPaths(SQLiteConnection db, IEnumerable paths)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (paths != null)
+        {
+            foreach (object value in paths)
+            {
+                string path = value == null ? "" : Convert.ToString(value, CultureInfo.InvariantCulture);
+                if (!string.IsNullOrWhiteSpace(path)) unique.Add(GetCanonicalPath(path));
+            }
+        }
+
+        var candidates = new List<string>(unique);
+        candidates.Sort(StringComparer.OrdinalIgnoreCase);
+        var result = new DataTable();
+        int offset = 0;
+        do
+        {
+            int count = Math.Min(400, candidates.Count - offset);
+            using (var cmd = db.CreateCommand())
+            {
+                var sql = new StringBuilder(
+                    "SELECT path,length,last_write_ticks,parsed_offset,session_id,cwd,parent_thread_id,forked_from_id,content_retained,root_session_id FROM file_metadata WHERE ");
+                if (count <= 0)
+                {
+                    sql.Append("1=0");
+                }
+                else
+                {
+                    sql.Append("path IN (");
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (i > 0) sql.Append(',');
+                        string parameterName = "@p" + i.ToString(CultureInfo.InvariantCulture);
+                        sql.Append(parameterName);
+                        cmd.Parameters.AddWithValue(parameterName, candidates[offset + i]);
+                    }
+                    sql.Append(')');
+                }
+                sql.Append(" ORDER BY path ASC");
+                cmd.CommandText = sql.ToString();
+                using (var adapter = new SQLiteDataAdapter(cmd)) { adapter.Fill(result); }
+            }
+            offset += count;
+        } while (offset < candidates.Count);
+        return result;
+    }
+
+    /// <summary>
     /// 以紧凑字典冻结全部 parsed_offset，供开始/结束测量使用。该路径不创建
     /// DataTable，也不把关系元数据复制到 PowerShell；数据库中的路径已经
     /// 在导入时规范化，因此可直接作为冻结边界。
@@ -685,6 +806,108 @@ public static class TokenRaderIndexer
             object value = cmd.ExecuteScalar();
             return value == null || value == DBNull.Value ? 0 : Convert.ToInt32(value, CultureInfo.InvariantCulture);
         }
+    }
+
+    /// <summary>
+    /// Performs a lightweight catalog reconciliation entirely in compiled
+    /// code. Only path, length and last-write ticks are compared; JSONL content
+    /// is never opened here. The result includes new, modified and deleted
+    /// paths so the normal incremental importer can process only those files.
+    /// </summary>
+    public static string[] FindChangedFiles(SQLiteConnection db, string sessionsRoot)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        if (string.IsNullOrWhiteSpace(sessionsRoot)) return new string[0];
+        string canonicalRoot = GetCanonicalPath(sessionsRoot).TrimEnd(
+            Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string rootPrefix = canonicalRoot + Path.DirectorySeparatorChar;
+        string alternateRootPrefix = Path.AltDirectorySeparatorChar == Path.DirectorySeparatorChar
+            ? rootPrefix
+            : canonicalRoot + Path.AltDirectorySeparatorChar;
+        var known = new Dictionary<string, FileCursorState>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT path,length,last_write_ticks FROM file_metadata WHERE path IS NOT NULL AND path<>''";
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string path = ReadReaderString(reader, 0);
+                    // Paths are canonicalized before being stored. Comparing
+                    // against the precomputed root prefix avoids thousands of
+                    // redundant Path.GetFullPath calls during every boundary
+                    // snapshot while still excluding metadata from another
+                    // sessions root.
+                    if (string.IsNullOrWhiteSpace(path) ||
+                        (!path.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) &&
+                         !path.StartsWith(alternateRootPrefix, StringComparison.OrdinalIgnoreCase))) continue;
+                    known[path] = new FileCursorState {
+                        Length = ReadReaderInt64(reader, 1),
+                        LastWriteTicks = ReadReaderInt64(reader, 2)
+                    };
+                }
+            }
+        }
+
+        var changed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (Directory.Exists(canonicalRoot))
+        {
+            var pending = new Stack<DirectoryInfo>();
+            pending.Push(new DirectoryInfo(canonicalRoot));
+            while (pending.Count > 0)
+            {
+                DirectoryInfo directory = pending.Pop();
+                try
+                {
+                    // DirectoryInfo returns FileInfo instances populated from
+                    // the directory enumeration itself. Reusing Length and
+                    // LastWriteTimeUtc avoids a second metadata lookup for
+                    // every JSONL file.
+                    foreach (FileSystemInfo entry in directory.EnumerateFileSystemInfos())
+                    {
+                        DirectoryInfo child = entry as DirectoryInfo;
+                        if (child != null)
+                        {
+                            pending.Push(child);
+                            continue;
+                        }
+                        FileInfo file = entry as FileInfo;
+                        if (file == null || !file.Extension.Equals(".jsonl", StringComparison.OrdinalIgnoreCase)) continue;
+                        string path = file.FullName;
+                        FileCursorState cursor;
+                        if (!known.TryGetValue(path, out cursor) ||
+                            cursor.Length != file.Length || cursor.LastWriteTicks != file.LastWriteTimeUtc.Ticks)
+                            changed.Add(path);
+                        known.Remove(path);
+                    }
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+
+        // Metadata left in the map represents a file that disappeared or was
+        // renamed. Candidate synchronization removes those stale rows.
+        foreach (string missing in known.Keys) changed.Add(missing);
+        var result = new List<string>(changed);
+        result.Sort(StringComparer.OrdinalIgnoreCase);
+        return result.ToArray();
+    }
+
+    private static bool IsPathWithinRoot(string path, string root)
+    {
+        if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(root)) return false;
+        string canonicalPath = GetCanonicalPath(path);
+        string canonicalRoot = GetCanonicalPath(root).TrimEnd(
+            Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string prefix = canonicalRoot + Path.DirectorySeparatorChar;
+        return canonicalPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed class FileCursorState
+    {
+        public long Length;
+        public long LastWriteTicks;
     }
 
     /// <summary>
@@ -733,7 +956,8 @@ public static class TokenRaderIndexer
         var resolvedThresholds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         var baselinePaths = ReadOffsetPathSet(startOffsets);
         var result = new TokenRaderIntervalAggregateResult();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var parentBySession = ReadAggregateParentMap(db);
+        var seenEventSessions = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         // token_count is also emitted for status/rate-limit refreshes. Those
         // rows can carry the same cumulative total_token_usage and the same
         // last_token_usage at a later timestamp; they are snapshots of one
@@ -818,7 +1042,30 @@ public static class TokenRaderIndexer
                         string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
-                        if (!seen.Add(eventKey))
+                        List<string> priorSessions;
+                        bool lineageDuplicate = false;
+                        if (!seenEventSessions.TryGetValue(eventKey, out priorSessions))
+                        {
+                            priorSessions = new List<string>();
+                            seenEventSessions.Add(eventKey, priorSessions);
+                        }
+                        else
+                        {
+                            for (int priorIndex = 0; priorIndex < priorSessions.Count; priorIndex++)
+                            {
+                                if (AreAggregateSessionsLineageRelated(
+                                    sessionId, priorSessions[priorIndex], rootSessionId, parentBySession))
+                                {
+                                    lineageDuplicate = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // Retain every observed session in the lineage set. A
+                        // later grandchild may be related to a dropped child even
+                        // when its more distant ancestor metadata is unavailable.
+                        if (!ContainsIgnoreCase(priorSessions, sessionId)) priorSessions.Add(sessionId);
+                        if (lineageDuplicate)
                         {
                             result.DuplicateEventsDropped++;
                             continue;
@@ -876,6 +1123,70 @@ public static class TokenRaderIndexer
         result.ProcessingMilliseconds = stopwatch.ElapsedMilliseconds;
         SetAggregateProgress(progressState, result.ProcessedRows, "区间聚合完成");
         return result;
+    }
+
+    private static Dictionary<string, string> ReadAggregateParentMap(SQLiteConnection db)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT session_id,parent_thread_id,forked_from_id FROM file_metadata " +
+                "WHERE session_id IS NOT NULL AND session_id<>''";
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string session = ReadReaderString(reader, 0);
+                    string parent = ReadReaderString(reader, 1);
+                    if (string.IsNullOrWhiteSpace(parent)) parent = ReadReaderString(reader, 2);
+                    if (!string.IsNullOrWhiteSpace(session) && !string.IsNullOrWhiteSpace(parent))
+                        result[session] = parent;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static bool AreAggregateSessionsLineageRelated(
+        string left,
+        string right,
+        string rootSessionId,
+        Dictionary<string, string> parentBySession)
+    {
+        if (string.Equals(left, right, StringComparison.OrdinalIgnoreCase)) return true;
+        if (!string.IsNullOrWhiteSpace(rootSessionId) &&
+            (string.Equals(left, rootSessionId, StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(right, rootSessionId, StringComparison.OrdinalIgnoreCase))) return true;
+        return IsAggregateAncestor(left, right, parentBySession) ||
+               IsAggregateAncestor(right, left, parentBySession);
+    }
+
+    private static bool IsAggregateAncestor(
+        string possibleAncestor,
+        string session,
+        Dictionary<string, string> parentBySession)
+    {
+        if (string.IsNullOrWhiteSpace(possibleAncestor) || string.IsNullOrWhiteSpace(session) ||
+            parentBySession == null || parentBySession.Count == 0) return false;
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string current = session;
+        for (int depth = 0; depth < 64 && !string.IsNullOrWhiteSpace(current) && visited.Add(current); depth++)
+        {
+            string parent;
+            if (!parentBySession.TryGetValue(current, out parent) || string.IsNullOrWhiteSpace(parent)) return false;
+            if (string.Equals(parent, possibleAncestor, StringComparison.OrdinalIgnoreCase)) return true;
+            current = parent;
+        }
+        return false;
+    }
+
+    private static bool ContainsIgnoreCase(List<string> values, string candidate)
+    {
+        if (values == null) return false;
+        for (int i = 0; i < values.Count; i++)
+            if (string.Equals(values[i], candidate, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
     }
 
     private static Dictionary<string, long> ReadLongContextThresholds(IDictionary input)
@@ -1138,6 +1449,57 @@ public static class TokenRaderIndexer
             : rootSessionId;
         UpsertFileMetadata(db, path, length, lastWriteTicks, parsedOffset,
             sessionId, cwd, parentThreadId, forkedFromId, effectiveRoot, true);
+    }
+
+    /// <summary>
+    /// Applies a newly resolved canonical task root to both the lightweight
+    /// file catalog and all retained token rows. This repairs descendants that
+    /// were indexed before their parent or root session metadata arrived.
+    /// Returns the number of rows whose root changed.
+    /// </summary>
+    public static int BackfillSessionRoots(SQLiteConnection db, IDictionary sessionRoots, long indexRevision)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        if (sessionRoots == null || sessionRoots.Count == 0) return 0;
+
+        int affected = 0;
+        using (var tx = db.BeginTransaction())
+        using (var metadata = db.CreateCommand())
+        using (var records = db.CreateCommand())
+        {
+            metadata.Transaction = tx;
+            metadata.CommandText =
+                "UPDATE file_metadata SET root_session_id=@root " +
+                "WHERE session_id=@session AND (root_session_id IS NULL OR root_session_id<>@root)";
+            metadata.Parameters.Add(new SQLiteParameter("@root"));
+            metadata.Parameters.Add(new SQLiteParameter("@session"));
+
+            records.Transaction = tx;
+            records.CommandText =
+                "UPDATE token_records SET root_session_id=@root,index_revision=@revision " +
+                "WHERE session_id=@session AND (root_session_id IS NULL OR root_session_id<>@root)";
+            records.Parameters.Add(new SQLiteParameter("@root"));
+            records.Parameters.Add(new SQLiteParameter("@revision"));
+            records.Parameters.Add(new SQLiteParameter("@session"));
+
+            foreach (DictionaryEntry entry in sessionRoots)
+            {
+                string session = entry.Key == null ? "" : Convert.ToString(entry.Key, CultureInfo.InvariantCulture);
+                string root = entry.Value == null ? "" : Convert.ToString(entry.Value, CultureInfo.InvariantCulture);
+                if (string.IsNullOrWhiteSpace(session) || string.IsNullOrWhiteSpace(root)) continue;
+
+                metadata.Parameters["@root"].Value = root;
+                metadata.Parameters["@session"].Value = session;
+                affected += metadata.ExecuteNonQuery();
+
+                records.Parameters["@root"].Value = root;
+                records.Parameters["@revision"].Value = Math.Max(0L, indexRevision);
+                records.Parameters["@session"].Value = session;
+                affected += records.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+        return affected;
     }
 
     private static void UpsertFileMetadata(
