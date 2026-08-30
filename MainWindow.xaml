@@ -351,6 +351,62 @@
                         </Border>
                     </UniformGrid>
 
+                    <Border Style="{StaticResource CardStyle}" Margin="4,14,4,8" Padding="18">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="12"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="2*"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock Text="滚动 24 小时用量" FontSize="16" FontWeight="SemiBold"/>
+                                <TextBlock Text="磁盘汇总 · 仅保留最近 7 天" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,3,0,9"/>
+                                <ComboBox x:Name="UsageHistoryRangeComboBox" Width="160" SelectedIndex="0" HorizontalAlignment="Left"
+                                          ToolTip="每项都是连续24小时窗口，不是自然日">
+                                    <ComboBoxItem Content="过去24小时" Tag="0"/>
+                                    <ComboBoxItem Content="24–48小时前" Tag="1"/>
+                                    <ComboBoxItem Content="2–3天前" Tag="2"/>
+                                    <ComboBoxItem Content="3–4天前" Tag="3"/>
+                                    <ComboBoxItem Content="4–5天前" Tag="4"/>
+                                    <ComboBoxItem Content="5–6天前" Tag="5"/>
+                                    <ComboBoxItem Content="6–7天前" Tag="6"/>
+                                </ComboBox>
+                                <TextBlock x:Name="UsageHistoryWindowText" Text="等待磁盘数据" Foreground="#78909A" FontSize="9" Margin="0,8,0,0"/>
+                            </StackPanel>
+                            <Border Grid.Column="2" Background="#101B22" CornerRadius="10" Padding="14">
+                                <StackPanel VerticalAlignment="Center">
+                                    <TextBlock Text="总 Token" Foreground="{StaticResource MutedBrush}" FontSize="10"/>
+                                    <TextBlock x:Name="UsageHistoryTokenText" Text="0" Foreground="#F4F7FA" FontSize="25" FontWeight="SemiBold" Margin="0,7,0,0"/>
+                                    <TextBlock x:Name="UsageHistoryModelText" Text="等待模型" Foreground="#66808A" FontSize="9" Margin="0,3,0,0"/>
+                                </StackPanel>
+                            </Border>
+                            <Border Grid.Column="4" Background="#102C29" BorderBrush="#28554C" BorderThickness="1" CornerRadius="10" Padding="14">
+                                <StackPanel VerticalAlignment="Center">
+                                    <TextBlock Text="API 等价美元" Foreground="#A8C7C0" FontSize="10"/>
+                                    <TextBlock x:Name="UsageHistoryUsdText" Text="$0.0000" Foreground="{StaticResource AccentBrush}" FontSize="25" FontWeight="SemiBold" Margin="0,7,0,0"/>
+                                    <TextBlock x:Name="UsageHistoryStatusText" Text="等待汇总" Foreground="#7FA39B" FontSize="9" Margin="0,3,0,0"/>
+                                </StackPanel>
+                            </Border>
+                            <DataGrid x:Name="UsageHistoryModelGrid" Grid.Row="2" Grid.ColumnSpan="5" AutoGenerateColumns="False" Height="158" AlternationCount="2">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="模型" Binding="{Binding Model}" Width="*"/>
+                                    <DataGridTextColumn Header="缓存输入" Binding="{Binding Cached}" Width="105"/>
+                                    <DataGridTextColumn Header="未缓存输入" Binding="{Binding Uncached}" Width="105"/>
+                                    <DataGridTextColumn Header="输出" Binding="{Binding Output}" Width="95"/>
+                                    <DataGridTextColumn Header="总 Token" Binding="{Binding Total}" Width="105"/>
+                                    <DataGridTextColumn Header="API 等价美元" Binding="{Binding Cost}" Width="115"/>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Grid>
+                    </Border>
+
                     <Border Margin="4,14,4,8" CornerRadius="15" BorderBrush="#28554C" BorderThickness="1">
                         <Border.Background>
                             <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">

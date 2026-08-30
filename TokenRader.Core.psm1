@@ -2807,4 +2807,251 @@ function Get-TokenRaderIndexedIntervalResult {
     }
 }
 
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision
+function Get-TokenRaderPricingCacheKey {
+    param([Parameter(Mandatory = $true)]$PricingDocument)
+    $modelParts = foreach ($entry in @($PricingDocument.models | Sort-Object id)) {
+        @(
+            [string]$entry.id,
+            [string]$entry.input,
+            [string]$entry.cachedInput,
+            [string]$entry.output,
+            $(if ($null -ne $entry.PSObject.Properties['longContextThreshold']) { [string]$entry.longContextThreshold } else { '' }),
+            $(if ($null -ne $entry.PSObject.Properties['longContextInputMultiplier']) { [string]$entry.longContextInputMultiplier } else { '' }),
+            $(if ($null -ne $entry.PSObject.Properties['longContextOutputMultiplier']) { [string]$entry.longContextOutputMultiplier } else { '' })
+        ) -join ':'
+    }
+    return (@([string]$PricingDocument.verifiedAt, [string]$PricingDocument.unitTokens, ($modelParts -join ';')) -join '|')
+}
+
+function ConvertFrom-TokenRaderUsageHistorySnapshot {
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [bool]$FromCache = $true
+    )
+    $windowStart = [DateTimeOffset]::new([DateTime]::new([Int64]$Snapshot.WindowStartTicks, [DateTimeKind]::Utc))
+    $windowEnd = [DateTimeOffset]::new([DateTime]::new([Int64]$Snapshot.WindowEndTicks, [DateTimeKind]::Utc))
+    $computedAt = [DateTimeOffset]::new([DateTime]::new([Int64]$Snapshot.ComputedAtTicks, [DateTimeKind]::Utc))
+    $models = if ([string]::IsNullOrWhiteSpace([string]$Snapshot.Models)) {
+        @()
+    } else {
+        @(([string]$Snapshot.Models).Split([char]0x1F, [StringSplitOptions]::RemoveEmptyEntries))
+    }
+    $usage = New-TokenRaderUsage `
+        -InputTokens ([Int64]$Snapshot.TotalInput) `
+        -CachedTokens ([Int64]$Snapshot.TotalCached) `
+        -OutputTokens ([Int64]$Snapshot.TotalOutput) `
+        -ReasoningOutputTokens ([Int64]$Snapshot.TotalReasoning)
+    $modelBreakdown = foreach ($modelSnapshot in @($Snapshot.ModelBreakdown)) {
+        if ($null -eq $modelSnapshot) { continue }
+        $modelUsage = New-TokenRaderUsage `
+            -InputTokens ([Int64]$modelSnapshot.TotalInput) `
+            -CachedTokens ([Int64]$modelSnapshot.TotalCached) `
+            -OutputTokens ([Int64]$modelSnapshot.TotalOutput) `
+            -ReasoningOutputTokens ([Int64]$modelSnapshot.TotalReasoning)
+        [pscustomobject]@{
+            Model = $(if ([string]::IsNullOrWhiteSpace([string]$modelSnapshot.Model)) { '未知模型' } else { [string]$modelSnapshot.Model })
+            Usage = $modelUsage
+            InputCost = [double]$modelSnapshot.InputCost
+            CachedCost = [double]$modelSnapshot.CachedCost
+            OutputCost = [double]$modelSnapshot.OutputCost
+            TotalCost = [double]$modelSnapshot.InputCost + [double]$modelSnapshot.CachedCost + [double]$modelSnapshot.OutputCost
+            PricingComplete = [bool]$modelSnapshot.PricingComplete
+            CostComplete = [bool]$modelSnapshot.PricingComplete
+            Events = [Int64]$modelSnapshot.Events
+        }
+    }
+    [pscustomobject]@{
+        WindowStart = $windowStart
+        WindowEnd = $windowEnd
+        ComputedAt = $computedAt
+        IndexRevision = [Int64]$Snapshot.IndexRevision
+        Usage = $usage
+        Models = $models
+        ModelDisplay = [string]$Snapshot.ModelDisplay
+        ModelBreakdown = @($modelBreakdown)
+        InputCost = [double]$Snapshot.InputCost
+        CachedCost = [double]$Snapshot.CachedCost
+        OutputCost = [double]$Snapshot.OutputCost
+        TotalCost = [double]$Snapshot.InputCost + [double]$Snapshot.CachedCost + [double]$Snapshot.OutputCost
+        PricingComplete = [bool]$Snapshot.PricingComplete
+        CostComplete = [bool]$Snapshot.PricingComplete
+        RawEvents = [Int64]$Snapshot.RawEvents
+        CountedEvents = [Int64]$Snapshot.CountedEvents
+        DuplicateEventsDropped = [Int64]$Snapshot.DuplicateEventsDropped
+        InheritedEventsDropped = [Int64]$Snapshot.InheritedEventsDropped
+        ProcessedRows = [Int64]$Snapshot.ProcessedRows
+        FromCache = $FromCache
+    }
+}
+
+function Get-TokenRaderUsageHistoryWindow {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [Parameter(Mandatory = $true)]$PricingDocument,
+        [ValidateRange(0, 6)][int]$DayOffset = 0,
+        $AnchorAt = $null,
+        [switch]$ForceRefresh,
+        [switch]$PurgeExpired,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None,
+        [hashtable]$ProgressState = $null
+    )
+
+    $anchor = if ($null -eq $AnchorAt) { [DateTimeOffset]::Now } else { [DateTimeOffset]$AnchorAt }
+    # Second-aligned boundaries preserve an exact rolling-24-hour view while
+    # avoiding one cache row per sub-second UI request. These are not
+    # calendar-day buckets.
+    $alignedAnchor = [DateTimeOffset]::new(
+        $anchor.Year, $anchor.Month, $anchor.Day, $anchor.Hour, $anchor.Minute, $anchor.Second, $anchor.Offset)
+    $windowEnd = $alignedAnchor.AddDays(-$DayOffset)
+    $windowStart = $windowEnd.AddHours(-24)
+    $startTicks = [Int64]$windowStart.UtcDateTime.Ticks
+    $endTicks = [Int64]$windowEnd.UtcDateTime.Ticks
+    $pricingKey = Get-TokenRaderPricingCacheKey -PricingDocument $PricingDocument
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+    try {
+        $revision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
+        if ($PurgeExpired) {
+            $cutoffTicks = [Int64][DateTimeOffset]::Now.AddDays(-7).UtcDateTime.Ticks
+            [void][TokenRaderIndexer]::PurgeUsageHistory($index.Connection, $cutoffTicks)
+        }
+        if (-not $ForceRefresh) {
+            $cached = [TokenRaderIndexer]::GetUsageHistorySnapshot(
+                $index.Connection, $startTicks, $endTicks, $revision, $pricingKey)
+            if ($null -ne $cached) { return ConvertFrom-TokenRaderUsageHistorySnapshot -Snapshot $cached -FromCache $true }
+        }
+
+        $thresholds = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in @($PricingDocument.models)) {
+            $threshold = if ($null -ne $entry.PSObject.Properties['longContextThreshold']) { [Int64]$entry.longContextThreshold } else { 0L }
+            $id = [string]$entry.id
+            if (-not [string]::IsNullOrWhiteSpace($id)) { $thresholds[$id] = $threshold }
+            foreach ($alias in @($entry.aliases)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$alias)) { $thresholds[[string]$alias] = $threshold }
+            }
+        }
+        if ($null -ne $ProgressState) {
+            $ProgressState.Stage = '读取24小时磁盘用量'
+            $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+        }
+        $aggregate = [TokenRaderIndexer]::AggregateTimeRangeRecords(
+            $index.Connection, $windowStart, $windowEnd, $thresholds, $CancellationToken, $ProgressState)
+
+        $unknownModels = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        [double]$inputCost = 0
+        [double]$cachedCost = 0
+        [double]$outputCost = 0
+        $priceCache = @{}
+        $modelTotals = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+        $unitTokens = if ($null -ne $PricingDocument.PSObject.Properties['unitTokens'] -and [double]$PricingDocument.unitTokens -gt 0) {
+            [double]$PricingDocument.unitTokens
+        } else { 1000000.0 }
+        foreach ($bucket in @($aggregate.Buckets)) {
+            $bucketUsage = New-TokenRaderUsage -InputTokens $bucket.Input -CachedTokens $bucket.Cached -OutputTokens $bucket.Output -ReasoningOutputTokens $bucket.Reasoning
+            $model = [string]$bucket.Model
+            if (-not $modelTotals.ContainsKey($model)) {
+                $modelTotals[$model] = [pscustomobject]@{
+                    Model = $model
+                    TotalInput = [Int64]0
+                    TotalCached = [Int64]0
+                    TotalOutput = [Int64]0
+                    TotalReasoning = [Int64]0
+                    InputCost = [double]0
+                    CachedCost = [double]0
+                    OutputCost = [double]0
+                    PricingComplete = $true
+                    Events = [Int64]0
+                }
+            }
+            $modelTotal = $modelTotals[$model]
+            $modelTotal.TotalInput += [Int64]$bucket.Input
+            $modelTotal.TotalCached += [Int64]$bucket.Cached
+            $modelTotal.TotalOutput += [Int64]$bucket.Output
+            $modelTotal.TotalReasoning += [Int64]$bucket.Reasoning
+            $modelTotal.Events += [Int64]$bucket.Events
+            if (-not $priceCache.ContainsKey($model)) { $priceCache[$model] = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument }
+            $price = $priceCache[$model]
+            if ($null -eq $price) {
+                [void]$unknownModels.Add($(if ([string]::IsNullOrWhiteSpace($model)) { '未知模型' } else { $model }))
+                $modelTotal.PricingComplete = $false
+                continue
+            }
+            [double]$inputMultiplier = 1.0
+            [double]$outputMultiplier = 1.0
+            if ([bool]$bucket.LongContext) {
+                $inputMultiplier = if ($null -ne $price.PSObject.Properties['longContextInputMultiplier']) { [double]$price.longContextInputMultiplier } else { 2.0 }
+                $outputMultiplier = if ($null -ne $price.PSObject.Properties['longContextOutputMultiplier']) { [double]$price.longContextOutputMultiplier } else { 1.5 }
+            }
+            $bucketInputCost = ([double]$bucketUsage.Uncached / $unitTokens) * [double]$price.input * $inputMultiplier
+            $bucketCachedCost = ([double]$bucketUsage.Cached / $unitTokens) * [double]$price.cachedInput * $inputMultiplier
+            $bucketOutputCost = ([double]$bucketUsage.Output / $unitTokens) * [double]$price.output * $outputMultiplier
+            $inputCost += $bucketInputCost
+            $cachedCost += $bucketCachedCost
+            $outputCost += $bucketOutputCost
+            $modelTotal.InputCost += $bucketInputCost
+            $modelTotal.CachedCost += $bucketCachedCost
+            $modelTotal.OutputCost += $bucketOutputCost
+        }
+
+        $models = @($aggregate.Models)
+        $snapshot = New-Object TokenRaderUsageHistorySnapshot
+        $snapshot.WindowStartTicks = $startTicks
+        $snapshot.WindowEndTicks = $endTicks
+        $snapshot.ComputedAtTicks = [Int64][DateTimeOffset]::UtcNow.UtcDateTime.Ticks
+        $snapshot.IndexRevision = $revision
+        $snapshot.PricingKey = $pricingKey
+        $snapshot.TotalInput = [Int64]$aggregate.TotalInput
+        $snapshot.TotalCached = [Int64]$aggregate.TotalCached
+        $snapshot.TotalOutput = [Int64]$aggregate.TotalOutput
+        $snapshot.TotalReasoning = [Int64]$aggregate.TotalReasoning
+        $snapshot.InputCost = $inputCost
+        $snapshot.CachedCost = $cachedCost
+        $snapshot.OutputCost = $outputCost
+        $snapshot.PricingComplete = ($unknownModels.Count -eq 0)
+        $snapshot.ModelDisplay = if ($models.Count -eq 0) { '无调用' } elseif ($models.Count -eq 1) { [string]$models[0] } else { '{0} 个模型' -f $models.Count }
+        $snapshot.Models = $models -join [char]0x1F
+        $snapshot.RawEvents = [Int64]$aggregate.RawEvents
+        $snapshot.CountedEvents = [Int64]$aggregate.CountedEvents
+        $snapshot.DuplicateEventsDropped = [Int64]$aggregate.DuplicateEventsDropped
+        $snapshot.InheritedEventsDropped = [Int64]$aggregate.InheritedEventsDropped
+        $snapshot.ProcessedRows = [Int64]$aggregate.ProcessedRows
+        $modelSnapshots = foreach ($modelTotal in @($modelTotals.Values | Sort-Object Model)) {
+            $modelSnapshot = New-Object TokenRaderUsageHistoryModelSnapshot
+            $modelSnapshot.Model = [string]$modelTotal.Model
+            $modelSnapshot.TotalInput = [Int64]$modelTotal.TotalInput
+            $modelSnapshot.TotalCached = [Int64]$modelTotal.TotalCached
+            $modelSnapshot.TotalOutput = [Int64]$modelTotal.TotalOutput
+            $modelSnapshot.TotalReasoning = [Int64]$modelTotal.TotalReasoning
+            $modelSnapshot.InputCost = [double]$modelTotal.InputCost
+            $modelSnapshot.CachedCost = [double]$modelTotal.CachedCost
+            $modelSnapshot.OutputCost = [double]$modelTotal.OutputCost
+            $modelSnapshot.PricingComplete = [bool]$modelTotal.PricingComplete
+            $modelSnapshot.Events = [Int64]$modelTotal.Events
+            $modelSnapshot
+        }
+        $snapshot.ModelBreakdown = [TokenRaderUsageHistoryModelSnapshot[]]@($modelSnapshots)
+        [TokenRaderIndexer]::SaveUsageHistorySnapshot($index.Connection, $snapshot)
+        return ConvertFrom-TokenRaderUsageHistorySnapshot -Snapshot $snapshot -FromCache $false
+    } finally {
+        if ($null -ne $crossProcessLock) { $crossProcessLock.Dispose() }
+    }
+}
+
+function Remove-TokenRaderUsageHistory {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [ValidateRange(1, 30)][int]$RetentionDays = 7,
+        $ReferenceAt = $null
+    )
+    $reference = if ($null -eq $ReferenceAt) { [DateTimeOffset]::Now } else { [DateTimeOffset]$ReferenceAt }
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+    try {
+        $cutoff = [Int64]$reference.AddDays(-$RetentionDays).UtcDateTime.Ticks
+        return [int][TokenRaderIndexer]::PurgeUsageHistory($index.Connection, $cutoff)
+    } finally {
+        if ($null -ne $crossProcessLock) { $crossProcessLock.Dispose() }
+    }
+}
+
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision, Get-TokenRaderUsageHistoryWindow, Remove-TokenRaderUsageHistory

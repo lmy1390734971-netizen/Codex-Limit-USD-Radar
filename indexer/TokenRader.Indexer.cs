@@ -109,6 +109,66 @@ public sealed class TokenRaderIntervalAggregateResult
 }
 
 /// <summary>
+/// Compact per-model totals belonging to one rolling 24-hour disk snapshot.
+/// </summary>
+public sealed class TokenRaderUsageHistoryModelSnapshot
+{
+    public string Model { get; set; }
+    public long TotalInput { get; set; }
+    public long TotalCached { get; set; }
+    public long TotalOutput { get; set; }
+    public long TotalReasoning { get; set; }
+    public double InputCost { get; set; }
+    public double CachedCost { get; set; }
+    public double OutputCost { get; set; }
+    public bool PricingComplete { get; set; }
+    public long Events { get; set; }
+
+    public TokenRaderUsageHistoryModelSnapshot()
+    {
+        Model = "";
+    }
+}
+
+/// <summary>
+/// A single rolling 24-hour aggregate persisted in the project-local SQLite
+/// database. Only compact totals are stored; prompt/response content and
+/// individual calls are never copied into the history cache.
+/// </summary>
+public sealed class TokenRaderUsageHistorySnapshot
+{
+    public long WindowStartTicks { get; set; }
+    public long WindowEndTicks { get; set; }
+    public long ComputedAtTicks { get; set; }
+    public long IndexRevision { get; set; }
+    public string PricingKey { get; set; }
+    public long TotalInput { get; set; }
+    public long TotalCached { get; set; }
+    public long TotalOutput { get; set; }
+    public long TotalReasoning { get; set; }
+    public double InputCost { get; set; }
+    public double CachedCost { get; set; }
+    public double OutputCost { get; set; }
+    public bool PricingComplete { get; set; }
+    public string ModelDisplay { get; set; }
+    public string Models { get; set; }
+    public long RawEvents { get; set; }
+    public long CountedEvents { get; set; }
+    public long DuplicateEventsDropped { get; set; }
+    public long InheritedEventsDropped { get; set; }
+    public long ProcessedRows { get; set; }
+    public TokenRaderUsageHistoryModelSnapshot[] ModelBreakdown { get; set; }
+
+    public TokenRaderUsageHistorySnapshot()
+    {
+        PricingKey = "";
+        ModelDisplay = "";
+        Models = "";
+        ModelBreakdown = new TokenRaderUsageHistoryModelSnapshot[0];
+    }
+}
+
+/// <summary>
 /// 磁盘 SQLite 索引引擎。将 Codex 会话日志（JSONL）中的 token 记录解析后
 /// 写入项目 data/private/index/index.db，后续所有查询走 SQL，
 /// 数据在磁盘而非内存，进程内存保持恒定。
@@ -386,7 +446,216 @@ public static class TokenRaderIndexer
             cmd.ExecuteNonQuery();
             cmd.CommandText = "INSERT OR IGNORE INTO index_settings (key, value) VALUES ('IndexRevision', '0')";
             cmd.ExecuteNonQuery();
+
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS usage_history (window_start_ticks INTEGER NOT NULL, window_end_ticks INTEGER NOT NULL, computed_at_ticks INTEGER NOT NULL, index_revision INTEGER NOT NULL, pricing_key TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL DEFAULT 0, total_cached INTEGER NOT NULL DEFAULT 0, total_output INTEGER NOT NULL DEFAULT 0, total_reasoning INTEGER NOT NULL DEFAULT 0, input_cost REAL NOT NULL DEFAULT 0, cached_cost REAL NOT NULL DEFAULT 0, output_cost REAL NOT NULL DEFAULT 0, pricing_complete INTEGER NOT NULL DEFAULT 1, model_display TEXT NOT NULL DEFAULT '', models TEXT NOT NULL DEFAULT '', raw_events INTEGER NOT NULL DEFAULT 0, counted_events INTEGER NOT NULL DEFAULT 0, duplicate_events_dropped INTEGER NOT NULL DEFAULT 0, inherited_events_dropped INTEGER NOT NULL DEFAULT 0, processed_rows INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(window_start_ticks,window_end_ticks))";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_usage_history_end ON usage_history(window_end_ticks)";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS usage_history_models (window_start_ticks INTEGER NOT NULL, window_end_ticks INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL DEFAULT 0, total_cached INTEGER NOT NULL DEFAULT 0, total_output INTEGER NOT NULL DEFAULT 0, total_reasoning INTEGER NOT NULL DEFAULT 0, input_cost REAL NOT NULL DEFAULT 0, cached_cost REAL NOT NULL DEFAULT 0, output_cost REAL NOT NULL DEFAULT 0, pricing_complete INTEGER NOT NULL DEFAULT 1, events INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(window_start_ticks,window_end_ticks,model))";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_usage_history_models_end ON usage_history_models(window_end_ticks)";
+            cmd.ExecuteNonQuery();
         }
+    }
+
+    public static TokenRaderUsageHistorySnapshot GetUsageHistorySnapshot(
+        SQLiteConnection db,
+        long windowStartTicks,
+        long windowEndTicks,
+        long indexRevision,
+        string pricingKey)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        TokenRaderUsageHistorySnapshot snapshot = null;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT window_start_ticks,window_end_ticks,computed_at_ticks,index_revision,pricing_key," +
+                "total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost," +
+                "pricing_complete,model_display,models,raw_events,counted_events,duplicate_events_dropped," +
+                "inherited_events_dropped,processed_rows FROM usage_history " +
+                "WHERE window_start_ticks=@start AND window_end_ticks=@end AND index_revision=@revision AND pricing_key=@pricing LIMIT 1";
+            cmd.Parameters.AddWithValue("@start", windowStartTicks);
+            cmd.Parameters.AddWithValue("@end", windowEndTicks);
+            cmd.Parameters.AddWithValue("@revision", indexRevision);
+            cmd.Parameters.AddWithValue("@pricing", pricingKey ?? "");
+            using (var reader = cmd.ExecuteReader())
+            {
+                if (!reader.Read()) return null;
+                snapshot = ReadUsageHistorySnapshot(reader);
+            }
+        }
+        snapshot.ModelBreakdown = ReadUsageHistoryModels(db, windowStartTicks, windowEndTicks);
+        return snapshot;
+    }
+
+    public static void SaveUsageHistorySnapshot(SQLiteConnection db, TokenRaderUsageHistorySnapshot snapshot)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        if (snapshot == null) throw new ArgumentNullException("snapshot");
+        using (var tx = db.BeginTransaction())
+        {
+            using (var cmd = db.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText =
+                    "INSERT OR REPLACE INTO usage_history " +
+                    "(window_start_ticks,window_end_ticks,computed_at_ticks,index_revision,pricing_key," +
+                    "total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost," +
+                    "pricing_complete,model_display,models,raw_events,counted_events,duplicate_events_dropped," +
+                    "inherited_events_dropped,processed_rows) VALUES " +
+                    "(@start,@end,@computed,@revision,@pricing,@input,@cached,@output,@reasoning,@input_cost," +
+                    "@cached_cost,@output_cost,@complete,@model_display,@models,@raw,@counted,@duplicate,@inherited,@processed)";
+                cmd.Parameters.AddWithValue("@start", snapshot.WindowStartTicks);
+                cmd.Parameters.AddWithValue("@end", snapshot.WindowEndTicks);
+                cmd.Parameters.AddWithValue("@computed", snapshot.ComputedAtTicks);
+                cmd.Parameters.AddWithValue("@revision", snapshot.IndexRevision);
+                cmd.Parameters.AddWithValue("@pricing", snapshot.PricingKey ?? "");
+                cmd.Parameters.AddWithValue("@input", snapshot.TotalInput);
+                cmd.Parameters.AddWithValue("@cached", snapshot.TotalCached);
+                cmd.Parameters.AddWithValue("@output", snapshot.TotalOutput);
+                cmd.Parameters.AddWithValue("@reasoning", snapshot.TotalReasoning);
+                cmd.Parameters.AddWithValue("@input_cost", snapshot.InputCost);
+                cmd.Parameters.AddWithValue("@cached_cost", snapshot.CachedCost);
+                cmd.Parameters.AddWithValue("@output_cost", snapshot.OutputCost);
+                cmd.Parameters.AddWithValue("@complete", snapshot.PricingComplete ? 1 : 0);
+                cmd.Parameters.AddWithValue("@model_display", snapshot.ModelDisplay ?? "");
+                cmd.Parameters.AddWithValue("@models", snapshot.Models ?? "");
+                cmd.Parameters.AddWithValue("@raw", snapshot.RawEvents);
+                cmd.Parameters.AddWithValue("@counted", snapshot.CountedEvents);
+                cmd.Parameters.AddWithValue("@duplicate", snapshot.DuplicateEventsDropped);
+                cmd.Parameters.AddWithValue("@inherited", snapshot.InheritedEventsDropped);
+                cmd.Parameters.AddWithValue("@processed", snapshot.ProcessedRows);
+                cmd.ExecuteNonQuery();
+            }
+            using (var deleteModels = db.CreateCommand())
+            {
+                deleteModels.Transaction = tx;
+                deleteModels.CommandText = "DELETE FROM usage_history_models WHERE window_start_ticks=@start AND window_end_ticks=@end";
+                deleteModels.Parameters.AddWithValue("@start", snapshot.WindowStartTicks);
+                deleteModels.Parameters.AddWithValue("@end", snapshot.WindowEndTicks);
+                deleteModels.ExecuteNonQuery();
+            }
+            foreach (TokenRaderUsageHistoryModelSnapshot model in snapshot.ModelBreakdown ?? new TokenRaderUsageHistoryModelSnapshot[0])
+            {
+                if (model == null) continue;
+                using (var modelCmd = db.CreateCommand())
+                {
+                    modelCmd.Transaction = tx;
+                    modelCmd.CommandText =
+                        "INSERT INTO usage_history_models (window_start_ticks,window_end_ticks,model,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events) " +
+                        "VALUES (@start,@end,@model,@input,@cached,@output,@reasoning,@input_cost,@cached_cost,@output_cost,@complete,@events)";
+                    modelCmd.Parameters.AddWithValue("@start", snapshot.WindowStartTicks);
+                    modelCmd.Parameters.AddWithValue("@end", snapshot.WindowEndTicks);
+                    modelCmd.Parameters.AddWithValue("@model", model.Model ?? "");
+                    modelCmd.Parameters.AddWithValue("@input", model.TotalInput);
+                    modelCmd.Parameters.AddWithValue("@cached", model.TotalCached);
+                    modelCmd.Parameters.AddWithValue("@output", model.TotalOutput);
+                    modelCmd.Parameters.AddWithValue("@reasoning", model.TotalReasoning);
+                    modelCmd.Parameters.AddWithValue("@input_cost", model.InputCost);
+                    modelCmd.Parameters.AddWithValue("@cached_cost", model.CachedCost);
+                    modelCmd.Parameters.AddWithValue("@output_cost", model.OutputCost);
+                    modelCmd.Parameters.AddWithValue("@complete", model.PricingComplete ? 1 : 0);
+                    modelCmd.Parameters.AddWithValue("@events", model.Events);
+                    modelCmd.ExecuteNonQuery();
+                }
+            }
+            tx.Commit();
+        }
+    }
+
+    public static int PurgeUsageHistory(SQLiteConnection db, long cutoffWindowEndTicks)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        using (var tx = db.BeginTransaction())
+        {
+            using (var childCmd = db.CreateCommand())
+            {
+                childCmd.Transaction = tx;
+                childCmd.CommandText = "DELETE FROM usage_history_models WHERE window_end_ticks < @cutoff";
+                childCmd.Parameters.AddWithValue("@cutoff", cutoffWindowEndTicks);
+                childCmd.ExecuteNonQuery();
+            }
+            int removed;
+            using (var cmd = db.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = "DELETE FROM usage_history WHERE window_end_ticks < @cutoff";
+                cmd.Parameters.AddWithValue("@cutoff", cutoffWindowEndTicks);
+                removed = cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+            return removed;
+        }
+    }
+
+    public static int GetUsageHistoryCount(SQLiteConnection db)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(*) FROM usage_history";
+            return Convert.ToInt32(cmd.ExecuteScalar(), CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static TokenRaderUsageHistorySnapshot ReadUsageHistorySnapshot(SQLiteDataReader reader)
+    {
+        return new TokenRaderUsageHistorySnapshot {
+            WindowStartTicks = ReadReaderInt64(reader, 0),
+            WindowEndTicks = ReadReaderInt64(reader, 1),
+            ComputedAtTicks = ReadReaderInt64(reader, 2),
+            IndexRevision = ReadReaderInt64(reader, 3),
+            PricingKey = ReadReaderString(reader, 4),
+            TotalInput = ReadReaderInt64(reader, 5),
+            TotalCached = ReadReaderInt64(reader, 6),
+            TotalOutput = ReadReaderInt64(reader, 7),
+            TotalReasoning = ReadReaderInt64(reader, 8),
+            InputCost = reader.IsDBNull(9) ? 0.0 : Convert.ToDouble(reader.GetValue(9), CultureInfo.InvariantCulture),
+            CachedCost = reader.IsDBNull(10) ? 0.0 : Convert.ToDouble(reader.GetValue(10), CultureInfo.InvariantCulture),
+            OutputCost = reader.IsDBNull(11) ? 0.0 : Convert.ToDouble(reader.GetValue(11), CultureInfo.InvariantCulture),
+            PricingComplete = !reader.IsDBNull(12) && Convert.ToInt32(reader.GetValue(12), CultureInfo.InvariantCulture) != 0,
+            ModelDisplay = ReadReaderString(reader, 13),
+            Models = ReadReaderString(reader, 14),
+            RawEvents = ReadReaderInt64(reader, 15),
+            CountedEvents = ReadReaderInt64(reader, 16),
+            DuplicateEventsDropped = ReadReaderInt64(reader, 17),
+            InheritedEventsDropped = ReadReaderInt64(reader, 18),
+            ProcessedRows = ReadReaderInt64(reader, 19)
+        };
+    }
+
+    private static TokenRaderUsageHistoryModelSnapshot[] ReadUsageHistoryModels(
+        SQLiteConnection db, long windowStartTicks, long windowEndTicks)
+    {
+        var result = new List<TokenRaderUsageHistoryModelSnapshot>();
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT model,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events " +
+                "FROM usage_history_models WHERE window_start_ticks=@start AND window_end_ticks=@end ORDER BY model ASC";
+            cmd.Parameters.AddWithValue("@start", windowStartTicks);
+            cmd.Parameters.AddWithValue("@end", windowEndTicks);
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    result.Add(new TokenRaderUsageHistoryModelSnapshot {
+                        Model = ReadReaderString(reader, 0),
+                        TotalInput = ReadReaderInt64(reader, 1),
+                        TotalCached = ReadReaderInt64(reader, 2),
+                        TotalOutput = ReadReaderInt64(reader, 3),
+                        TotalReasoning = ReadReaderInt64(reader, 4),
+                        InputCost = reader.IsDBNull(5) ? 0.0 : Convert.ToDouble(reader.GetValue(5), CultureInfo.InvariantCulture),
+                        CachedCost = reader.IsDBNull(6) ? 0.0 : Convert.ToDouble(reader.GetValue(6), CultureInfo.InvariantCulture),
+                        OutputCost = reader.IsDBNull(7) ? 0.0 : Convert.ToDouble(reader.GetValue(7), CultureInfo.InvariantCulture),
+                        PricingComplete = !reader.IsDBNull(8) && Convert.ToInt32(reader.GetValue(8), CultureInfo.InvariantCulture) != 0,
+                        Events = ReadReaderInt64(reader, 9)
+                    });
+                }
+            }
+        }
+        return result.ToArray();
     }
 
     // ── Import ──────────────────────────────────────────────────────────
@@ -1123,6 +1392,235 @@ public static class TokenRaderIndexer
         result.ProcessingMilliseconds = stopwatch.ElapsedMilliseconds;
         SetAggregateProgress(progressState, result.ProcessedRows, "区间聚合完成");
         return result;
+    }
+
+    /// <summary>
+    /// Streams token calls whose event timestamps fall inside one exact
+    /// half-open range [startedAt, endedAt). This powers the rolling 24-hour
+    /// history card without loading individual SQLite rows into PowerShell or
+    /// keeping a seven-day in-memory collection.
+    /// </summary>
+    public static TokenRaderIntervalAggregateResult AggregateTimeRangeRecords(
+        SQLiteConnection db,
+        DateTimeOffset startedAt,
+        DateTimeOffset endedAt,
+        IDictionary longContextThresholds,
+        CancellationToken cancellationToken,
+        IDictionary progressState = null)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        if (endedAt <= startedAt) throw new ArgumentException("endedAt must be later than startedAt");
+
+        var thresholds = ReadLongContextThresholds(longContextThresholds);
+        var resolvedThresholds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        var result = new TokenRaderIntervalAggregateResult();
+        var parentBySession = ReadAggregateParentMap(db);
+        var seenEventSessions = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var seenCumulativeSnapshots = new HashSet<string>(StringComparer.Ordinal);
+        var activeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var buckets = new Dictionary<string, TokenRaderIntervalAggregateBucket>(StringComparer.OrdinalIgnoreCase);
+        var stopwatch = Stopwatch.StartNew();
+
+        // ISO timestamps emitted by Codex are normally UTC. Widen the indexed
+        // lexical SQL range by one UTC date on each side, then apply the exact
+        // DateTimeOffset boundary in managed code. This also handles records
+        // carrying an explicit non-UTC offset without scanning all history.
+        string broadStart = startedAt.UtcDateTime.Date.AddDays(-1.0)
+            .ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
+        string broadEnd = endedAt.UtcDateTime.Date.AddDays(2.0)
+            .ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
+
+        SetAggregateProgress(progressState, 0L, "读取24小时磁盘记录");
+        string[] sourcePaths = ReadTimeRangeSourcePaths(db, broadStart, broadEnd);
+        SeedTimeRangeCumulativeSnapshots(db, sourcePaths, startedAt,
+            seenCumulativeSnapshots, cancellationToken);
+
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
+                "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id " +
+                "FROM token_records WHERE source_offset_end>0 AND timestamp>=@broad_start AND timestamp<@broad_end " +
+                "ORDER BY timestamp ASC,source_path ASC,source_offset_end ASC";
+            cmd.Parameters.AddWithValue("@broad_start", broadStart);
+            cmd.Parameters.AddWithValue("@broad_end", broadEnd);
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    result.ProcessedRows++;
+                    if ((result.ProcessedRows & 255L) == 0L)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        SetAggregateProgress(progressState, result.ProcessedRows, "读取24小时磁盘记录");
+                    }
+
+                    string sessionId = ReadReaderString(reader, 0);
+                    string timestampText = ReadReaderString(reader, 1);
+                    string model = ReadReaderString(reader, 2);
+                    long totalInput = ReadReaderInt64(reader, 3);
+                    long totalCached = ReadReaderInt64(reader, 4);
+                    long totalOutput = ReadReaderInt64(reader, 5);
+                    long totalReasoning = ReadReaderInt64(reader, 6);
+                    long callInput = ReadReaderInt64(reader, 7);
+                    long callCached = ReadReaderInt64(reader, 8);
+                    long callOutput = ReadReaderInt64(reader, 9);
+                    long callReasoning = ReadReaderInt64(reader, 10);
+                    string fingerprint = ReadReaderString(reader, 11);
+                    string sourcePath = ReadReaderString(reader, 12);
+                    string rootSessionId = ReadReaderString(reader, 14);
+
+                    DateTimeOffset eventAt;
+                    if (!TryParseTimestamp(timestampText, out eventAt) || eventAt < startedAt || eventAt >= endedAt) continue;
+                    result.RawEvents++;
+                    if (callInput <= 0L && callOutput <= 0L) continue;
+
+                    string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
+                        totalInput, totalCached, totalOutput, totalReasoning);
+                    if (!seenCumulativeSnapshots.Add(cumulativeKey))
+                    {
+                        result.DuplicateEventsDropped++;
+                        continue;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(rootSessionId)) rootSessionId = sessionId;
+                    string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
+                        totalInput, totalCached, totalOutput, totalReasoning,
+                        callInput, callCached, callOutput, callReasoning, fingerprint);
+                    List<string> priorSessions;
+                    bool lineageDuplicate = false;
+                    if (!seenEventSessions.TryGetValue(eventKey, out priorSessions))
+                    {
+                        priorSessions = new List<string>();
+                        seenEventSessions.Add(eventKey, priorSessions);
+                    }
+                    else
+                    {
+                        for (int priorIndex = 0; priorIndex < priorSessions.Count; priorIndex++)
+                        {
+                            if (AreAggregateSessionsLineageRelated(
+                                sessionId, priorSessions[priorIndex], rootSessionId, parentBySession))
+                            {
+                                lineageDuplicate = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!ContainsIgnoreCase(priorSessions, sessionId)) priorSessions.Add(sessionId);
+                    if (lineageDuplicate)
+                    {
+                        result.DuplicateEventsDropped++;
+                        continue;
+                    }
+
+                    result.CountedEvents++;
+                    result.TotalInput += callInput;
+                    result.TotalCached += callCached;
+                    result.TotalOutput += callOutput;
+                    result.TotalReasoning += callReasoning;
+                    if (!string.IsNullOrWhiteSpace(sourcePath)) activeFiles.Add(sourcePath);
+                    if (!string.IsNullOrWhiteSpace(model)) models.Add(model);
+                    long threshold;
+                    if (!resolvedThresholds.TryGetValue(model, out threshold))
+                    {
+                        threshold = ResolveAggregateLongContextThreshold(model, thresholds);
+                        resolvedThresholds[model] = threshold;
+                    }
+                    bool longContext = threshold > 0L && callInput > threshold;
+                    string bucketKey = model.ToLowerInvariant() + "|" + (longContext ? "long" : "standard");
+                    TokenRaderIntervalAggregateBucket bucket;
+                    if (!buckets.TryGetValue(bucketKey, out bucket))
+                    {
+                        bucket = new TokenRaderIntervalAggregateBucket {
+                            Model = model,
+                            LongContext = longContext
+                        };
+                        buckets.Add(bucketKey, bucket);
+                    }
+                    bucket.Input += callInput;
+                    bucket.Cached += callCached;
+                    bucket.Output += callOutput;
+                    bucket.Reasoning += callReasoning;
+                    bucket.Events++;
+                }
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        result.ChangedSessions = activeFiles.Count;
+        var sortedModels = new List<string>(models);
+        sortedModels.Sort(StringComparer.OrdinalIgnoreCase);
+        result.Models = sortedModels.ToArray();
+        var sortedBuckets = new List<TokenRaderIntervalAggregateBucket>(buckets.Values);
+        sortedBuckets.Sort(delegate(TokenRaderIntervalAggregateBucket left, TokenRaderIntervalAggregateBucket right) {
+            int comparison = StringComparer.OrdinalIgnoreCase.Compare(left.Model, right.Model);
+            if (comparison != 0) return comparison;
+            return left.LongContext.CompareTo(right.LongContext);
+        });
+        result.Buckets = sortedBuckets.ToArray();
+        result.ProcessingMilliseconds = stopwatch.ElapsedMilliseconds;
+        SetAggregateProgress(progressState, result.ProcessedRows, "24小时磁盘汇总完成");
+        return result;
+    }
+
+    private static string[] ReadTimeRangeSourcePaths(SQLiteConnection db, string broadStart, string broadEnd)
+    {
+        var paths = new List<string>();
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT DISTINCT source_path FROM token_records WHERE source_offset_end>0 AND source_path<>'' " +
+                "AND timestamp>=@start AND timestamp<@end ORDER BY source_path ASC";
+            cmd.Parameters.AddWithValue("@start", broadStart);
+            cmd.Parameters.AddWithValue("@end", broadEnd);
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string path = ReadReaderString(reader, 0);
+                    if (!string.IsNullOrWhiteSpace(path)) paths.Add(path);
+                }
+            }
+        }
+        return paths.ToArray();
+    }
+
+    private static void SeedTimeRangeCumulativeSnapshots(
+        SQLiteConnection db,
+        IEnumerable<string> sourcePaths,
+        DateTimeOffset startedAt,
+        HashSet<string> seenCumulativeSnapshots,
+        CancellationToken cancellationToken)
+    {
+        int pathIndex = 0;
+        foreach (string path in sourcePaths)
+        {
+            if ((pathIndex++ & 31) == 0) cancellationToken.ThrowIfCancellationRequested();
+            using (var cmd = db.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT session_id,timestamp,total_input,total_cached,total_output,total_reasoning " +
+                    "FROM token_records WHERE source_path=@path AND source_offset_end>0 " +
+                    "ORDER BY source_offset_end DESC";
+                cmd.Parameters.AddWithValue("@path", path);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        DateTimeOffset eventAt;
+                        if (!TryParseTimestamp(ReadReaderString(reader, 1), out eventAt) || eventAt >= startedAt) continue;
+                        seenCumulativeSnapshots.Add(BuildAggregateCumulativeKey(
+                            ReadReaderString(reader, 0),
+                            ReadReaderInt64(reader, 2),
+                            ReadReaderInt64(reader, 3),
+                            ReadReaderInt64(reader, 4),
+                            ReadReaderInt64(reader, 5)));
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     private static Dictionary<string, string> ReadAggregateParentMap(SQLiteConnection db)

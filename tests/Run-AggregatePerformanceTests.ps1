@@ -171,6 +171,58 @@ try {
     Assert-AggregateTest ($siblings.RawEvents -eq 2 -and $siblings.CountedEvents -eq 2) 'independent sibling calls were collapsed by shared-root deduplication'
     Assert-AggregateTest ($siblings.TotalInput -eq 1400 -and $siblings.TotalOutput -eq 140) 'independent sibling token totals changed'
 
+    # Rolling history is an exact half-open 24-hour timestamp window. Seed the
+    # last cumulative snapshot before the start so a later status refresh does
+    # not bill the previous call again; the record at End is excluded.
+    Add-TestAggregateRow $correctness 'history' '2026-08-29T00:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'history-before' 'synthetic://history' 10 'history-root'
+    Add-TestAggregateRow $correctness 'history' '2026-08-29T00:00:01Z' 'gpt-5.5' 1000 100 100 1000 100 100 'history-refresh' 'synthetic://history' 20 'history-root'
+    Add-TestAggregateRow $correctness 'history' '2026-08-29T00:00:02Z' 'gpt-5.5' 2000 200 200 1000 100 100 'history-call' 'synthetic://history' 30 'history-root'
+    Add-TestAggregateRow $correctness 'history' '2026-08-29T00:00:03Z' 'gpt-5.5' 3000 300 300 1000 100 100 'history-at-end' 'synthetic://history' 40 'history-root'
+    $historyAggregate = [TokenRaderIndexer]::AggregateTimeRangeRecords(
+        $correctness,
+        [DateTimeOffset]::Parse('2026-08-29T00:00:00.500Z'),
+        [DateTimeOffset]::Parse('2026-08-29T00:00:03Z'),
+        $thresholds, $none, $null)
+    Assert-AggregateTest ($historyAggregate.RawEvents -eq 2) 'rolling history did not keep exact start/end boundaries'
+    Assert-AggregateTest ($historyAggregate.CountedEvents -eq 1) 'rolling history billed a repeated pre-window cumulative snapshot'
+    Assert-AggregateTest ($historyAggregate.DuplicateEventsDropped -eq 1) 'rolling history did not diagnose the repeated snapshot'
+    Assert-AggregateTest ($historyAggregate.TotalInput -eq 1000 -and $historyAggregate.TotalCached -eq 100 -and $historyAggregate.TotalOutput -eq 100) 'rolling history token totals changed'
+
+    $historySnapshot = New-Object TokenRaderUsageHistorySnapshot
+    $historySnapshot.WindowStartTicks = [DateTimeOffset]::Parse('2026-08-29T00:00:00Z').UtcDateTime.Ticks
+    $historySnapshot.WindowEndTicks = [DateTimeOffset]::Parse('2026-08-30T00:00:00Z').UtcDateTime.Ticks
+    $historySnapshot.ComputedAtTicks = [DateTimeOffset]::Parse('2026-08-30T00:00:01Z').UtcDateTime.Ticks
+    $historySnapshot.IndexRevision = 7
+    $historySnapshot.PricingKey = 'synthetic-pricing'
+    $historySnapshot.TotalInput = 1000
+    $historySnapshot.TotalCached = 100
+    $historySnapshot.TotalOutput = 100
+    $historySnapshot.InputCost = 0.001
+    $historySnapshot.CachedCost = 0.0001
+    $historySnapshot.OutputCost = 0.002
+    $historySnapshot.PricingComplete = $true
+    $historySnapshot.ModelDisplay = 'gpt-5.5'
+    $historySnapshot.Models = 'gpt-5.5'
+    $historyModel = New-Object TokenRaderUsageHistoryModelSnapshot
+    $historyModel.Model = 'gpt-5.5'
+    $historyModel.TotalInput = 1000
+    $historyModel.TotalCached = 100
+    $historyModel.TotalOutput = 100
+    $historyModel.InputCost = 0.001
+    $historyModel.CachedCost = 0.0001
+    $historyModel.OutputCost = 0.002
+    $historyModel.PricingComplete = $true
+    $historyModel.Events = 1
+    $historySnapshot.ModelBreakdown = [TokenRaderUsageHistoryModelSnapshot[]]@($historyModel)
+    [TokenRaderIndexer]::SaveUsageHistorySnapshot($correctness, $historySnapshot)
+    $loadedHistory = [TokenRaderIndexer]::GetUsageHistorySnapshot(
+        $correctness, $historySnapshot.WindowStartTicks, $historySnapshot.WindowEndTicks, 7, 'synthetic-pricing')
+    Assert-AggregateTest ($null -ne $loadedHistory -and $loadedHistory.TotalInput -eq 1000 -and $loadedHistory.PricingComplete) 'disk usage-history snapshot did not round-trip'
+    Assert-AggregateTest ($loadedHistory.ModelBreakdown.Count -eq 1 -and $loadedHistory.ModelBreakdown[0].Model -eq 'gpt-5.5' -and $loadedHistory.ModelBreakdown[0].TotalInput -eq 1000) 'disk per-model usage history did not round-trip'
+    Assert-AggregateTest ([TokenRaderIndexer]::GetUsageHistoryCount($correctness) -eq 1) 'usage-history row count changed'
+    $removedHistory = [TokenRaderIndexer]::PurgeUsageHistory($correctness, $historySnapshot.WindowEndTicks + 1)
+    Assert-AggregateTest ($removedHistory -eq 1 -and [TokenRaderIndexer]::GetUsageHistoryCount($correctness) -eq 0) 'seven-day usage-history purge did not remove an expired snapshot'
+
     $cancelled = [Threading.CancellationTokenSource]::new()
     try {
         $cancelled.Cancel()
@@ -245,6 +297,20 @@ WHERE seq<=1885000;
             Write-Output ('AGGREGATE_PERF rows={0} elapsedMs={1:0.0} internalMs={2}' -f
                 $profile.Rows, $watch.Elapsed.TotalMilliseconds, $aggregate.ProcessingMilliseconds)
         }
+        Invoke-TestSql $performance 'CREATE INDEX idx_records_timestamp ON token_records(timestamp);'
+        $historyWatch = [Diagnostics.Stopwatch]::StartNew()
+        $historyAggregate = [TokenRaderIndexer]::AggregateTimeRangeRecords(
+            $performance,
+            [DateTimeOffset]::Parse('2026-08-28T00:00:00Z'),
+            [DateTimeOffset]::Parse('2026-08-29T00:00:00Z'),
+            $thresholds, $none, $null)
+        $historyWatch.Stop()
+        Assert-AggregateTest ($historyAggregate.CountedEvents -eq 108010L) 'large rolling history count changed'
+        Assert-AggregateTest ($historyWatch.Elapsed.TotalMilliseconds -le 4000.0) (
+            'rolling history aggregate exceeded target: rows={0}, elapsed={1:0.0} ms, target=4000.0 ms' -f
+                $historyAggregate.CountedEvents, $historyWatch.Elapsed.TotalMilliseconds)
+        Write-Output ('HISTORY_PERF rows={0} elapsedMs={1:0.0} internalMs={2}' -f
+            $historyAggregate.CountedEvents, $historyWatch.Elapsed.TotalMilliseconds, $historyAggregate.ProcessingMilliseconds)
     } finally {
         $performance.Close()
         $performance.Dispose()

@@ -1311,6 +1311,12 @@ try {
         # Simulate a delayed/lost watcher notification by draining it manually.
         # Boundary capture must still find the completed line via lightweight
         # full reconciliation before it freezes EndOffsets.
+        $parallelModelSwitch = [ordered]@{
+            timestamp = $parallelAppendAt.AddMilliseconds(5).ToString('o')
+            type = 'turn_context'
+            payload = [ordered]@{ model = 'gpt-5.6-sol' }
+        }
+        [IO.File]::AppendAllText($parallelRootPath, (($parallelModelSwitch | ConvertTo-Json -Depth 5 -Compress) + [Environment]::NewLine), $parallelUtf8)
         $parallelAppend2 = New-TestTokenRecord -Timestamp $parallelAppendAt.AddMilliseconds(10).ToString('o') -TotalInput 3000 -TotalCached 300 -TotalOutput 300 -CallInput 1000 -CallCached 100 -CallOutput 100
         [IO.File]::AppendAllText($parallelRootPath, (($parallelAppend2 | ConvertTo-Json -Depth 10 -Compress) + [Environment]::NewLine), $parallelUtf8)
         Start-Sleep -Milliseconds 50
@@ -1322,6 +1328,49 @@ try {
             [DateTimeOffset]$parallelBaseline.StartedAt, @{}, [Threading.CancellationToken]::None, $null)
         Assert-Equal 2 ([Int64]$parallelInterval.CountedEvents) 'stable end boundary retains both post-baseline calls'
         Assert-Equal 2000 ([Int64]$parallelInterval.TotalInput) 'stable end boundary post-baseline token total'
+
+        # The rolling history path reads one exact 24-hour range from SQLite,
+        # applies the same lineage-aware deduplication and persists only its
+        # compact totals. A repeated query with the same revision/range/prices
+        # must come directly from the disk cache.
+        $historyAnchor = $parallelAt.AddMinutes(1)
+        $historyResult = Get-TokenRaderUsageHistoryWindow `
+            -SessionsRoot $parallelSessions `
+            -PricingDocument $prices `
+            -DayOffset 0 `
+            -AnchorAt $historyAnchor `
+            -ForceRefresh
+        Assert-Equal 3 ([Int64]$historyResult.CountedEvents) 'rolling 24-hour history unique call count'
+        Assert-Equal 3000 ([Int64]$historyResult.Usage.Input) 'rolling 24-hour history input total'
+        Assert-Equal 300 ([Int64]$historyResult.Usage.Cached) 'rolling 24-hour history cached total'
+        Assert-Equal 300 ([Int64]$historyResult.Usage.Output) 'rolling 24-hour history output total'
+        Assert-Equal 2 @($historyResult.ModelBreakdown).Count 'rolling 24-hour history model breakdown count'
+        $history55 = @($historyResult.ModelBreakdown | Where-Object { [string]$_.Model -eq 'gpt-5.5' })[0]
+        $history56 = @($historyResult.ModelBreakdown | Where-Object { [string]$_.Model -eq 'gpt-5.6-sol' })[0]
+        Assert-Equal 2000 ([Int64]$history55.Usage.Input) 'rolling history gpt-5.5 token total'
+        Assert-Equal 1000 ([Int64]$history56.Usage.Input) 'rolling history gpt-5.6 token total'
+        Assert-Greater 0 ([Int64][Math]::Round([double]$history55.TotalCost * 1000000000.0)) 'rolling history gpt-5.5 API cost'
+        Assert-Greater 0 ([Int64][Math]::Round([double]$history56.TotalCost * 1000000000.0)) 'rolling history gpt-5.6 API cost'
+        Assert-Equal $false ([bool]$historyResult.FromCache) 'forced rolling history unexpectedly used a cached snapshot'
+        $historyCached = Get-TokenRaderUsageHistoryWindow `
+            -SessionsRoot $parallelSessions `
+            -PricingDocument $prices `
+            -DayOffset 0 `
+            -AnchorAt $historyAnchor
+        Assert-Equal $true ([bool]$historyCached.FromCache) 'rolling history was not reloaded from its disk snapshot'
+        Assert-Equal 2 @($historyCached.ModelBreakdown).Count 'rolling history cached model breakdown count'
+        Assert-Near ([double]$historyResult.TotalCost) ([double]$historyCached.TotalCost) 0.0000001 'rolling history cached API cost'
+
+        $expiredSnapshot = New-Object TokenRaderUsageHistorySnapshot
+        $expiredSnapshot.WindowStartTicks = $historyAnchor.AddDays(-9).UtcDateTime.Ticks
+        $expiredSnapshot.WindowEndTicks = $historyAnchor.AddDays(-8).UtcDateTime.Ticks
+        $expiredSnapshot.ComputedAtTicks = $historyAnchor.AddDays(-8).UtcDateTime.Ticks
+        $expiredSnapshot.IndexRevision = [Int64]$historyResult.IndexRevision
+        $expiredSnapshot.PricingKey = 'expired-test'
+        [TokenRaderIndexer]::SaveUsageHistorySnapshot((Get-TokenRaderIndex).Connection, $expiredSnapshot)
+        $historyRemoved = Remove-TokenRaderUsageHistory -SessionsRoot $parallelSessions -RetentionDays 7 -ReferenceAt $historyAnchor
+        Assert-Equal 1 ([int]$historyRemoved) 'rolling history did not purge only the snapshot older than seven days'
+        Assert-Equal 1 ([int][TokenRaderIndexer]::GetUsageHistoryCount((Get-TokenRaderIndex).Connection)) 'rolling history retained an unexpected number of snapshots'
 
         # The writer lock must be exclusive even when a second acquisition is
         # attempted independently, and the on-disk database must use WAL.
@@ -1551,7 +1600,7 @@ try {
     [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
-    foreach ($controlName in @('ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'IntervalStatusText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText', 'TotalMetricText', 'HitRateMetricText', 'UsdCostText', 'FiveHourUsageText', 'FiveHourDollarText', 'WeeklyUsageText', 'WeeklyDollarText', 'PricingDataGrid')) {
+    foreach ($controlName in @('ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'IntervalStatusText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText', 'TotalMetricText', 'HitRateMetricText', 'UsdCostText', 'FiveHourUsageText', 'FiveHourDollarText', 'WeeklyUsageText', 'WeeklyDollarText', 'PricingDataGrid', 'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText', 'UsageHistoryModelText', 'UsageHistoryStatusText', 'UsageHistoryModelGrid')) {
         if ($null -eq $window.FindName($controlName)) { throw "ASSERT FAILED: missing XAML control $controlName" }
     }
     $historyRange = $window.FindName('HistoryRangeComboBox')
@@ -1559,14 +1608,34 @@ try {
         [string]$historyRange.Items[0].Content -ne '最近1天' -or $historyRange.SelectedIndex -ne 0) {
         throw 'UI CONTRACT FAILED: rolling 24-hour history must be the first and default range'
     }
+    $usageHistoryRange = $window.FindName('UsageHistoryRangeComboBox')
+    if ($usageHistoryRange.Items.Count -ne 7 -or $usageHistoryRange.SelectedIndex -ne 0 -or
+        [string]$usageHistoryRange.Items[0].Tag -ne '0' -or [string]$usageHistoryRange.Items[6].Tag -ne '6' -or
+        [string]$usageHistoryRange.Items[0].Content -ne '过去24小时') {
+        throw 'UI CONTRACT FAILED: disk usage history must expose seven rolling 24-hour windows and default to the latest'
+    }
+    if ($window.FindName('UsageHistoryModelGrid').Columns.Count -ne 6) {
+        throw 'UI CONTRACT FAILED: rolling history must show per-model cached, uncached, output, total token and API cost columns'
+    }
 
     # Interval view must be a cheap state/cache operation. It must not scan the
     # whole session tree synchronously on every click, and the background
     # compute path must not fall back to invoking the parser on the UI thread.
     $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
     if ($uiSource -notmatch 'HistoryRangeComboBox\.IsEnabled\s*=\s*\(\$NewState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)\)' -or
+        $uiSource -notmatch 'UsageHistoryRangeComboBox\.IsEnabled\s*=\s*\(\$NewState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)\)' -or
         $uiSource -notmatch 'State\.UiState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)') {
         throw 'UI CONTRACT FAILED: history range must remain selectable while measuring'
+    }
+    if ($uiSource -notmatch 'Start-TokenRaderUsageHistoryRefresh\s+-PurgeExpired\s+\$true' -or
+        $uiSource -notmatch "-Kind\s+'UsageHistory'" -or
+        $uiSource -notmatch 'Get-TokenRaderUsageHistoryWindow' -or
+        $uiSource -notmatch "Model\s*=\s*'总计'") {
+        throw 'UI CONTRACT FAILED: final settlement must asynchronously refresh and purge the disk-backed seven-day usage history'
+    }
+    if ($uiSource -notmatch 'Get-TokenRaderBackgroundErrorMessage' -or
+        $uiSource -notmatch 'Streams\.Error' -or $uiSource -notmatch "-notmatch\s+'EndInvoke'") {
+        throw 'UI CONTRACT FAILED: background failures must unwrap EndInvoke and display the worker error'
     }
     $indexerSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'indexer\TokenRader.Indexer.cs'))
     if ($indexerSource -notmatch 'QueryLatestRateLimitRowsByOffsetRanges' -or
@@ -1615,11 +1684,25 @@ try {
     # the UI remains locked in Starting because completion is never observed.
     $pollerMatch = [regex]::Match($uiSource, '(?s)function Start-TokenRaderBackgroundPoller\b.*?(?=\r?\nfunction |\z)')
     if (-not $pollerMatch.Success) { throw 'UI CONTRACT FAILED: background completion poller was not found' }
-    foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Invoke-TokenRaderBackgroundHandler',
+    foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Get-TokenRaderBackgroundErrorMessage', 'Invoke-TokenRaderBackgroundHandler',
             'Request-TokenRaderBackgroundStop', 'Start-TokenRaderBackgroundPoller', 'Start-TokenRaderBackgroundJob')) {
         $helperMatch = [regex]::Match($uiSource, ('(?s)function ' + [regex]::Escape($helperName) + '\b.*?(?=\r?\nfunction |\z)'))
         if (-not $helperMatch.Success) { throw ('UI CONTRACT FAILED: helper not found: ' + $helperName) }
         Invoke-Expression $helperMatch.Value
+    }
+    $errorProbe = [PowerShell]::Create()
+    try {
+        [void]$errorProbe.AddScript("throw 'synthetic worker detail'")
+        $errorProbeAsync = $errorProbe.BeginInvoke()
+        if (-not $errorProbeAsync.AsyncWaitHandle.WaitOne(5000)) { throw 'ASYNC CONTRACT FAILED: error probe did not complete' }
+        $unwrappedError = ''
+        try { [void]$errorProbe.EndInvoke($errorProbeAsync) }
+        catch { $unwrappedError = Get-TokenRaderBackgroundErrorMessage -Worker $errorProbe -Exception $_.Exception }
+        if ($unwrappedError -notmatch 'synthetic worker detail' -or $unwrappedError -match 'EndInvoke') {
+            throw ('ASYNC CONTRACT FAILED: EndInvoke wrapper was not replaced by the worker error: ' + $unwrappedError)
+        }
+    } finally {
+        try { $errorProbe.Dispose() } catch { }
     }
     $script:WindowClosing = $false
     $script:BackgroundPollTimer = $null
