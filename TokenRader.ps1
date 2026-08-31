@@ -1338,17 +1338,13 @@ function Set-QuotaWindowCard {
         $ResetText.Text = '暂无窗口'
         return
     }
-    $UsageText.Text = ('{0:0.#}%' -f [double]$Window.UsedPercent)
+    $UsageText.Text = ('{0:0.####}%' -f [double]$Window.UsedPercent)
     $Progress.Value = [Math]::Max(0, [Math]::Min(100, [double]$Window.UsedPercent))
     $ResetText.Text = if ($null -ne $Window.ResetsAt) { ('重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt) } else { ('{0} 分钟窗口' -f $Window.WindowMinutes) }
     if ($null -ne $Estimate) {
-        $minimumBasis = if ($null -ne $Estimate.PSObject.Properties['MinimumDeltaApplied'] -and [bool]$Estimate.MinimumDeltaApplied) {
-            (' · 实际 +{0:0.##}%，按 1% 反推' -f [double]$Estimate.DeltaPercent)
-        } else { '' }
-        $DollarText.Text = ('美金额度≈{0} · 从 {1:0.#}% 开始{2} · 已用≈{3} · 剩余≈{4}' -f
+        $DollarText.Text = ('美金额度≈{0} · 从 {1:0.####}% 开始 · 已用≈{2} · 剩余≈{3}' -f
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
             [double]$Estimate.StartUsedPercent,
-            $minimumBasis,
             (Format-TokenRaderUsd ([double]$Estimate.UsedUsd)),
             (Format-TokenRaderUsd ([double]$Estimate.RemainingUsd)))
     } else {
@@ -1395,18 +1391,12 @@ function Update-QuotaEstimatesFromInterval {
 
     $calibrated = @()
     if ($null -ne $newEstimates.FiveHour) {
-        $basis = if ([bool]$newEstimates.FiveHour.MinimumDeltaApplied) {
-            '实际 +{0:0.##}%，按 1% 反推' -f $newEstimates.FiveHour.DeltaPercent
-        } else { '+{0:0.#}%' -f $newEstimates.FiveHour.DeltaPercent }
-        $calibrated += ('5 小时 {0:0.#}%→{1:0.#}%（{2}）' -f
-            $newEstimates.FiveHour.StartUsedPercent, $newEstimates.FiveHour.EndUsedPercent, $basis)
+        $calibrated += ('5 小时 {0:0.####}%→{1:0.####}%（+{2:0.####}%）' -f
+            $newEstimates.FiveHour.StartUsedPercent, $newEstimates.FiveHour.EndUsedPercent, $newEstimates.FiveHour.DeltaPercent)
     }
     if ($null -ne $newEstimates.Weekly) {
-        $basis = if ([bool]$newEstimates.Weekly.MinimumDeltaApplied) {
-            '实际 +{0:0.##}%，按 1% 反推' -f $newEstimates.Weekly.DeltaPercent
-        } else { '+{0:0.#}%' -f $newEstimates.Weekly.DeltaPercent }
-        $calibrated += ('周 {0:0.#}%→{1:0.#}%（{2}）' -f
-            $newEstimates.Weekly.StartUsedPercent, $newEstimates.Weekly.EndUsedPercent, $basis)
+        $calibrated += ('周 {0:0.####}%→{1:0.####}%（+{2:0.####}%）' -f
+            $newEstimates.Weekly.StartUsedPercent, $newEstimates.Weekly.EndUsedPercent, $newEstimates.Weekly.DeltaPercent)
     }
     $phase = if ($Final) { '最终' } else { '实时' }
     $script:State.QuotaCalibrationMessage = if ($calibrated.Count -gt 0) {
@@ -1622,9 +1612,9 @@ function Start-TokenRaderIntervalComputeAsync {
     if ([Int64]$script:State.MeasurementGeneration -ne $effectiveGeneration) { return }
     $effectiveRequestId = if ($RequestId -gt 0) { $RequestId } else { New-TokenRaderRequestId }
     if ([bool]$script:State.IntervalComputing) {
-        # A final request always supersedes a preview. A manual preview that
-        # requests fresh quota data may follow an automatic token-only preview,
-        # but repeated equivalent clicks are coalesced into the same request.
+        # A final request always supersedes a preview. A quota-aware preview
+        # may follow an explicitly token-only caller, while repeated equivalent
+        # clicks are coalesced into the same request.
         $queueManualQuota = (-not $Final -and $ScanRateLimits -and
             -not [bool]$script:State.IntervalActiveScanRateLimits -and
             (-not [bool]$script:State.IntervalComputePending -or
@@ -1748,9 +1738,9 @@ function Complete-TokenRaderIntervalCompute {
         if ($null -ne $Payload.PSObject.Properties['LatestRateLimits']) { Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits }
         $endLimits = if ($null -ne $result.PSObject.Properties['EndRateLimits']) { $result.EndRateLimits } else { $result.RateLimits }
         Merge-LatestRateLimits -Candidate $endLimits
-        # Automatic five-minute previews deliberately skip the quota query.
-        # Their null EndRateLimits must not erase the last estimate calibrated
-        # by a manual View Result or the final frozen settlement.
+        # A caller may explicitly skip the quota query. Its null EndRateLimits
+        # must not erase the last estimate calibrated by a quota-aware preview
+        # or the final frozen settlement.
         if ($ScanRateLimits) {
             Update-QuotaEstimatesFromInterval -Result $result -Final $Final
         }
@@ -1874,7 +1864,7 @@ function Update-IntervalView {
         }
         Start-TokenRaderIntervalComputeAsync `
             -Baseline $script:State.IntervalBaseline `
-            -ScanRateLimits ([bool]$Manual) `
+            -ScanRateLimits $true `
             -Generation ([Int64]$script:State.MeasurementGeneration)
     }
 }

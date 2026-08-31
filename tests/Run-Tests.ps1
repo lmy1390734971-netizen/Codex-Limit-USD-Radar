@@ -391,14 +391,12 @@ try {
     $minimumDeltaStart = New-TestQuotaRateLimits -FiveHourUsed 3.0 -WeeklyUsed 7.0 `
         -FiveHourReset ([DateTimeOffset]::Parse('2026-07-14T10:00:00Z')) `
         -WeeklyReset ([DateTimeOffset]::Parse('2026-07-20T10:00:00Z'))
-    $minimumDeltaEnd = New-TestQuotaRateLimits -FiveHourUsed 3.4 -WeeklyUsed 7.4 `
+    $minimumDeltaEnd = New-TestQuotaRateLimits -FiveHourUsed 3.1 -WeeklyUsed 7.1 `
         -FiveHourReset ([DateTimeOffset]::Parse('2026-07-14T10:00:00Z')) `
         -WeeklyReset ([DateTimeOffset]::Parse('2026-07-20T10:00:00Z'))
     $minimumDeltaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $minimumDeltaEnd -IntervalCost 1.25 -CostComplete $true
-    Assert-Near 0.4 $minimumDeltaEstimate.FiveHour.DeltaPercent 0.0001 'sub-one-percent observed quota delta'
-    Assert-Near 1.0 $minimumDeltaEstimate.FiveHour.EffectiveDeltaPercent 0.0001 'sub-one-percent effective quota delta'
-    Assert-Equal $true $minimumDeltaEstimate.FiveHour.MinimumDeltaApplied 'sub-one-percent quota floor marker'
-    Assert-Near 125.0 $minimumDeltaEstimate.FiveHour.TotalUsd 0.0001 'sub-one-percent quota uses one-percent denominator'
+    Assert-Near 0.1 $minimumDeltaEstimate.FiveHour.DeltaPercent 0.0001 'one-decimal log quota delta'
+    Assert-Near 1250.0 $minimumDeltaEstimate.FiveHour.TotalUsd 0.0001 'one-decimal quota uses exact log precision'
     $zeroDeltaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $minimumDeltaStart -IntervalCost 1.25 -CostComplete $true
     Assert-Equal $null $zeroDeltaEstimate.FiveHour 'zero-percent quota delta remains invalid'
 
@@ -1753,9 +1751,17 @@ try {
     # whole session tree synchronously on every click, and the background
     # compute path must not fall back to invoking the parser on the UI thread.
     $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
+    $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
     if ($uiSource.Contains('待时间段校准') -or
-        $uiSource -notmatch '美金额度≈\{0\} · 从 \{1:0\.#\}% 开始') {
+        $uiSource -notmatch '美金额度≈\{0\} · 从 \{1:0\.####\}% 开始') {
         throw 'UI CONTRACT FAILED: quota estimates must display direct USD and their starting percentage'
+    }
+    if ($uiSource -match '按 1% 反推' -or $coreSource -match 'Max\(1\.0,\s*\$deltaPercent\)') {
+        throw 'QUOTA CONTRACT FAILED: quota inference must use the exact positive precision provided by logs'
+    }
+    if ($uiSource -match '-ScanRateLimits\s+\(\[bool\]\$Manual\)' -or
+        $uiSource -notmatch '(?s)function Update-IntervalView\b.*?Start-TokenRaderIntervalComputeAsync\s+`\s*\r?\n\s*-Baseline \$script:State\.IntervalBaseline\s+`\s*\r?\n\s*-ScanRateLimits \$true') {
+        throw 'QUOTA CONTRACT FAILED: measuring previews must query quota snapshots without waiting for final settlement'
     }
     if ($uiSource -notmatch '未单独计价：工具 \{0:N0\} 次 · 输入图片 \{1:N0\} 张 · 生成图片 \{2:N0\} 张') {
         throw 'UI CONTRACT FAILED: runtime unpriced tool/image summary text is missing'
@@ -1774,7 +1780,6 @@ try {
     if ($uiSource -notmatch '(?s)elseif\s*\(\$succeeded\s+-and\s+\$accepted\s+-and\s+-not\s+\$hasPendingInterval\).*?Start-TokenRaderUsageHistoryRefresh') {
         throw 'UI CONTRACT FAILED: a successful measuring preview must refresh the rolling 24-hour card'
     }
-    $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
     if ($coreSource -notmatch '(?s)function Get-TokenRaderUsageHistoryWindow\b.*?Sync-TokenRaderMeasurementBoundary') {
         throw 'HISTORY CONTRACT FAILED: every rolling history query must synchronize a stable latest index boundary'
     }
@@ -2026,8 +2031,8 @@ try {
         throw 'UI CONTRACT FAILED: live/final timeout, slow-stage warning, cancellation, or final-preview preemption contract changed'
     }
     if ($viewMatch.Value -notmatch 'param\(\[switch\]\$Manual\)' -or
-        $viewMatch.Value -notmatch 'ScanRateLimits \(\[bool\]\$Manual\)') {
-        throw 'UI CONTRACT FAILED: manual result refresh must request a quota snapshot from the same frozen end offsets'
+        $viewMatch.Value -notmatch 'ScanRateLimits \$true') {
+        throw 'UI CONTRACT FAILED: automatic and manual result refreshes must request quota snapshots before final settlement'
     }
     $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
     $indexedResultMatch = [regex]::Match($coreSource, '(?s)function Get-TokenRaderIndexedIntervalResult\b.*?(?=\r?\nfunction |\z)')
