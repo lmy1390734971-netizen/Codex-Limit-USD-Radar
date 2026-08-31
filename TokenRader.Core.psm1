@@ -1463,6 +1463,21 @@ function Get-TokenRaderQuotaEstimate {
         [bool]$CostComplete = $true
     )
 
+    function Get-WindowPercentResolution {
+        param($Window)
+        if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['PercentResolution']) {
+            $declared = [double]$Window.PercentResolution
+            if ($declared -gt 0 -and $declared -le 100) { return $declared }
+        }
+        if ($null -eq $Window) { return 1.0 }
+        $text = ([double]$Window.UsedPercent).ToString('0.################', [Globalization.CultureInfo]::InvariantCulture)
+        $separator = $text.IndexOf('.')
+        if ($separator -lt 0) { return 1.0 }
+        $digits = $text.Length - $separator - 1
+        if ($digits -le 0) { return 1.0 }
+        return [Math]::Pow(10.0, -$digits)
+    }
+
     function Get-WindowEstimate {
         param($StartWindow, $EndWindow, [string]$StartPlanType, [string]$EndPlanType)
         if (-not $CostComplete -or $IntervalCost -le 0 -or $null -eq $StartWindow -or $null -eq $EndWindow) { return $null }
@@ -1479,12 +1494,21 @@ function Get-TokenRaderQuotaEstimate {
         if ($null -ne $StartWindow.PSObject.Properties['ObservedAt'] -and $null -ne $EndWindow.PSObject.Properties['ObservedAt'] -and
             [DateTimeOffset]$EndWindow.ObservedAt -lt [DateTimeOffset]$StartWindow.ObservedAt) { return $null }
         $deltaPercent = [double]$EndWindow.UsedPercent - [double]$StartWindow.UsedPercent
-        if ($deltaPercent -le 0) { return $null }
-        $totalUsd = $IntervalCost / ($deltaPercent / 100.0)
+        if ($deltaPercent -lt -0.000000001) { return $null }
+        if ([Math]::Abs($deltaPercent) -lt 0.000000001) { $deltaPercent = 0.0 }
+        $percentResolution = [Math]::Min(
+            [double](Get-WindowPercentResolution $StartWindow),
+            [double](Get-WindowPercentResolution $EndWindow))
+        $effectiveDeltaPercent = if ($deltaPercent -gt 0) { $deltaPercent } else { $percentResolution }
+        if ($effectiveDeltaPercent -le 0) { return $null }
+        $totalUsd = $IntervalCost / ($effectiveDeltaPercent / 100.0)
         [pscustomobject]@{
             StartUsedPercent = [double]$StartWindow.UsedPercent
             EndUsedPercent = [double]$EndWindow.UsedPercent
             DeltaPercent = $deltaPercent
+            EffectiveDeltaPercent = $effectiveDeltaPercent
+            PercentResolution = $percentResolution
+            ResolutionAssumptionApplied = $deltaPercent -eq 0.0
             TotalUsd = $totalUsd
             UsedUsd = $totalUsd * ([double]$EndWindow.UsedPercent / 100.0)
             RemainingUsd = $totalUsd * ([double]$EndWindow.RemainingPercent / 100.0)

@@ -397,8 +397,20 @@ try {
     $minimumDeltaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $minimumDeltaEnd -IntervalCost 1.25 -CostComplete $true
     Assert-Near 0.1 $minimumDeltaEstimate.FiveHour.DeltaPercent 0.0001 'one-decimal log quota delta'
     Assert-Near 1250.0 $minimumDeltaEstimate.FiveHour.TotalUsd 0.0001 'one-decimal quota uses exact log precision'
-    $zeroDeltaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $minimumDeltaStart -IntervalCost 1.25 -CostComplete $true
-    Assert-Equal $null $zeroDeltaEstimate.FiveHour 'zero-percent quota delta remains invalid'
+    $wholePercentZeroEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $minimumDeltaStart -IntervalCost 1.25 -CostComplete $true
+    Assert-Equal $true $wholePercentZeroEstimate.FiveHour.ResolutionAssumptionApplied 'unchanged whole-percent log uses its precision step'
+    Assert-Near 1.0 $wholePercentZeroEstimate.FiveHour.EffectiveDeltaPercent 0.0001 'whole-percent log precision step'
+    Assert-Near 125.0 $wholePercentZeroEstimate.FiveHour.TotalUsd 0.0001 'unchanged whole-percent direct quota estimate'
+    Add-Member -InputObject $minimumDeltaStart.FiveHour -NotePropertyName PercentResolution -NotePropertyValue 0.1
+    $decimalPrecisionZeroEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $minimumDeltaStart -IntervalCost 1.25 -CostComplete $true
+    Assert-Equal $true $decimalPrecisionZeroEstimate.FiveHour.ResolutionAssumptionApplied 'unchanged decimal log uses declared precision step'
+    Assert-Near 0.1 $decimalPrecisionZeroEstimate.FiveHour.EffectiveDeltaPercent 0.0001 'decimal log precision step'
+    Assert-Near 1250.0 $decimalPrecisionZeroEstimate.FiveHour.TotalUsd 0.0001 'unchanged decimal-precision direct quota estimate'
+    $negativeDeltaEnd = New-TestQuotaRateLimits -FiveHourUsed 2.9 -WeeklyUsed 6.9 `
+        -FiveHourReset ([DateTimeOffset]::Parse('2026-07-14T10:00:00Z')) `
+        -WeeklyReset ([DateTimeOffset]::Parse('2026-07-20T10:00:00Z'))
+    $negativeDeltaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $negativeDeltaEnd -IntervalCost 1.25 -CostComplete $true
+    Assert-Equal $null $negativeDeltaEstimate.FiveHour 'negative quota delta remains invalid'
 
     # Explicit measurement capture contract used by the asynchronous UI.  The
     # public commands freeze offsets/snapshots before the worker starts; the end
@@ -1758,6 +1770,10 @@ try {
     }
     if ($uiSource -match '按 1% 反推' -or $coreSource -match 'Max\(1\.0,\s*\$deltaPercent\)') {
         throw 'QUOTA CONTRACT FAILED: quota inference must use the exact positive precision provided by logs'
+    }
+    if ($uiSource -notmatch '百分比未变化，按日志精度 \{0:0\.####\}% 估算' -or
+        $coreSource -notmatch 'ResolutionAssumptionApplied') {
+        throw 'QUOTA CONTRACT FAILED: unchanged percentages with billable cost must display a precision-based direct estimate'
     }
     if ($uiSource -match '-ScanRateLimits\s+\(\[bool\]\$Manual\)' -or
         $uiSource -notmatch '(?s)function Update-IntervalView\b.*?Start-TokenRaderIntervalComputeAsync\s+`\s*\r?\n\s*-Baseline \$script:State\.IntervalBaseline\s+`\s*\r?\n\s*-ScanRateLimits \$true') {

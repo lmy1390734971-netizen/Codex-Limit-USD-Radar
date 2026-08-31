@@ -1342,9 +1342,13 @@ function Set-QuotaWindowCard {
     $Progress.Value = [Math]::Max(0, [Math]::Min(100, [double]$Window.UsedPercent))
     $ResetText.Text = if ($null -ne $Window.ResetsAt) { ('重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt) } else { ('{0} 分钟窗口' -f $Window.WindowMinutes) }
     if ($null -ne $Estimate) {
-        $DollarText.Text = ('美金额度≈{0} · 从 {1:0.####}% 开始 · 已用≈{2} · 剩余≈{3}' -f
+        $resolutionBasis = if ($null -ne $Estimate.PSObject.Properties['ResolutionAssumptionApplied'] -and [bool]$Estimate.ResolutionAssumptionApplied) {
+            (' · 百分比未变化，按日志精度 {0:0.####}% 估算' -f [double]$Estimate.EffectiveDeltaPercent)
+        } else { '' }
+        $DollarText.Text = ('美金额度≈{0} · 从 {1:0.####}% 开始{2} · 已用≈{3} · 剩余≈{4}' -f
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
             [double]$Estimate.StartUsedPercent,
+            $resolutionBasis,
             (Format-TokenRaderUsd ([double]$Estimate.UsedUsd)),
             (Format-TokenRaderUsd ([double]$Estimate.RemainingUsd)))
     } else {
@@ -1391,12 +1395,18 @@ function Update-QuotaEstimatesFromInterval {
 
     $calibrated = @()
     if ($null -ne $newEstimates.FiveHour) {
-        $calibrated += ('5 小时 {0:0.####}%→{1:0.####}%（+{2:0.####}%）' -f
-            $newEstimates.FiveHour.StartUsedPercent, $newEstimates.FiveHour.EndUsedPercent, $newEstimates.FiveHour.DeltaPercent)
+        $basis = if ([bool]$newEstimates.FiveHour.ResolutionAssumptionApplied) {
+            '百分比未变化，按日志精度 {0:0.####}% 估算' -f $newEstimates.FiveHour.EffectiveDeltaPercent
+        } else { '+{0:0.####}%' -f $newEstimates.FiveHour.DeltaPercent }
+        $calibrated += ('5 小时 {0:0.####}%→{1:0.####}%（{2}）' -f
+            $newEstimates.FiveHour.StartUsedPercent, $newEstimates.FiveHour.EndUsedPercent, $basis)
     }
     if ($null -ne $newEstimates.Weekly) {
-        $calibrated += ('周 {0:0.####}%→{1:0.####}%（+{2:0.####}%）' -f
-            $newEstimates.Weekly.StartUsedPercent, $newEstimates.Weekly.EndUsedPercent, $newEstimates.Weekly.DeltaPercent)
+        $basis = if ([bool]$newEstimates.Weekly.ResolutionAssumptionApplied) {
+            '百分比未变化，按日志精度 {0:0.####}% 估算' -f $newEstimates.Weekly.EffectiveDeltaPercent
+        } else { '+{0:0.####}%' -f $newEstimates.Weekly.DeltaPercent }
+        $calibrated += ('周 {0:0.####}%→{1:0.####}%（{2}）' -f
+            $newEstimates.Weekly.StartUsedPercent, $newEstimates.Weekly.EndUsedPercent, $basis)
     }
     $phase = if ($Final) { '最终' } else { '实时' }
     $script:State.QuotaCalibrationMessage = if ($calibrated.Count -gt 0) {
@@ -1408,7 +1418,7 @@ function Update-QuotaEstimatesFromInterval {
     } elseif ([double]$Result.TotalCost -le 0) {
         '当前时间段尚无可计价消耗，点击“查看结果”会再次检查。'
     } else {
-        '开始与当前额度窗口不一致、缺少重置时间或百分比尚无增量，暂不显示反推结果。'
+        '开始与当前额度窗口不一致或缺少可靠重置时间，本次不显示反推结果。'
     }
     Update-QuotaCards
 }
