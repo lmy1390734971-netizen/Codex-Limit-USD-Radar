@@ -1480,11 +1480,14 @@ function Get-TokenRaderQuotaEstimate {
             [DateTimeOffset]$EndWindow.ObservedAt -lt [DateTimeOffset]$StartWindow.ObservedAt) { return $null }
         $deltaPercent = [double]$EndWindow.UsedPercent - [double]$StartWindow.UsedPercent
         if ($deltaPercent -le 0) { return $null }
-        $totalUsd = $IntervalCost / ($deltaPercent / 100.0)
+        $effectiveDeltaPercent = [Math]::Max(1.0, $deltaPercent)
+        $totalUsd = $IntervalCost / ($effectiveDeltaPercent / 100.0)
         [pscustomobject]@{
             StartUsedPercent = [double]$StartWindow.UsedPercent
             EndUsedPercent = [double]$EndWindow.UsedPercent
             DeltaPercent = $deltaPercent
+            EffectiveDeltaPercent = $effectiveDeltaPercent
+            MinimumDeltaApplied = $deltaPercent -lt 1.0
             TotalUsd = $totalUsd
             UsedUsd = $totalUsd * ([double]$EndWindow.UsedPercent / 100.0)
             RemainingUsd = $totalUsd * ([double]$EndWindow.RemainingPercent / 100.0)

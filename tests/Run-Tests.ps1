@@ -388,6 +388,19 @@ try {
     Assert-Near 21.0 $quotaEstimate.Weekly.EndUsedPercent 0.0001 'weekly quota estimate end percentage'
     Assert-Near 0.83 $quotaEstimate.FiveHour.TotalUsd 0.0000001 'five-hour inferred USD quota'
     Assert-Near 1.66 $quotaEstimate.Weekly.TotalUsd 0.0000001 'weekly inferred USD quota'
+    $minimumDeltaStart = New-TestQuotaRateLimits -FiveHourUsed 3.0 -WeeklyUsed 7.0 `
+        -FiveHourReset ([DateTimeOffset]::Parse('2026-07-14T10:00:00Z')) `
+        -WeeklyReset ([DateTimeOffset]::Parse('2026-07-20T10:00:00Z'))
+    $minimumDeltaEnd = New-TestQuotaRateLimits -FiveHourUsed 3.4 -WeeklyUsed 7.4 `
+        -FiveHourReset ([DateTimeOffset]::Parse('2026-07-14T10:00:00Z')) `
+        -WeeklyReset ([DateTimeOffset]::Parse('2026-07-20T10:00:00Z'))
+    $minimumDeltaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $minimumDeltaEnd -IntervalCost 1.25 -CostComplete $true
+    Assert-Near 0.4 $minimumDeltaEstimate.FiveHour.DeltaPercent 0.0001 'sub-one-percent observed quota delta'
+    Assert-Near 1.0 $minimumDeltaEstimate.FiveHour.EffectiveDeltaPercent 0.0001 'sub-one-percent effective quota delta'
+    Assert-Equal $true $minimumDeltaEstimate.FiveHour.MinimumDeltaApplied 'sub-one-percent quota floor marker'
+    Assert-Near 125.0 $minimumDeltaEstimate.FiveHour.TotalUsd 0.0001 'sub-one-percent quota uses one-percent denominator'
+    $zeroDeltaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $minimumDeltaStart -IntervalCost 1.25 -CostComplete $true
+    Assert-Equal $null $zeroDeltaEstimate.FiveHour 'zero-percent quota delta remains invalid'
 
     # Explicit measurement capture contract used by the asynchronous UI.  The
     # public commands freeze offsets/snapshots before the worker starts; the end

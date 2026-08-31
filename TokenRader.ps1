@@ -1342,9 +1342,13 @@ function Set-QuotaWindowCard {
     $Progress.Value = [Math]::Max(0, [Math]::Min(100, [double]$Window.UsedPercent))
     $ResetText.Text = if ($null -ne $Window.ResetsAt) { ('重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt) } else { ('{0} 分钟窗口' -f $Window.WindowMinutes) }
     if ($null -ne $Estimate) {
-        $DollarText.Text = ('美金额度≈{0} · 从 {1:0.#}% 开始 · 已用≈{2} · 剩余≈{3}' -f
+        $minimumBasis = if ($null -ne $Estimate.PSObject.Properties['MinimumDeltaApplied'] -and [bool]$Estimate.MinimumDeltaApplied) {
+            (' · 实际 +{0:0.##}%，按 1% 反推' -f [double]$Estimate.DeltaPercent)
+        } else { '' }
+        $DollarText.Text = ('美金额度≈{0} · 从 {1:0.#}% 开始{2} · 已用≈{3} · 剩余≈{4}' -f
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
             [double]$Estimate.StartUsedPercent,
+            $minimumBasis,
             (Format-TokenRaderUsd ([double]$Estimate.UsedUsd)),
             (Format-TokenRaderUsd ([double]$Estimate.RemainingUsd)))
     } else {
@@ -1391,12 +1395,18 @@ function Update-QuotaEstimatesFromInterval {
 
     $calibrated = @()
     if ($null -ne $newEstimates.FiveHour) {
-        $calibrated += ('5 小时 {0:0.#}%→{1:0.#}%（+{2:0.#}%）' -f
-            $newEstimates.FiveHour.StartUsedPercent, $newEstimates.FiveHour.EndUsedPercent, $newEstimates.FiveHour.DeltaPercent)
+        $basis = if ([bool]$newEstimates.FiveHour.MinimumDeltaApplied) {
+            '实际 +{0:0.##}%，按 1% 反推' -f $newEstimates.FiveHour.DeltaPercent
+        } else { '+{0:0.#}%' -f $newEstimates.FiveHour.DeltaPercent }
+        $calibrated += ('5 小时 {0:0.#}%→{1:0.#}%（{2}）' -f
+            $newEstimates.FiveHour.StartUsedPercent, $newEstimates.FiveHour.EndUsedPercent, $basis)
     }
     if ($null -ne $newEstimates.Weekly) {
-        $calibrated += ('周 {0:0.#}%→{1:0.#}%（+{2:0.#}%）' -f
-            $newEstimates.Weekly.StartUsedPercent, $newEstimates.Weekly.EndUsedPercent, $newEstimates.Weekly.DeltaPercent)
+        $basis = if ([bool]$newEstimates.Weekly.MinimumDeltaApplied) {
+            '实际 +{0:0.##}%，按 1% 反推' -f $newEstimates.Weekly.DeltaPercent
+        } else { '+{0:0.#}%' -f $newEstimates.Weekly.DeltaPercent }
+        $calibrated += ('周 {0:0.#}%→{1:0.#}%（{2}）' -f
+            $newEstimates.Weekly.StartUsedPercent, $newEstimates.Weekly.EndUsedPercent, $basis)
     }
     $phase = if ($Final) { '最终' } else { '实时' }
     $script:State.QuotaCalibrationMessage = if ($calibrated.Count -gt 0) {
