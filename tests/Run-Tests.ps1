@@ -382,6 +382,10 @@ try {
     Assert-Near 12.0 $intervalResult.RateLimits.FiveHour.UsedPercent 0.0001 'interval ending five-hour usage'
     Assert-Near 21.0 $intervalResult.RateLimits.Weekly.UsedPercent 0.0001 'interval ending weekly usage'
     $quotaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $measurementBaseline.RateLimits -EndRateLimits $intervalResult.RateLimits -IntervalCost $intervalResult.TotalCost -CostComplete $intervalResult.CostComplete
+    Assert-Near 10.0 $quotaEstimate.FiveHour.StartUsedPercent 0.0001 'five-hour quota estimate start percentage'
+    Assert-Near 12.0 $quotaEstimate.FiveHour.EndUsedPercent 0.0001 'five-hour quota estimate end percentage'
+    Assert-Near 20.0 $quotaEstimate.Weekly.StartUsedPercent 0.0001 'weekly quota estimate start percentage'
+    Assert-Near 21.0 $quotaEstimate.Weekly.EndUsedPercent 0.0001 'weekly quota estimate end percentage'
     Assert-Near 0.83 $quotaEstimate.FiveHour.TotalUsd 0.0000001 'five-hour inferred USD quota'
     Assert-Near 1.66 $quotaEstimate.Weekly.TotalUsd 0.0000001 'weekly inferred USD quota'
 
@@ -1727,11 +1731,19 @@ try {
         $toolCardPosition -le $periodPosition -or $xamlSource.Contains('Text="滚动 24 小时用量"')) {
         throw 'UI CONTRACT FAILED: API cost and quota cards must precede the renamed period-usage section'
     }
+    if ([string]$window.FindName('FiveHourDollarText').Text -ne '美金额度：尚无有效反推结果' -or
+        [string]$window.FindName('WeeklyDollarText').Text -ne '美金额度：尚无有效反推结果') {
+        throw 'UI CONTRACT FAILED: quota cards must not display a pending-time-calibration placeholder'
+    }
 
     # Interval view must be a cheap state/cache operation. It must not scan the
     # whole session tree synchronously on every click, and the background
     # compute path must not fall back to invoking the parser on the UI thread.
     $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
+    if ($uiSource.Contains('待时间段校准') -or
+        $uiSource -notmatch '美金额度≈\{0\} · 从 \{1:0\.#\}% 开始') {
+        throw 'UI CONTRACT FAILED: quota estimates must display direct USD and their starting percentage'
+    }
     if ($uiSource -notmatch '未单独计价：工具 \{0:N0\} 次 · 输入图片 \{1:N0\} 张 · 生成图片 \{2:N0\} 张') {
         throw 'UI CONTRACT FAILED: runtime unpriced tool/image summary text is missing'
     }

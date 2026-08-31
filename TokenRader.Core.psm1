@@ -1482,10 +1482,14 @@ function Get-TokenRaderQuotaEstimate {
         if ($deltaPercent -le 0) { return $null }
         $totalUsd = $IntervalCost / ($deltaPercent / 100.0)
         [pscustomobject]@{
+            StartUsedPercent = [double]$StartWindow.UsedPercent
+            EndUsedPercent = [double]$EndWindow.UsedPercent
             DeltaPercent = $deltaPercent
             TotalUsd = $totalUsd
             UsedUsd = $totalUsd * ([double]$EndWindow.UsedPercent / 100.0)
             RemainingUsd = $totalUsd * ([double]$EndWindow.RemainingPercent / 100.0)
+            WindowMinutes = [int]$EndWindow.WindowMinutes
+            ResetsAt = $EndWindow.ResetsAt
         }
     }
 

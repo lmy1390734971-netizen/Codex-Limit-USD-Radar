@@ -1334,7 +1334,7 @@ function Set-QuotaWindowCard {
     if ($null -eq $Window) {
         $UsageText.Text = '暂无'
         $Progress.Value = 0
-        $DollarText.Text = '美金额度：当前日志未提供'
+        $DollarText.Text = '美金额度：暂无可用数据'
         $ResetText.Text = '暂无窗口'
         return
     }
@@ -1342,12 +1342,13 @@ function Set-QuotaWindowCard {
     $Progress.Value = [Math]::Max(0, [Math]::Min(100, [double]$Window.UsedPercent))
     $ResetText.Text = if ($null -ne $Window.ResetsAt) { ('重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt) } else { ('{0} 分钟窗口' -f $Window.WindowMinutes) }
     if ($null -ne $Estimate) {
-        $DollarText.Text = ('总额≈{0} · 已用≈{1} · 剩余≈{2}' -f
+        $DollarText.Text = ('美金额度≈{0} · 从 {1:0.#}% 开始 · 已用≈{2} · 剩余≈{3}' -f
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
+            [double]$Estimate.StartUsedPercent,
             (Format-TokenRaderUsd ([double]$Estimate.UsedUsd)),
             (Format-TokenRaderUsd ([double]$Estimate.RemainingUsd)))
     } else {
-        $DollarText.Text = '美金额度：待时间段校准'
+        $DollarText.Text = '美金额度：尚无有效反推结果'
     }
 }
 
@@ -1389,8 +1390,14 @@ function Update-QuotaEstimatesFromInterval {
     }
 
     $calibrated = @()
-    if ($null -ne $newEstimates.FiveHour) { $calibrated += ('5 小时 +{0:0.#}%' -f $newEstimates.FiveHour.DeltaPercent) }
-    if ($null -ne $newEstimates.Weekly) { $calibrated += ('周 +{0:0.#}%' -f $newEstimates.Weekly.DeltaPercent) }
+    if ($null -ne $newEstimates.FiveHour) {
+        $calibrated += ('5 小时 {0:0.#}%→{1:0.#}%（+{2:0.#}%）' -f
+            $newEstimates.FiveHour.StartUsedPercent, $newEstimates.FiveHour.EndUsedPercent, $newEstimates.FiveHour.DeltaPercent)
+    }
+    if ($null -ne $newEstimates.Weekly) {
+        $calibrated += ('周 {0:0.#}%→{1:0.#}%（+{2:0.#}%）' -f
+            $newEstimates.Weekly.StartUsedPercent, $newEstimates.Weekly.EndUsedPercent, $newEstimates.Weekly.DeltaPercent)
+    }
     $phase = if ($Final) { '最终' } else { '实时' }
     $script:State.QuotaCalibrationMessage = if ($calibrated.Count -gt 0) {
         ('{0}反推已同步：{1}。' -f $phase, ($calibrated -join '，'))
