@@ -1334,7 +1334,7 @@ function Set-QuotaWindowCard {
     if ($null -eq $Window -or $windowExpired) {
         $UsageText.Text = '暂无'
         $Progress.Value = 0
-        $DollarText.Text = 'Token额度：暂无当前窗口'
+        $DollarText.Text = '美金额度：暂无当前窗口'
         $ResetText.Text = '暂无当前窗口'
         return
     }
@@ -1343,17 +1343,17 @@ function Set-QuotaWindowCard {
     $ResetText.Text = if ($null -ne $Window.ResetsAt) { ('重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt) } else { ('{0} 分钟窗口' -f $Window.WindowMinutes) }
     if ($null -ne $Estimate) {
         $currentPercent = [double]$Window.UsedPercent
-        $sourceLabel = if ([string]$Estimate.EstimateSource -eq 'direct_limit_tokens') { '服务端直接Token容量' } else { '本地窗口Token/百分比估算' }
+        $sourceLabel = if ([string]$Estimate.EstimateSource -eq 'direct_limit_tokens_usd_estimate') { '直接Token容量×窗口平均API价' } else { '完整窗口API成本/当前百分比' }
         $identityLabel = if ([bool]$Estimate.IdentityComplete) { '' } else { ' · 请求级去重不完整' }
-        $DollarText.Text = ('当前用量 {0:0.####}% · Token总额度≈{1} · 已用≈{2} · 剩余≈{3} · 来源：{4}{5}' -f
+        $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 已用≈{2} · 剩余≈{3} · 来源：{4}{5}' -f
             $currentPercent,
-            (Format-TokenRaderNumber ([Int64]$Estimate.TotalTokens)),
-            (Format-TokenRaderNumber ([Int64]$Estimate.UsedTokens)),
-            (Format-TokenRaderNumber ([Int64]$Estimate.RemainingTokens)),
+            (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
+            (Format-TokenRaderUsd ([double]$Estimate.UsedUsd)),
+            (Format-TokenRaderUsd ([double]$Estimate.RemainingUsd)),
             $sourceLabel,
             $identityLabel)
     } else {
-        $DollarText.Text = 'Token额度：尚无有效估算结果'
+        $DollarText.Text = '美金额度：尚无有效估算结果'
     }
 }
 
@@ -1448,10 +1448,10 @@ function Update-QuotaEstimatesFromInterval {
 
     $calibrated = @()
     if ($null -ne $newEstimates.FiveHour) {
-        $calibrated += ('5 小时 Token容量≈{0}' -f (Format-TokenRaderNumber ([Int64]$newEstimates.FiveHour.TotalTokens)))
+        $calibrated += ('5 小时 API等价美元≈{0}' -f (Format-TokenRaderUsd ([double]$newEstimates.FiveHour.TotalUsd)))
     }
     if ($null -ne $newEstimates.Weekly) {
-        $calibrated += ('周 Token容量≈{0}' -f (Format-TokenRaderNumber ([Int64]$newEstimates.Weekly.TotalTokens)))
+        $calibrated += ('周 API等价美元≈{0}' -f (Format-TokenRaderUsd ([double]$newEstimates.Weekly.TotalUsd)))
     }
     $retained = @()
     if ($retainedFive) { $retained += '5 小时' }
@@ -1463,13 +1463,13 @@ function Update-QuotaEstimatesFromInterval {
     } elseif ($retained.Count -gt 0) {
         ('本次查看未形成新的反推基准，{0}继续显示同一额度窗口的最近有效结果。' -f ($retained -join '、'))
     } elseif (-not $accountUnchanged) {
-        '测量期间账号标签发生变化，本次不估算Token额度。'
+        '测量期间账号标签发生变化，本次不估算美金额度。'
     } elseif (-not $pricingComplete) {
         ''
     } elseif ([double]$Result.TotalCost -le 0) {
         '当前时间段尚无可计价消耗，点击“查看结果”会再次检查。'
     } else {
-        '当前额度窗口缺少可靠重置时间，本次不显示Token容量估算。'
+        '当前额度窗口缺少可靠重置时间，本次不显示美金额度估算。'
     }
     Update-QuotaCards
 }

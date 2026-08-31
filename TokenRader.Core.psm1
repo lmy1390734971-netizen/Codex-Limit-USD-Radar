@@ -1568,7 +1568,9 @@ function Get-TokenRaderQuotaEstimate {
             if ($null -eq $Evidence -or $null -eq $Evidence.PSObject.Properties['BoundaryValid'] -or
                 -not [bool]$Evidence.BoundaryValid -or $null -eq $Evidence.PSObject.Properties['TotalTokens'] -or
                 [Int64]$Evidence.TotalTokens -le 0 -or $null -eq $Evidence.PSObject.Properties['EstimateSource'] -or
-                [string]::IsNullOrWhiteSpace([string]$Evidence.EstimateSource)) { return $null }
+                [string]::IsNullOrWhiteSpace([string]$Evidence.EstimateSource) -or
+                $null -eq $Evidence.PSObject.Properties['PricingComplete'] -or -not [bool]$Evidence.PricingComplete -or
+                $null -eq $Evidence.PSObject.Properties['EstimatedTotalUsd'] -or [double]$Evidence.EstimatedTotalUsd -le 0) { return $null }
             if ($null -eq $Evidence.PSObject.Properties['EndObservedAt'] -or
                 [DateTimeOffset]$Evidence.EndObservedAt -ne [DateTimeOffset]$EndWindow.ObservedAt) { return $null }
             if ($null -ne $Evidence.LastCountedAt -and
@@ -1585,15 +1587,17 @@ function Get-TokenRaderQuotaEstimate {
                 RemainingTokens = [Int64]$Evidence.RemainingTokens
                 ObservedTokens = [Int64]$Evidence.ObservedTokens
                 EstimateSource = [string]$Evidence.EstimateSource
+                CapacitySource = [string]$Evidence.CapacitySource
                 IdentityComplete = [bool]$Evidence.IdentityComplete
                 IdentitySources = @($Evidence.IdentitySources)
                 UnidentifiedEvents = [Int64]$Evidence.UnidentifiedEvents
                 EvidenceCost = [double]$Evidence.TotalCost
                 EvidenceFirstCountedAt = $Evidence.FirstCountedAt
                 EvidenceLastCountedAt = $Evidence.LastCountedAt
-                TotalUsd = $null
-                UsedUsd = $null
-                RemainingUsd = $null
+                AverageUsdPerToken = [double]$Evidence.AverageUsdPerToken
+                TotalUsd = [double]$Evidence.EstimatedTotalUsd
+                UsedUsd = [double]$Evidence.ObservedCostUsd
+                RemainingUsd = [double]$Evidence.EstimatedRemainingUsd
                 WindowMinutes = [int]$EndWindow.WindowMinutes
                 ResetsAt = $EndWindow.ResetsAt
                 PlanType = $EndPlanType
@@ -3013,6 +3017,12 @@ function Get-TokenRaderQuotaWindowEvidence {
             UsedTokens = [Int64]0
             RemainingTokens = [Int64]0
             EstimateSource = ''
+            CapacitySource = ''
+            UsdEstimateSource = ''
+            AverageUsdPerToken = [double]0
+            EstimatedTotalUsd = [double]0
+            ObservedCostUsd = [double]0
+            EstimatedRemainingUsd = [double]0
             IdentityComplete = $false
             IdentitySources = @()
         }
@@ -3052,6 +3062,18 @@ function Get-TokenRaderQuotaWindowEvidence {
         $remainingTokens = [Math]::Max([Int64]0, $totalTokens - $observedTokens)
         $estimateSource = 'snapshot_token_estimate'
     }
+    [double]$averageUsdPerToken = 0
+    [double]$estimatedTotalUsd = 0
+    [double]$estimatedRemainingUsd = 0
+    $usdEstimateSource = ''
+    if ([bool]$priced.PricingComplete -and $observedTokens -gt 0 -and $totalTokens -gt 0 -and [double]$priced.TotalCost -gt 0) {
+        $averageUsdPerToken = [double]$priced.TotalCost / [double]$observedTokens
+        $estimatedTotalUsd = $averageUsdPerToken * [double]$totalTokens
+        $estimatedRemainingUsd = [Math]::Max(0.0, $estimatedTotalUsd - [double]$priced.TotalCost)
+        $usdEstimateSource = if ($estimateSource -eq 'direct_limit_tokens') {
+            'direct_limit_tokens_usd_estimate'
+        } else { 'snapshot_window_usd_estimate' }
+    }
     [pscustomobject]@{
         BoundaryValid = $true
         CoverageComplete = $true
@@ -3073,7 +3095,13 @@ function Get-TokenRaderQuotaWindowEvidence {
         TotalTokens = $totalTokens
         UsedTokens = $usedTokens
         RemainingTokens = $remainingTokens
-        EstimateSource = $estimateSource
+        EstimateSource = $usdEstimateSource
+        CapacitySource = $estimateSource
+        UsdEstimateSource = $usdEstimateSource
+        AverageUsdPerToken = $averageUsdPerToken
+        EstimatedTotalUsd = $estimatedTotalUsd
+        ObservedCostUsd = [double]$priced.TotalCost
+        EstimatedRemainingUsd = $estimatedRemainingUsd
         IdentityComplete = [bool]$aggregate.IdentityComplete
         IdentitySources = @($aggregate.IdentitySources)
         UnidentifiedEvents = [Int64]$aggregate.UnidentifiedEvents
