@@ -1765,8 +1765,8 @@ try {
     $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
     $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
     if ($uiSource.Contains('待时间段校准') -or
-        $uiSource -notmatch '美金额度≈\{0\} · 从 \{1:0\.####\}% 开始') {
-        throw 'UI CONTRACT FAILED: quota estimates must display direct USD and their starting percentage'
+        $uiSource -notmatch '当前用量 \{0:0\.####\}% · 反推总额度≈\{1\}.*?从 \{4:0\.####\}% 开始') {
+        throw 'UI CONTRACT FAILED: quota estimates must lead with current usage and inferred total before the starting percentage'
     }
     if ($uiSource -match '按 1% 反推' -or $coreSource -match 'Max\(1\.0,\s*\$deltaPercent\)') {
         throw 'QUOTA CONTRACT FAILED: quota inference must use the exact positive precision provided by logs'
@@ -1774,6 +1774,11 @@ try {
     if ($uiSource -notmatch '百分比未变化，按日志精度 \{0:0\.####\}% 估算' -or
         $coreSource -notmatch 'ResolutionAssumptionApplied') {
         throw 'QUOTA CONTRACT FAILED: unchanged percentages with billable cost must display a precision-based direct estimate'
+    }
+    if ($uiSource -notmatch 'previousEstimates' -or
+        $uiSource -notmatch 'Test-TokenRaderQuotaEstimateMatchesWindow' -or
+        $uiSource -notmatch '继续显示同一额度窗口的最近有效结果') {
+        throw 'QUOTA CONTRACT FAILED: a transient View Result must not erase a valid estimate from the same reset window'
     }
     if ($uiSource -match '-ScanRateLimits\s+\(\[bool\]\$Manual\)' -or
         $uiSource -notmatch '(?s)function Update-IntervalView\b.*?Start-TokenRaderIntervalComputeAsync\s+`\s*\r?\n\s*-Baseline \$script:State\.IntervalBaseline\s+`\s*\r?\n\s*-ScanRateLimits \$true') {

@@ -1514,6 +1514,7 @@ function Get-TokenRaderQuotaEstimate {
             RemainingUsd = $totalUsd * ([double]$EndWindow.RemainingPercent / 100.0)
             WindowMinutes = [int]$EndWindow.WindowMinutes
             ResetsAt = $EndWindow.ResetsAt
+            PlanType = $EndPlanType
         }
     }
 

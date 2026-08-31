@@ -1345,12 +1345,16 @@ function Set-QuotaWindowCard {
         $resolutionBasis = if ($null -ne $Estimate.PSObject.Properties['ResolutionAssumptionApplied'] -and [bool]$Estimate.ResolutionAssumptionApplied) {
             (' · 百分比未变化，按日志精度 {0:0.####}% 估算' -f [double]$Estimate.EffectiveDeltaPercent)
         } else { '' }
-        $DollarText.Text = ('美金额度≈{0} · 从 {1:0.####}% 开始{2} · 已用≈{3} · 剩余≈{4}' -f
+        $currentPercent = [double]$Window.UsedPercent
+        $currentUsedUsd = [double]$Estimate.TotalUsd * ($currentPercent / 100.0)
+        $currentRemainingUsd = [double]$Estimate.TotalUsd * ((100.0 - $currentPercent) / 100.0)
+        $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 已用≈{2} · 剩余≈{3} · 从 {4:0.####}% 开始{5}' -f
+            $currentPercent,
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
+            (Format-TokenRaderUsd $currentUsedUsd),
+            (Format-TokenRaderUsd $currentRemainingUsd),
             [double]$Estimate.StartUsedPercent,
-            $resolutionBasis,
-            (Format-TokenRaderUsd ([double]$Estimate.UsedUsd)),
-            (Format-TokenRaderUsd ([double]$Estimate.RemainingUsd)))
+            $resolutionBasis)
     } else {
         $DollarText.Text = '美金额度：尚无有效反推结果'
     }
@@ -1366,6 +1370,31 @@ function Update-QuotaCards {
     Set-QuotaWindowCard -Window $fiveWindow -Estimate $fiveEstimate -UsageText $script:FiveHourUsageText -Progress $script:FiveHourProgress -DollarText $script:FiveHourDollarText -ResetText $script:FiveHourResetText
     Set-QuotaWindowCard -Window $weeklyWindow -Estimate $weeklyEstimate -UsageText $script:WeeklyUsageText -Progress $script:WeeklyProgress -DollarText $script:WeeklyDollarText -ResetText $script:WeeklyResetText
     $script:QuotaEstimateHintText.Text = [string]$script:State.QuotaCalibrationMessage
+}
+
+function Test-TokenRaderQuotaEstimateMatchesWindow {
+    param($Estimate, $Window)
+    if ($null -eq $Estimate) { return $false }
+    # A transient result may omit rate_limits entirely. The estimate belongs
+    # to the current measurement generation, so retain it until a concrete
+    # incompatible window is observed.
+    if ($null -eq $Window) { return $true }
+    if ($null -ne $Estimate.PSObject.Properties['WindowMinutes'] -and
+        [int]$Estimate.WindowMinutes -ne [int]$Window.WindowMinutes) { return $false }
+    if ($null -ne $Estimate.PSObject.Properties['PlanType'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Estimate.PlanType) -and
+        $null -ne $Window.PSObject.Properties['PlanType'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Window.PlanType) -and
+        -not [string]::Equals([string]$Estimate.PlanType, [string]$Window.PlanType, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    if ($null -ne $Estimate.PSObject.Properties['ResetsAt'] -and $null -ne $Estimate.ResetsAt -and
+        $null -ne $Window.ResetsAt) {
+        $estimateReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$Estimate.WindowMinutes) -ResetsAt $Estimate.ResetsAt
+        $windowReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$Window.WindowMinutes) -ResetsAt $Window.ResetsAt
+        if ([string]::IsNullOrWhiteSpace($estimateReset) -or $estimateReset -ne $windowReset) { return $false }
+    }
+    return $true
 }
 
 function Update-QuotaEstimatesFromInterval {
@@ -1388,9 +1417,30 @@ function Update-QuotaEstimatesFromInterval {
         -EndRateLimits $(if ($accountUnchanged) { $endRateLimits } else { $null }) `
         -IntervalCost ([double]$Result.TotalCost) `
         -CostComplete $pricingComplete
+    $previousEstimates = $script:State.QuotaEstimates
+    $validationRateLimits = if ($null -ne $endRateLimits) { $endRateLimits } else { $script:State.RateLimits }
+    $validationFive = if ($null -ne $validationRateLimits) { $validationRateLimits.FiveHour } else { $null }
+    $validationWeekly = if ($null -ne $validationRateLimits) { $validationRateLimits.Weekly } else { $null }
+    $previousFive = if ($null -ne $previousEstimates) { $previousEstimates.FiveHour } else { $null }
+    $previousWeekly = if ($null -ne $previousEstimates) { $previousEstimates.Weekly } else { $null }
+    $canRetainPrevious = $accountUnchanged -and $pricingComplete
+    $retainedFive = $false
+    $retainedWeekly = $false
+    $effectiveFive = $newEstimates.FiveHour
+    if ($null -eq $effectiveFive -and $canRetainPrevious -and
+        (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $previousFive -Window $validationFive)) {
+        $effectiveFive = $previousFive
+        $retainedFive = $true
+    }
+    $effectiveWeekly = $newEstimates.Weekly
+    if ($null -eq $effectiveWeekly -and $canRetainPrevious -and
+        (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $previousWeekly -Window $validationWeekly)) {
+        $effectiveWeekly = $previousWeekly
+        $retainedWeekly = $true
+    }
     $script:State.QuotaEstimates = [pscustomobject]@{
-        FiveHour = $newEstimates.FiveHour
-        Weekly = $newEstimates.Weekly
+        FiveHour = $effectiveFive
+        Weekly = $effectiveWeekly
     }
 
     $calibrated = @()
@@ -1408,9 +1458,15 @@ function Update-QuotaEstimatesFromInterval {
         $calibrated += ('周 {0:0.####}%→{1:0.####}%（{2}）' -f
             $newEstimates.Weekly.StartUsedPercent, $newEstimates.Weekly.EndUsedPercent, $basis)
     }
+    $retained = @()
+    if ($retainedFive) { $retained += '5 小时' }
+    if ($retainedWeekly) { $retained += '周' }
     $phase = if ($Final) { '最终' } else { '实时' }
     $script:State.QuotaCalibrationMessage = if ($calibrated.Count -gt 0) {
-        ('{0}反推已同步：{1}。' -f $phase, ($calibrated -join '，'))
+        $retainedSuffix = if ($retained.Count -gt 0) { '；{0}继续显示同一窗口的最近有效结果' -f ($retained -join '、') } else { '' }
+        ('{0}反推已同步：{1}{2}。' -f $phase, ($calibrated -join '，'), $retainedSuffix)
+    } elseif ($retained.Count -gt 0) {
+        ('本次查看未形成新的反推基准，{0}继续显示同一额度窗口的最近有效结果。' -f ($retained -join '、'))
     } elseif (-not $accountUnchanged) {
         '测量期间账号标签发生变化，本次不反推美金额度。'
     } elseif (-not $pricingComplete) {
