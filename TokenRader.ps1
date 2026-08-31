@@ -1419,7 +1419,8 @@ function Update-QuotaEstimatesFromInterval {
         -IntervalCost ([double]$Result.TotalCost) `
         -CostComplete $pricingComplete `
         -StartReferenceAt $script:State.IntervalBaseline.StartedAt `
-        -EndReferenceAt $(if ($null -ne $Result.PSObject.Properties['EndedAt']) { $Result.EndedAt } else { [DateTimeOffset]::Now })
+        -EndReferenceAt $(if ($null -ne $Result.PSObject.Properties['EndedAt']) { $Result.EndedAt } else { [DateTimeOffset]::Now }) `
+        -QuotaEvidence $(if ($null -ne $Result.PSObject.Properties['QuotaEvidence']) { $Result.QuotaEvidence } else { $null })
     $previousEstimates = $script:State.QuotaEstimates
     $validationRateLimits = if ($null -ne $endRateLimits) { $endRateLimits } else { $script:State.RateLimits }
     $validationFive = if ($null -ne $validationRateLimits) { $validationRateLimits.FiveHour } else { $null }

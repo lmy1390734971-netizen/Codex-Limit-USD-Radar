@@ -101,6 +101,8 @@ public sealed class TokenRaderIntervalAggregateResult
     public long TotalCached { get; set; }
     public long TotalOutput { get; set; }
     public long TotalReasoning { get; set; }
+    public DateTimeOffset? FirstCountedAt { get; set; }
+    public DateTimeOffset? LastCountedAt { get; set; }
     public int ChangedSessions { get; set; }
     public string[] Models { get; set; }
     public TokenRaderIntervalAggregateBucket[] Buckets { get; set; }
@@ -242,6 +244,20 @@ public sealed class TokenRaderModelBackfillResult
 /// </summary>
 public static class TokenRaderIndexer
 {
+    private sealed class AggregateEventCandidate
+    {
+        public string SessionId = "";
+        public string RootSessionId = "";
+        public string SourcePath = "";
+        public string Model = "";
+        public DateTimeOffset EventAt;
+        public bool HasTimestamp;
+        public long CallInput;
+        public long CallCached;
+        public long CallOutput;
+        public long CallReasoning;
+    }
+
     private sealed class WatchState : IDisposable
     {
         public readonly ConcurrentDictionary<string, byte> ChangedPaths =
@@ -1729,20 +1745,16 @@ public static class TokenRaderIndexer
 
         var ranges = ReadAggregateOffsetRanges(startOffsets, endOffsets);
         var thresholds = ReadLongContextThresholds(longContextThresholds);
-        var resolvedThresholds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         var baselinePaths = ReadOffsetPathSet(startOffsets);
         var result = new TokenRaderIntervalAggregateResult();
         var parentBySession = ReadAggregateParentMap(db);
-        var seenEventSessions = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var lineageGroups = new Dictionary<string, List<AggregateEventCandidate>>(StringComparer.Ordinal);
         // token_count is also emitted for status/rate-limit refreshes. Those
         // rows can carry the same cumulative total_token_usage and the same
         // last_token_usage at a later timestamp; they are snapshots of one
         // call, not additional calls. Keep a per-session cumulative identity
         // so timestamp-only refreshes cannot be billed repeatedly.
         var seenCumulativeSnapshots = new HashSet<string>(StringComparer.Ordinal);
-        var activeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var buckets = new Dictionary<string, TokenRaderIntervalAggregateBucket>(StringComparer.OrdinalIgnoreCase);
         var stopwatch = Stopwatch.StartNew();
 
         SetAggregateProgress(progressState, 0L, "聚合区间记录");
@@ -1818,84 +1830,28 @@ public static class TokenRaderIndexer
                         string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
-                        List<string> priorSessions;
-                        bool lineageDuplicate = false;
-                        if (!seenEventSessions.TryGetValue(eventKey, out priorSessions))
-                        {
-                            priorSessions = new List<string>();
-                            seenEventSessions.Add(eventKey, priorSessions);
-                        }
-                        else
-                        {
-                            for (int priorIndex = 0; priorIndex < priorSessions.Count; priorIndex++)
-                            {
-                                if (AreAggregateSessionsLineageRelated(
-                                    sessionId, priorSessions[priorIndex], rootSessionId, parentBySession))
-                                {
-                                    lineageDuplicate = true;
-                                    break;
-                                }
-                            }
-                        }
-                        // Retain every observed session in the lineage set. A
-                        // later grandchild may be related to a dropped child even
-                        // when its more distant ancestor metadata is unavailable.
-                        if (!ContainsIgnoreCase(priorSessions, sessionId)) priorSessions.Add(sessionId);
-                        if (lineageDuplicate)
-                        {
-                            result.DuplicateEventsDropped++;
-                            continue;
-                        }
-
-                        result.CountedEvents++;
-                        result.TotalInput += callInput;
-                        result.TotalCached += callCached;
-                        result.TotalOutput += callOutput;
-                        result.TotalReasoning += callReasoning;
-                        if (!string.IsNullOrWhiteSpace(sourcePath)) activeFiles.Add(sourcePath);
-                        if (!string.IsNullOrWhiteSpace(model)) models.Add(model);
-                        bool longContext;
-                        long threshold;
-                        if (!resolvedThresholds.TryGetValue(model, out threshold))
-                        {
-                            threshold = ResolveAggregateLongContextThreshold(model, thresholds);
-                            resolvedThresholds[model] = threshold;
-                        }
-                        longContext = threshold > 0L && callInput > threshold;
-                        string bucketKey = model.ToLowerInvariant() + "|" + (longContext ? "long" : "standard");
-                        TokenRaderIntervalAggregateBucket bucket;
-                        if (!buckets.TryGetValue(bucketKey, out bucket))
-                        {
-                            bucket = new TokenRaderIntervalAggregateBucket {
+                        AddAggregateLineageCandidate(lineageGroups, eventKey,
+                            new AggregateEventCandidate {
+                                SessionId = sessionId,
+                                RootSessionId = rootSessionId,
+                                SourcePath = sourcePath,
                                 Model = model,
-                                LongContext = longContext
-                            };
-                            buckets.Add(bucketKey, bucket);
-                        }
-                        bucket.Input += callInput;
-                        bucket.Cached += callCached;
-                        bucket.Output += callOutput;
-                        bucket.Reasoning += callReasoning;
-                        bucket.Events++;
+                                EventAt = eventAt,
+                                HasTimestamp = hasTimestamp,
+                                CallInput = callInput,
+                                CallCached = callCached,
+                                CallOutput = callOutput,
+                                CallReasoning = callReasoning
+                            }, parentBySession, result);
                     }
                 }
             }
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+        FinalizeAggregateLineageCandidates(lineageGroups, thresholds, result);
         SetAggregateProgress(progressState, result.ProcessedRows, "区间聚合完成");
         result.BytesRead = ComputeRangeBytes(ranges);
-        result.ChangedSessions = activeFiles.Count;
-        var sortedModels = new List<string>(models);
-        sortedModels.Sort(StringComparer.OrdinalIgnoreCase);
-        result.Models = sortedModels.ToArray();
-        var sortedBuckets = new List<TokenRaderIntervalAggregateBucket>(buckets.Values);
-        sortedBuckets.Sort(delegate(TokenRaderIntervalAggregateBucket left, TokenRaderIntervalAggregateBucket right) {
-            int comparison = StringComparer.OrdinalIgnoreCase.Compare(left.Model, right.Model);
-            if (comparison != 0) return comparison;
-            return left.LongContext.CompareTo(right.LongContext);
-        });
-        result.Buckets = sortedBuckets.ToArray();
         result.ProcessingMilliseconds = stopwatch.ElapsedMilliseconds;
         SetAggregateProgress(progressState, result.ProcessedRows, "区间聚合完成");
         return result;
@@ -1919,14 +1875,10 @@ public static class TokenRaderIndexer
         if (endedAt <= startedAt) throw new ArgumentException("endedAt must be later than startedAt");
 
         var thresholds = ReadLongContextThresholds(longContextThresholds);
-        var resolvedThresholds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         var result = new TokenRaderIntervalAggregateResult();
         var parentBySession = ReadAggregateParentMap(db);
-        var seenEventSessions = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var lineageGroups = new Dictionary<string, List<AggregateEventCandidate>>(StringComparer.Ordinal);
         var seenCumulativeSnapshots = new HashSet<string>(StringComparer.Ordinal);
-        var activeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var buckets = new Dictionary<string, TokenRaderIntervalAggregateBucket>(StringComparer.OrdinalIgnoreCase);
         var stopwatch = Stopwatch.StartNew();
 
         // ISO timestamps emitted by Codex are normally UTC. Widen the indexed
@@ -1995,79 +1947,145 @@ public static class TokenRaderIndexer
                     string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                         totalInput, totalCached, totalOutput, totalReasoning,
                         callInput, callCached, callOutput, callReasoning, fingerprint);
-                    List<string> priorSessions;
-                    bool lineageDuplicate = false;
-                    if (!seenEventSessions.TryGetValue(eventKey, out priorSessions))
-                    {
-                        priorSessions = new List<string>();
-                        seenEventSessions.Add(eventKey, priorSessions);
-                    }
-                    else
-                    {
-                        for (int priorIndex = 0; priorIndex < priorSessions.Count; priorIndex++)
-                        {
-                            if (AreAggregateSessionsLineageRelated(
-                                sessionId, priorSessions[priorIndex], rootSessionId, parentBySession))
-                            {
-                                lineageDuplicate = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!ContainsIgnoreCase(priorSessions, sessionId)) priorSessions.Add(sessionId);
-                    if (lineageDuplicate)
-                    {
-                        result.DuplicateEventsDropped++;
-                        continue;
-                    }
-
-                    result.CountedEvents++;
-                    result.TotalInput += callInput;
-                    result.TotalCached += callCached;
-                    result.TotalOutput += callOutput;
-                    result.TotalReasoning += callReasoning;
-                    if (!string.IsNullOrWhiteSpace(sourcePath)) activeFiles.Add(sourcePath);
-                    if (!string.IsNullOrWhiteSpace(model)) models.Add(model);
-                    long threshold;
-                    if (!resolvedThresholds.TryGetValue(model, out threshold))
-                    {
-                        threshold = ResolveAggregateLongContextThreshold(model, thresholds);
-                        resolvedThresholds[model] = threshold;
-                    }
-                    bool longContext = threshold > 0L && callInput > threshold;
-                    string bucketKey = model.ToLowerInvariant() + "|" + (longContext ? "long" : "standard");
-                    TokenRaderIntervalAggregateBucket bucket;
-                    if (!buckets.TryGetValue(bucketKey, out bucket))
-                    {
-                        bucket = new TokenRaderIntervalAggregateBucket {
+                    AddAggregateLineageCandidate(lineageGroups, eventKey,
+                        new AggregateEventCandidate {
+                            SessionId = sessionId,
+                            RootSessionId = rootSessionId,
+                            SourcePath = sourcePath,
                             Model = model,
-                            LongContext = longContext
-                        };
-                        buckets.Add(bucketKey, bucket);
-                    }
-                    bucket.Input += callInput;
-                    bucket.Cached += callCached;
-                    bucket.Output += callOutput;
-                    bucket.Reasoning += callReasoning;
-                    bucket.Events++;
+                            EventAt = eventAt,
+                            HasTimestamp = true,
+                            CallInput = callInput,
+                            CallCached = callCached,
+                            CallOutput = callOutput,
+                            CallReasoning = callReasoning
+                        }, parentBySession, result);
                 }
             }
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        result.ChangedSessions = activeFiles.Count;
-        var sortedModels = new List<string>(models);
-        sortedModels.Sort(StringComparer.OrdinalIgnoreCase);
-        result.Models = sortedModels.ToArray();
-        var sortedBuckets = new List<TokenRaderIntervalAggregateBucket>(buckets.Values);
-        sortedBuckets.Sort(delegate(TokenRaderIntervalAggregateBucket left, TokenRaderIntervalAggregateBucket right) {
-            int comparison = StringComparer.OrdinalIgnoreCase.Compare(left.Model, right.Model);
-            if (comparison != 0) return comparison;
-            return left.LongContext.CompareTo(right.LongContext);
-        });
-        result.Buckets = sortedBuckets.ToArray();
+        FinalizeAggregateLineageCandidates(lineageGroups, thresholds, result);
         result.ProcessingMilliseconds = stopwatch.ElapsedMilliseconds;
         SetAggregateProgress(progressState, result.ProcessedRows, "24小时磁盘汇总完成");
+        return result;
+    }
+
+    /// <summary>
+    /// Aggregates the exact timestamp interval (startedExclusive, endedInclusive]
+    /// while never reading token rows beyond the caller's frozen per-file end
+    /// offsets. This is used only for quota evidence, whose percentage snapshots
+    /// describe a global account interval rather than the UI measurement start.
+    /// </summary>
+    public static TokenRaderIntervalAggregateResult AggregateTimeRangeRecordsAtOffsets(
+        SQLiteConnection db,
+        IDictionary endOffsets,
+        DateTimeOffset startedExclusive,
+        DateTimeOffset endedInclusive,
+        IDictionary longContextThresholds,
+        CancellationToken cancellationToken,
+        IDictionary progressState = null)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        if (endedInclusive <= startedExclusive)
+            throw new ArgumentException("endedInclusive must be later than startedExclusive");
+
+        var ranges = ReadAggregateOffsetRanges(null, endOffsets);
+        var thresholds = ReadLongContextThresholds(longContextThresholds);
+        var result = new TokenRaderIntervalAggregateResult();
+        var parentBySession = ReadAggregateParentMap(db);
+        var lineageGroups = new Dictionary<string, List<AggregateEventCandidate>>(StringComparer.Ordinal);
+        var seenCumulativeSnapshots = new HashSet<string>(StringComparer.Ordinal);
+        var stopwatch = Stopwatch.StartNew();
+        string broadStart = startedExclusive.UtcDateTime.Date.AddDays(-1.0)
+            .ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
+        string broadEnd = endedInclusive.UtcDateTime.Date.AddDays(2.0)
+            .ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
+        var relevantPaths = new HashSet<string>(
+            ReadTimeRangeSourcePaths(db, broadStart, broadEnd), StringComparer.OrdinalIgnoreCase);
+
+        SetAggregateProgress(progressState, 0L, "聚合区间记录");
+        for (int rangeIndex = 0; rangeIndex < ranges.Count; rangeIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            OffsetRange range = ranges[rangeIndex];
+            if (!relevantPaths.Contains(range.Path)) continue;
+            SeedTimeRangeCumulativeSnapshotAtOffset(db, range, startedExclusive,
+                seenCumulativeSnapshots, cancellationToken);
+            using (var cmd = db.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
+                    "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id " +
+                    "FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<=@end " +
+                    "AND timestamp>=@broad_start AND timestamp<@broad_end ORDER BY source_offset_end ASC";
+                cmd.Parameters.AddWithValue("@path", range.Path);
+                cmd.Parameters.AddWithValue("@end", range.End);
+                cmd.Parameters.AddWithValue("@broad_start", broadStart);
+                cmd.Parameters.AddWithValue("@broad_end", broadEnd);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        result.ProcessedRows++;
+                        if ((result.ProcessedRows & 255L) == 0L)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            SetAggregateProgress(progressState, result.ProcessedRows, "聚合区间记录");
+                        }
+
+                        DateTimeOffset eventAt;
+                        if (!TryParseTimestamp(ReadReaderString(reader, 1), out eventAt) ||
+                            eventAt <= startedExclusive || eventAt > endedInclusive) continue;
+                        result.RawEvents++;
+                        string sessionId = ReadReaderString(reader, 0);
+                        string model = ReadReaderString(reader, 2);
+                        long totalInput = ReadReaderInt64(reader, 3);
+                        long totalCached = ReadReaderInt64(reader, 4);
+                        long totalOutput = ReadReaderInt64(reader, 5);
+                        long totalReasoning = ReadReaderInt64(reader, 6);
+                        long callInput = ReadReaderInt64(reader, 7);
+                        long callCached = ReadReaderInt64(reader, 8);
+                        long callOutput = ReadReaderInt64(reader, 9);
+                        long callReasoning = ReadReaderInt64(reader, 10);
+                        string fingerprint = ReadReaderString(reader, 11);
+                        string sourcePath = ReadReaderString(reader, 12);
+                        string rootSessionId = ReadReaderString(reader, 14);
+                        if (callInput <= 0L && callOutput <= 0L) continue;
+
+                        string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
+                            totalInput, totalCached, totalOutput, totalReasoning);
+                        if (!seenCumulativeSnapshots.Add(cumulativeKey))
+                        {
+                            result.DuplicateEventsDropped++;
+                            continue;
+                        }
+                        if (string.IsNullOrWhiteSpace(rootSessionId)) rootSessionId = sessionId;
+                        string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
+                            totalInput, totalCached, totalOutput, totalReasoning,
+                            callInput, callCached, callOutput, callReasoning, fingerprint);
+                        AddAggregateLineageCandidate(lineageGroups, eventKey,
+                            new AggregateEventCandidate {
+                                SessionId = sessionId,
+                                RootSessionId = rootSessionId,
+                                SourcePath = sourcePath,
+                                Model = model,
+                                EventAt = eventAt,
+                                HasTimestamp = true,
+                                CallInput = callInput,
+                                CallCached = callCached,
+                                CallOutput = callOutput,
+                                CallReasoning = callReasoning
+                            }, parentBySession, result);
+                    }
+                }
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        FinalizeAggregateLineageCandidates(lineageGroups, thresholds, result);
+        result.ProcessingMilliseconds = stopwatch.ElapsedMilliseconds;
+        SetAggregateProgress(progressState, result.ProcessedRows, "区间聚合完成");
         return result;
     }
 
@@ -2130,6 +2148,43 @@ public static class TokenRaderIndexer
         }
     }
 
+    private static void SeedTimeRangeCumulativeSnapshotAtOffset(
+        SQLiteConnection db,
+        OffsetRange range,
+        DateTimeOffset startedExclusive,
+        HashSet<string> seenCumulativeSnapshots,
+        CancellationToken cancellationToken)
+    {
+        if (db == null || range == null || seenCumulativeSnapshots == null) return;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT session_id,timestamp,total_input,total_cached,total_output,total_reasoning " +
+                "FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<=@end " +
+                "ORDER BY source_offset_end DESC";
+            cmd.Parameters.AddWithValue("@path", range.Path);
+            cmd.Parameters.AddWithValue("@end", range.End);
+            using (var reader = cmd.ExecuteReader())
+            {
+                int inspected = 0;
+                while (reader.Read())
+                {
+                    if ((inspected++ & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
+                    DateTimeOffset eventAt;
+                    if (!TryParseTimestamp(ReadReaderString(reader, 1), out eventAt) ||
+                        eventAt > startedExclusive) continue;
+                    seenCumulativeSnapshots.Add(BuildAggregateCumulativeKey(
+                        ReadReaderString(reader, 0),
+                        ReadReaderInt64(reader, 2),
+                        ReadReaderInt64(reader, 3),
+                        ReadReaderInt64(reader, 4),
+                        ReadReaderInt64(reader, 5)));
+                    break;
+                }
+            }
+        }
+    }
+
     private static Dictionary<string, string> ReadAggregateParentMap(SQLiteConnection db)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -2153,18 +2208,116 @@ public static class TokenRaderIndexer
         return result;
     }
 
-    private static bool AreAggregateSessionsLineageRelated(
-        string left,
-        string right,
-        string rootSessionId,
-        Dictionary<string, string> parentBySession)
+    private static void AddAggregateLineageCandidate(
+        Dictionary<string, List<AggregateEventCandidate>> groups,
+        string eventKey,
+        AggregateEventCandidate candidate,
+        Dictionary<string, string> parentBySession,
+        TokenRaderIntervalAggregateResult result)
     {
-        if (string.Equals(left, right, StringComparison.OrdinalIgnoreCase)) return true;
-        if (!string.IsNullOrWhiteSpace(rootSessionId) &&
-            (string.Equals(left, rootSessionId, StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(right, rootSessionId, StringComparison.OrdinalIgnoreCase))) return true;
-        return IsAggregateAncestor(left, right, parentBySession) ||
-               IsAggregateAncestor(right, left, parentBySession);
+        List<AggregateEventCandidate> representatives;
+        if (!groups.TryGetValue(eventKey, out representatives))
+        {
+            representatives = new List<AggregateEventCandidate>();
+            groups.Add(eventKey, representatives);
+        }
+
+        for (int i = 0; i < representatives.Count; i++)
+        {
+            AggregateEventCandidate existing = representatives[i];
+            bool sameSession = string.Equals(candidate.SessionId, existing.SessionId,
+                StringComparison.OrdinalIgnoreCase);
+            bool candidateIsRoot = !string.IsNullOrWhiteSpace(candidate.RootSessionId) &&
+                string.Equals(candidate.SessionId, candidate.RootSessionId, StringComparison.OrdinalIgnoreCase);
+            bool existingIsRoot = !string.IsNullOrWhiteSpace(existing.RootSessionId) &&
+                string.Equals(existing.SessionId, existing.RootSessionId, StringComparison.OrdinalIgnoreCase);
+            bool candidateAncestor = !sameSession &&
+                (candidateIsRoot || IsAggregateAncestor(candidate.SessionId, existing.SessionId, parentBySession));
+            bool existingAncestor = !sameSession &&
+                (existingIsRoot || IsAggregateAncestor(existing.SessionId, candidate.SessionId, parentBySession));
+            if (!sameSession && !candidateAncestor && !existingAncestor) continue;
+
+            result.DuplicateEventsDropped++;
+            // The shallowest ancestor is the canonical source of both model
+            // and token usage. Replacing a previously seen descendant makes
+            // aggregation independent of file enumeration order.
+            if (candidateAncestor && !existingAncestor) representatives[i] = candidate;
+            return;
+        }
+        representatives.Add(candidate);
+    }
+
+    private static void FinalizeAggregateLineageCandidates(
+        Dictionary<string, List<AggregateEventCandidate>> groups,
+        Dictionary<string, long> thresholds,
+        TokenRaderIntervalAggregateResult result)
+    {
+        var activeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var buckets = new Dictionary<string, TokenRaderIntervalAggregateBucket>(StringComparer.OrdinalIgnoreCase);
+        var resolvedThresholds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        DateTimeOffset? firstCountedAt = null;
+        DateTimeOffset? lastCountedAt = null;
+
+        foreach (List<AggregateEventCandidate> representatives in groups.Values)
+        {
+            for (int i = 0; i < representatives.Count; i++)
+            {
+                AggregateEventCandidate candidate = representatives[i];
+                result.CountedEvents++;
+                result.TotalInput += candidate.CallInput;
+                result.TotalCached += candidate.CallCached;
+                result.TotalOutput += candidate.CallOutput;
+                result.TotalReasoning += candidate.CallReasoning;
+                if (!string.IsNullOrWhiteSpace(candidate.SourcePath)) activeFiles.Add(candidate.SourcePath);
+                if (!string.IsNullOrWhiteSpace(candidate.Model)) models.Add(candidate.Model);
+                if (candidate.HasTimestamp)
+                {
+                    if (!firstCountedAt.HasValue || candidate.EventAt < firstCountedAt.Value)
+                        firstCountedAt = candidate.EventAt;
+                    if (!lastCountedAt.HasValue || candidate.EventAt > lastCountedAt.Value)
+                        lastCountedAt = candidate.EventAt;
+                }
+
+                long threshold;
+                if (!resolvedThresholds.TryGetValue(candidate.Model, out threshold))
+                {
+                    threshold = ResolveAggregateLongContextThreshold(candidate.Model, thresholds);
+                    resolvedThresholds[candidate.Model] = threshold;
+                }
+                bool longContext = threshold > 0L && candidate.CallInput > threshold;
+                string bucketKey = candidate.Model.ToLowerInvariant() + "|" +
+                    (longContext ? "long" : "standard");
+                TokenRaderIntervalAggregateBucket bucket;
+                if (!buckets.TryGetValue(bucketKey, out bucket))
+                {
+                    bucket = new TokenRaderIntervalAggregateBucket {
+                        Model = candidate.Model,
+                        LongContext = longContext
+                    };
+                    buckets.Add(bucketKey, bucket);
+                }
+                bucket.Input += candidate.CallInput;
+                bucket.Cached += candidate.CallCached;
+                bucket.Output += candidate.CallOutput;
+                bucket.Reasoning += candidate.CallReasoning;
+                bucket.Events++;
+            }
+        }
+
+        result.FirstCountedAt = firstCountedAt;
+        result.LastCountedAt = lastCountedAt;
+        result.ChangedSessions = activeFiles.Count;
+        var sortedModels = new List<string>(models);
+        sortedModels.Sort(StringComparer.OrdinalIgnoreCase);
+        result.Models = sortedModels.ToArray();
+        var sortedBuckets = new List<TokenRaderIntervalAggregateBucket>(buckets.Values);
+        sortedBuckets.Sort(delegate(TokenRaderIntervalAggregateBucket left, TokenRaderIntervalAggregateBucket right) {
+            int comparison = StringComparer.OrdinalIgnoreCase.Compare(left.Model, right.Model);
+            if (comparison != 0) return comparison;
+            return left.LongContext.CompareTo(right.LongContext);
+        });
+        result.Buckets = sortedBuckets.ToArray();
     }
 
     private static bool IsAggregateAncestor(
@@ -2183,14 +2336,6 @@ public static class TokenRaderIndexer
             if (string.Equals(parent, possibleAncestor, StringComparison.OrdinalIgnoreCase)) return true;
             current = parent;
         }
-        return false;
-    }
-
-    private static bool ContainsIgnoreCase(List<string> values, string candidate)
-    {
-        if (values == null) return false;
-        for (int i = 0; i < values.Count; i++)
-            if (string.Equals(values[i], candidate, StringComparison.OrdinalIgnoreCase)) return true;
         return false;
     }
 
@@ -2342,8 +2487,7 @@ public static class TokenRaderIndexer
         // different times. Timestamp is therefore deliberately excluded from
         // the lineage identity. The caller still requires an actual ancestor-
         // descendant relationship, so identical sibling calls remain distinct.
-        return (rootSessionId ?? "").ToLowerInvariant() + "|" +
-            (model ?? "").Trim().ToLowerInvariant() + "|" + usage;
+        return (rootSessionId ?? "").ToLowerInvariant() + "|" + usage;
     }
 
     private static long ComputeRangeBytes(List<OffsetRange> ranges)

@@ -111,7 +111,7 @@ try {
     Add-TestAggregateRelationship $correctness 'parent' 'root' 'root' 'synthetic://parent'
     Add-TestAggregateRelationship $correctness 'child' 'parent' 'root' 'synthetic://child'
     Add-TestAggregateRow $correctness 'parent' '2026-08-28T00:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://parent' 10 'root'
-    Add-TestAggregateRow $correctness 'child' '2026-08-28T00:00:09Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://child' 10 'root'
+    Add-TestAggregateRow $correctness 'child' '2026-08-28T00:00:09Z' 'gpt-5.6-luna' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://child' 10 'root'
     Add-TestAggregateRow $correctness 'parent' '2026-08-28T00:00:01Z' 'gpt-5.5' 2000 200 200 1000 100 100 'fp-standard-2' 'synthetic://parent' 20 'root'
     Add-TestAggregateRow $correctness 'long' '2026-08-28T00:00:02Z' 'gpt-5.6-sol' 300001 100001 200 300001 100001 200 'fp-long' 'synthetic://long' 10 'long-root'
     Add-TestAggregateRow $correctness 'unknown' '2026-08-28T00:00:03Z' 'synthetic-unknown' 500 0 50 500 0 50 'fp-unknown' 'synthetic://unknown' 10 'unknown-root'
@@ -135,6 +135,22 @@ try {
     Assert-AggregateTest ($aggregate.TotalOutput -eq 450) 'aggregated output total changed'
     Assert-AggregateTest ($aggregate.Buckets.Count -eq 3) 'model/context buckets are not compact'
     Assert-AggregateTest (@($aggregate.Buckets | Where-Object { $_.Model -eq 'gpt-5.6-sol' -and $_.LongContext }).Count -eq 1) 'long-context call was not bucketed separately'
+    Assert-AggregateTest (@($aggregate.Buckets | Where-Object { $_.Model -eq 'gpt-5.6-luna' }).Count -eq 0) 'a copied child event escaped lineage deduplication after a model switch'
+    Assert-AggregateTest ($aggregate.FirstCountedAt -eq [DateTimeOffset]::Parse('2026-08-28T00:00:00Z')) 'first counted event timestamp changed'
+    Assert-AggregateTest ($aggregate.LastCountedAt -eq [DateTimeOffset]::Parse('2026-08-28T00:00:03Z')) 'last counted event includes a dropped descendant'
+
+    # Enumeration order must not decide which model represents a copied
+    # parent/child event. Read the Luna child first and require the later Sol
+    # ancestor to replace its bucket contribution.
+    Add-TestAggregateRelationship $correctness 'reverse-parent' 'reverse-root' 'reverse-root' 'synthetic://reverse-parent'
+    Add-TestAggregateRelationship $correctness 'reverse-child' 'reverse-parent' 'reverse-root' 'synthetic://reverse-child'
+    Add-TestAggregateRow $correctness 'reverse-child' '2026-08-28T00:00:12Z' 'gpt-5.6-luna' 900 90 90 900 90 90 'fp-reverse' 'synthetic://reverse-child' 10 'reverse-root'
+    Add-TestAggregateRow $correctness 'reverse-parent' '2026-08-28T00:00:11Z' 'gpt-5.6-sol' 900 90 90 900 90 90 'fp-reverse' 'synthetic://reverse-parent' 10 'reverse-root'
+    $reverseEnds = [ordered]@{ 'synthetic://reverse-child' = 10L; 'synthetic://reverse-parent' = 10L }
+    $reverse = [TokenRaderIndexer]::AggregateIntervalRecords(
+        $correctness, @{}, $reverseEnds, $startedAt, $thresholds, $none, $null)
+    Assert-AggregateTest ($reverse.CountedEvents -eq 1 -and $reverse.DuplicateEventsDropped -eq 1) 'reverse-order lineage copy was not counted once'
+    Assert-AggregateTest ($reverse.Buckets.Count -eq 1 -and $reverse.Buckets[0].Model -eq 'gpt-5.6-sol') 'reverse-order lineage copy did not select the ancestor model'
 
     # The first row after a frozen start may only repeat the last pre-start
     # snapshot. It must be removed even though its timestamp changed; the next
@@ -170,6 +186,23 @@ try {
         $startedAt, $thresholds, $none, $null)
     Assert-AggregateTest ($siblings.RawEvents -eq 2 -and $siblings.CountedEvents -eq 2) 'independent sibling calls were collapsed by shared-root deduplication'
     Assert-AggregateTest ($siblings.TotalInput -eq 1400 -and $siblings.TotalOutput -eq 140) 'independent sibling token totals changed'
+
+    # Quota evidence is start-exclusive/end-inclusive and is also bounded by
+    # the frozen source offset. The row at the start is seeded/excluded, both
+    # calls through the end snapshot are included, and a later appended row
+    # whose timestamp falls inside the window remains outside the frozen end.
+    Add-TestAggregateRow $correctness 'quota' '2026-08-28T01:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'quota-start' 'synthetic://quota' 10 'quota-root'
+    Add-TestAggregateRow $correctness 'quota' '2026-08-28T01:01:00Z' 'gpt-5.5' 2000 200 200 1000 100 100 'quota-one' 'synthetic://quota' 20 'quota-root'
+    Add-TestAggregateRow $correctness 'quota' '2026-08-28T01:02:00Z' 'gpt-5.5' 3000 300 300 1000 100 100 'quota-end' 'synthetic://quota' 30 'quota-root'
+    Add-TestAggregateRow $correctness 'quota' '2026-08-28T01:01:30Z' 'gpt-5.5' 4000 400 400 1000 100 100 'quota-after-freeze' 'synthetic://quota' 40 'quota-root'
+    $quotaAggregate = [TokenRaderIndexer]::AggregateTimeRangeRecordsAtOffsets(
+        $correctness, @{ 'synthetic://quota' = 30L },
+        [DateTimeOffset]::Parse('2026-08-28T01:00:00Z'),
+        [DateTimeOffset]::Parse('2026-08-28T01:02:00Z'),
+        $thresholds, $none, $null)
+    Assert-AggregateTest ($quotaAggregate.CountedEvents -eq 2 -and $quotaAggregate.TotalInput -eq 2000) 'quota evidence did not use the exact snapshot interval'
+    Assert-AggregateTest ($quotaAggregate.FirstCountedAt -eq [DateTimeOffset]::Parse('2026-08-28T01:01:00Z')) 'quota evidence included its start snapshot'
+    Assert-AggregateTest ($quotaAggregate.LastCountedAt -eq [DateTimeOffset]::Parse('2026-08-28T01:02:00Z')) 'quota evidence excluded its end snapshot or included a post-freeze row'
 
     # Rolling history is an exact half-open 24-hour timestamp window. Seed the
     # last cumulative snapshot before the start so a later status refresh does

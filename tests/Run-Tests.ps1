@@ -208,7 +208,7 @@ $aliasPricingEntry = @($aliasPricingDocument.models | Where-Object { [string]$_.
 $aliasPricingEntry.aliases = @('synthetic-gpt-5.5-alias')
 $aliasPricingCacheKey = & $coreModule { param($document) Get-TokenRaderPricingCacheKey -PricingDocument $document } $aliasPricingDocument
 Assert-Equal $false ($basePricingCacheKey -eq $aliasPricingCacheKey) 'usage-history pricing cache invalidates when model aliases change'
-if (-not $basePricingCacheKey.StartsWith('usage-history-v2|', [StringComparison]::Ordinal)) {
+if (-not $basePricingCacheKey.StartsWith('usage-history-v3|', [StringComparison]::Ordinal)) {
     throw 'ASSERT FAILED: usage-history pricing cache key is missing its algorithm version'
 }
 
@@ -499,6 +499,24 @@ try {
     Assert-Near $indexedFrozenBeforeAppend.TotalCost $indexedFrozenAfterAppend.TotalCost 0.0000001 'indexed frozen cost remains stable'
     Assert-Near 5.0 $indexedFrozenAfterAppend.EndRateLimits.FiveHour.UsedPercent 0.0001 'indexed frozen five-hour snapshot remains stable'
     Assert-Near 6.0 $indexedFrozenAfterAppend.EndRateLimits.Weekly.UsedPercent 0.0001 'indexed frozen weekly snapshot remains stable'
+    Assert-Equal 1 ([Int64]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.CountedEvents) 'quota evidence counts the call between its frozen snapshots'
+    Assert-Equal $true ([bool]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.BoundaryValid) 'fresh ending quota snapshot covers the last counted call'
+    Assert-Near ([double]$indexedFrozenBeforeAppend.TotalCost) ([double]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.TotalCost) 0.0000001 'aligned quota cost matches the one-call measurement fixture'
+    Assert-Equal ([DateTimeOffset]$indexedFrozenBeforeAppend.LastCountedAt) ([DateTimeOffset]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.LastCountedAt) 'main and quota aggregate last-call timestamp agreement'
+
+    $staleQuotaCall = New-TestTokenRecord -Timestamp '2026-07-14T01:33:00Z' -TotalInput 2250 -TotalCached 900 -TotalOutput 225 -CallInput 500 -CallCached 200 -CallOutput 50
+    ($staleQuotaCall | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $captureFreezePath -Encoding UTF8
+    $staleQuotaEnding = CaptureMeasurementEnd -Baseline $captureFreezeBaseline
+    $staleQuotaResult = Get-TokenRaderIndexedIntervalResult -Baseline $captureFreezeBaseline -PricingDocument $prices `
+        -EndOffsets $staleQuotaEnding.EndOffsets -EndRevision $staleQuotaEnding.EndRevision
+    Assert-Equal $false ([bool]$staleQuotaResult.QuotaEvidence.Weekly.BoundaryValid) 'end quota snapshot older than the final call was accepted'
+    $staleQuotaEstimate = Get-TokenRaderQuotaEstimate `
+        -StartRateLimits $staleQuotaResult.StartRateLimits `
+        -EndRateLimits $staleQuotaResult.EndRateLimits `
+        -IntervalCost ([double]$staleQuotaResult.TotalCost) `
+        -CostComplete ([bool]$staleQuotaResult.CostComplete) `
+        -QuotaEvidence $staleQuotaResult.QuotaEvidence
+    Assert-Equal $null $staleQuotaEstimate.Weekly 'stale indexed quota evidence generated a new estimate'
 
     # The compiled aggregator must remain numerically identical to the legacy
     # byte parser across multiple models, long-context pricing and an unknown
@@ -833,6 +851,33 @@ try {
     Assert-Near 250.0 $quota.Weekly.TotalUsd 0.0000001 'weekly 3 percent to 8 percent infers 250 API-equivalent USD'
     Assert-Near 20.0 $quota.FiveHour.UsedUsd 0.0000001 'five-hour used USD inference'
     Assert-Near 230.0 $quota.Weekly.RemainingUsd 0.0000001 'weekly remaining USD inference'
+
+    # Production quota inference must use its per-window aligned evidence, not
+    # the full UI measurement cost. The two quota windows may cover different
+    # snapshot intervals and therefore carry different costs.
+    $quotaEvidenceStartAt = [DateTimeOffset]::Parse('2026-07-14T06:00:00Z')
+    $quotaEvidenceEndAt = [DateTimeOffset]::Parse('2026-07-14T07:00:00Z')
+    foreach ($window in @($quotaStart.FiveHour, $quotaStart.Weekly)) {
+        Add-Member -InputObject $window -NotePropertyName ObservedAt -NotePropertyValue $quotaEvidenceStartAt -Force
+    }
+    foreach ($window in @($quotaEnd.FiveHour, $quotaEnd.Weekly)) {
+        Add-Member -InputObject $window -NotePropertyName ObservedAt -NotePropertyValue $quotaEvidenceEndAt -Force
+    }
+    $alignedEvidence = [pscustomobject]@{
+        FiveHour = [pscustomobject]@{ BoundaryValid = $true; PricingComplete = $true; TotalCost = 12.5; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
+        Weekly = [pscustomobject]@{ BoundaryValid = $true; PricingComplete = $true; TotalCost = 25.0; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
+    }
+    $alignedQuota = Get-TokenRaderQuotaEstimate -StartRateLimits $quotaStart -EndRateLimits $quotaEnd `
+        -IntervalCost 41.206022 -CostComplete $true -QuotaEvidence $alignedEvidence
+    Assert-Near 250.0 $alignedQuota.FiveHour.TotalUsd 0.0000001 'five-hour quota uses aligned evidence instead of the full measurement cost'
+    Assert-Near 500.0 $alignedQuota.Weekly.TotalUsd 0.0000001 'weekly quota uses its independent aligned evidence cost'
+    $staleEvidence = [pscustomobject]@{
+        FiveHour = [pscustomobject]@{ BoundaryValid = $false; PricingComplete = $true; TotalCost = 41.206022; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
+        Weekly = [pscustomobject]@{ BoundaryValid = $false; PricingComplete = $true; TotalCost = 41.206022; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
+    }
+    $staleQuota = Get-TokenRaderQuotaEstimate -StartRateLimits $quotaStart -EndRateLimits $quotaEnd `
+        -IntervalCost 41.206022 -CostComplete $true -QuotaEvidence $staleEvidence
+    Assert-Equal $null $staleQuota.Weekly 'stale end snapshot must not reproduce the screenshot 4120.6022 estimate'
 
     $crossResetEnd = New-TestQuotaRateLimits -FiveHourUsed 8 -WeeklyUsed 8 -FiveHourReset $quotaFiveReset.AddHours(1) -WeeklyReset $quotaWeeklyReset -PlanType 'pro'
     $crossResetEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $quotaStart -EndRateLimits $crossResetEnd -IntervalCost 12.5 -CostComplete $true
@@ -2083,12 +2128,25 @@ try {
         $indexedResultMatch.Value -match 'Get-TokenRaderCost\s+-') {
         throw 'INDEX CONTRACT FAILED: indexed interval result must stream a compiled aggregate and price only compact model buckets'
     }
+    if ($indexedResultMatch.Value -notmatch 'QuotaEvidence' -or
+        $indexedResultMatch.Value -notmatch 'Get-TokenRaderQuotaWindowEvidence' -or
+        $uiSource -notmatch '-QuotaEvidence') {
+        throw 'QUOTA CONTRACT FAILED: the UI inference path must consume frozen snapshot-aligned evidence'
+    }
+    $projectResultMatch = [regex]::Match($coreSource, '(?s)function Get-TokenRaderProjectResult\b.*?(?=\r?\nfunction |\z)')
+    if (-not $projectResultMatch.Success -or $projectResultMatch.Value -notmatch 'AggregateIntervalRecords') {
+        throw 'INDEX CONTRACT FAILED: indexed project totals must use the same compiled lineage deduplication'
+    }
     $indexerSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'indexer\TokenRader.Indexer.cs'))
     $aggregateSourceMatch = [regex]::Match($indexerSource, '(?s)public static TokenRaderIntervalAggregateResult AggregateIntervalRecords\b.*?(?=\r?\n    private static Dictionary<string, long> ReadLongContextThresholds)')
     if (-not $aggregateSourceMatch.Success -or $aggregateSourceMatch.Value -notmatch 'ExecuteReader\(' -or
         $aggregateSourceMatch.Value -notmatch 'ThrowIfCancellationRequested' -or
         $aggregateSourceMatch.Value -match 'new\s+DataTable|DataTable\s+\w+\s*=') {
         throw 'INDEX CONTRACT FAILED: compiled interval aggregation must stream SQLite rows with cancellation and without DataTable materialization'
+    }
+    if ($indexerSource -notmatch 'AggregateTimeRangeRecordsAtOffsets' -or
+        $indexerSource -notmatch 'FirstCountedAt' -or $indexerSource -notmatch 'LastCountedAt') {
+        throw 'QUOTA CONTRACT FAILED: offset-frozen snapshot aggregation or counted event boundaries are missing'
     }
     $intervalFailureMatch = [regex]::Match($uiSource, '(?s)function Fail-TokenRaderIntervalComputeJob\b.*?(?=\r?\nfunction |\z)')
     if (-not $intervalFailureMatch.Success -or $intervalFailureMatch.Value -notmatch '测量仍然有效' -or
