@@ -401,7 +401,7 @@
                                     </Grid>
                                     <ProgressBar x:Name="FiveHourProgress" Height="5" Minimum="0" Maximum="100" Value="0"
                                                  Background="#29343D" Foreground="#E8B95E" BorderThickness="0" Margin="0,7,0,0"/>
-                                    <TextBlock x:Name="FiveHourDollarText" Text="美金额度：尚无有效反推结果" Foreground="#9FB0B7" FontSize="10" Margin="0,9,0,0" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="FiveHourDollarText" Text="Token额度：尚无有效估算结果" Foreground="#9FB0B7" FontSize="10" Margin="0,9,0,0" TextWrapping="Wrap"/>
                                 </StackPanel>
                             </Border>
                             <Border Grid.Column="2" Style="{StaticResource CardStyle}" Padding="17">
@@ -424,7 +424,7 @@
                                     </Grid>
                                     <ProgressBar x:Name="WeeklyProgress" Height="5" Minimum="0" Maximum="100" Value="0"
                                                  Background="#29343D" Foreground="#A982E7" BorderThickness="0" Margin="0,7,0,0"/>
-                                    <TextBlock x:Name="WeeklyDollarText" Text="美金额度：尚无有效反推结果" Foreground="#9FB0B7" FontSize="10" Margin="0,9,0,0" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="WeeklyDollarText" Text="Token额度：尚无有效估算结果" Foreground="#9FB0B7" FontSize="10" Margin="0,9,0,0" TextWrapping="Wrap"/>
                                 </StackPanel>
                             </Border>
                         </Grid>

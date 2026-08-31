@@ -1334,7 +1334,7 @@ function Set-QuotaWindowCard {
     if ($null -eq $Window -or $windowExpired) {
         $UsageText.Text = '暂无'
         $Progress.Value = 0
-        $DollarText.Text = '美金额度：暂无当前窗口'
+        $DollarText.Text = 'Token额度：暂无当前窗口'
         $ResetText.Text = '暂无当前窗口'
         return
     }
@@ -1342,21 +1342,18 @@ function Set-QuotaWindowCard {
     $Progress.Value = [Math]::Max(0, [Math]::Min(100, [double]$Window.UsedPercent))
     $ResetText.Text = if ($null -ne $Window.ResetsAt) { ('重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt) } else { ('{0} 分钟窗口' -f $Window.WindowMinutes) }
     if ($null -ne $Estimate) {
-        $resolutionBasis = if ($null -ne $Estimate.PSObject.Properties['ResolutionAssumptionApplied'] -and [bool]$Estimate.ResolutionAssumptionApplied) {
-            (' · 百分比未变化，按日志精度 {0:0.####}% 估算' -f [double]$Estimate.EffectiveDeltaPercent)
-        } else { '' }
         $currentPercent = [double]$Window.UsedPercent
-        $currentUsedUsd = [double]$Estimate.TotalUsd * ($currentPercent / 100.0)
-        $currentRemainingUsd = [double]$Estimate.TotalUsd * ((100.0 - $currentPercent) / 100.0)
-        $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 已用≈{2} · 剩余≈{3} · 从 {4:0.####}% 开始{5}' -f
+        $sourceLabel = if ([string]$Estimate.EstimateSource -eq 'direct_limit_tokens') { '服务端直接Token容量' } else { '本地窗口Token/百分比估算' }
+        $identityLabel = if ([bool]$Estimate.IdentityComplete) { '' } else { ' · 请求级去重不完整' }
+        $DollarText.Text = ('当前用量 {0:0.####}% · Token总额度≈{1} · 已用≈{2} · 剩余≈{3} · 来源：{4}{5}' -f
             $currentPercent,
-            (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
-            (Format-TokenRaderUsd $currentUsedUsd),
-            (Format-TokenRaderUsd $currentRemainingUsd),
-            [double]$Estimate.StartUsedPercent,
-            $resolutionBasis)
+            (Format-TokenRaderNumber ([Int64]$Estimate.TotalTokens)),
+            (Format-TokenRaderNumber ([Int64]$Estimate.UsedTokens)),
+            (Format-TokenRaderNumber ([Int64]$Estimate.RemainingTokens)),
+            $sourceLabel,
+            $identityLabel)
     } else {
-        $DollarText.Text = '美金额度：尚无有效反推结果'
+        $DollarText.Text = 'Token额度：尚无有效估算结果'
     }
 }
 
@@ -1451,18 +1448,10 @@ function Update-QuotaEstimatesFromInterval {
 
     $calibrated = @()
     if ($null -ne $newEstimates.FiveHour) {
-        $basis = if ([bool]$newEstimates.FiveHour.ResolutionAssumptionApplied) {
-            '百分比未变化，按日志精度 {0:0.####}% 估算' -f $newEstimates.FiveHour.EffectiveDeltaPercent
-        } else { '+{0:0.####}%' -f $newEstimates.FiveHour.DeltaPercent }
-        $calibrated += ('5 小时 {0:0.####}%→{1:0.####}%（{2}）' -f
-            $newEstimates.FiveHour.StartUsedPercent, $newEstimates.FiveHour.EndUsedPercent, $basis)
+        $calibrated += ('5 小时 Token容量≈{0}' -f (Format-TokenRaderNumber ([Int64]$newEstimates.FiveHour.TotalTokens)))
     }
     if ($null -ne $newEstimates.Weekly) {
-        $basis = if ([bool]$newEstimates.Weekly.ResolutionAssumptionApplied) {
-            '百分比未变化，按日志精度 {0:0.####}% 估算' -f $newEstimates.Weekly.EffectiveDeltaPercent
-        } else { '+{0:0.####}%' -f $newEstimates.Weekly.DeltaPercent }
-        $calibrated += ('周 {0:0.####}%→{1:0.####}%（{2}）' -f
-            $newEstimates.Weekly.StartUsedPercent, $newEstimates.Weekly.EndUsedPercent, $basis)
+        $calibrated += ('周 Token容量≈{0}' -f (Format-TokenRaderNumber ([Int64]$newEstimates.Weekly.TotalTokens)))
     }
     $retained = @()
     if ($retainedFive) { $retained += '5 小时' }
@@ -1470,17 +1459,17 @@ function Update-QuotaEstimatesFromInterval {
     $phase = if ($Final) { '最终' } else { '实时' }
     $script:State.QuotaCalibrationMessage = if ($calibrated.Count -gt 0) {
         $retainedSuffix = if ($retained.Count -gt 0) { '；{0}继续显示同一窗口的最近有效结果' -f ($retained -join '、') } else { '' }
-        ('{0}反推已同步：{1}{2}。' -f $phase, ($calibrated -join '，'), $retainedSuffix)
+        ('{0}额度估算已同步：{1}{2}。' -f $phase, ($calibrated -join '，'), $retainedSuffix)
     } elseif ($retained.Count -gt 0) {
         ('本次查看未形成新的反推基准，{0}继续显示同一额度窗口的最近有效结果。' -f ($retained -join '、'))
     } elseif (-not $accountUnchanged) {
-        '测量期间账号标签发生变化，本次不反推美金额度。'
+        '测量期间账号标签发生变化，本次不估算Token额度。'
     } elseif (-not $pricingComplete) {
         ''
     } elseif ([double]$Result.TotalCost -le 0) {
         '当前时间段尚无可计价消耗，点击“查看结果”会再次检查。'
     } else {
-        '开始与当前额度窗口不一致或缺少可靠重置时间，本次不显示反推结果。'
+        '当前额度窗口缺少可靠重置时间，本次不显示Token容量估算。'
     }
     Update-QuotaCards
 }

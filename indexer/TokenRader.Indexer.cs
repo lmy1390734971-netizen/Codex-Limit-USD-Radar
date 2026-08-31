@@ -37,6 +37,17 @@ internal sealed class TokenRaderJsonRateWindow
     [DataMember(Name = "resets_at", EmitDefaultValue = false)] public object ResetsAt { get; set; }
     [DataMember(Name = "reset_at", EmitDefaultValue = false)] public object ResetAt { get; set; }
     [DataMember(Name = "resets_in_seconds", EmitDefaultValue = false)] public object ResetsInSeconds { get; set; }
+    [DataMember(Name = "used_tokens", EmitDefaultValue = false)] public object UsedTokens { get; set; }
+    [DataMember(Name = "remaining_tokens", EmitDefaultValue = false)] public object RemainingTokens { get; set; }
+    [DataMember(Name = "limit_tokens", EmitDefaultValue = false)] public object LimitTokens { get; set; }
+}
+
+[DataContract]
+internal sealed class TokenRaderJsonCredits
+{
+    [DataMember(Name = "balance", EmitDefaultValue = false)] public object Balance { get; set; }
+    [DataMember(Name = "has_credits", EmitDefaultValue = false)] public object HasCredits { get; set; }
+    [DataMember(Name = "unlimited", EmitDefaultValue = false)] public object Unlimited { get; set; }
 }
 
 [DataContract]
@@ -45,6 +56,12 @@ internal sealed class TokenRaderJsonRateLimits
     [DataMember(Name = "plan_type", EmitDefaultValue = false)] public string PlanType { get; set; }
     [DataMember(Name = "primary", EmitDefaultValue = false)] public TokenRaderJsonRateWindow Primary { get; set; }
     [DataMember(Name = "secondary", EmitDefaultValue = false)] public TokenRaderJsonRateWindow Secondary { get; set; }
+    [DataMember(Name = "limit_id", EmitDefaultValue = false)] public string LimitId { get; set; }
+    [DataMember(Name = "limit_name", EmitDefaultValue = false)] public string LimitName { get; set; }
+    [DataMember(Name = "individual_limit", EmitDefaultValue = false)] public object IndividualLimit { get; set; }
+    [DataMember(Name = "rate_limit_reached_type", EmitDefaultValue = false)] public string RateLimitReachedType { get; set; }
+    [DataMember(Name = "spend_control_reached", EmitDefaultValue = false)] public object SpendControlReached { get; set; }
+    [DataMember(Name = "credits", EmitDefaultValue = false)] public TokenRaderJsonCredits Credits { get; set; }
 }
 
 [DataContract]
@@ -57,6 +74,9 @@ internal sealed class TokenRaderJsonPayload
     [DataMember(Name = "status", EmitDefaultValue = false)] public string Status { get; set; }
     [DataMember(Name = "info", EmitDefaultValue = false)] public TokenRaderJsonInfo Info { get; set; }
     [DataMember(Name = "rate_limits", EmitDefaultValue = false)] public TokenRaderJsonRateLimits RateLimits { get; set; }
+    [DataMember(Name = "turn_id", EmitDefaultValue = false)] public string TurnId { get; set; }
+    [DataMember(Name = "request_id", EmitDefaultValue = false)] public string RequestId { get; set; }
+    [DataMember(Name = "response_id", EmitDefaultValue = false)] public string ResponseId { get; set; }
 }
 
 [DataContract]
@@ -103,6 +123,9 @@ public sealed class TokenRaderIntervalAggregateResult
     public long TotalReasoning { get; set; }
     public DateTimeOffset? FirstCountedAt { get; set; }
     public DateTimeOffset? LastCountedAt { get; set; }
+    public bool IdentityComplete { get; set; }
+    public long UnidentifiedEvents { get; set; }
+    public string[] IdentitySources { get; set; }
     public int ChangedSessions { get; set; }
     public string[] Models { get; set; }
     public TokenRaderIntervalAggregateBucket[] Buckets { get; set; }
@@ -111,6 +134,7 @@ public sealed class TokenRaderIntervalAggregateResult
     {
         Models = new string[0];
         Buckets = new TokenRaderIntervalAggregateBucket[0];
+        IdentitySources = new string[0];
     }
 }
 
@@ -252,6 +276,10 @@ public static class TokenRaderIndexer
         public string Model = "";
         public DateTimeOffset EventAt;
         public bool HasTimestamp;
+        public string TurnId = "";
+        public string RequestId = "";
+        public string ResponseId = "";
+        public string IdentitySource = "";
         public long CallInput;
         public long CallCached;
         public long CallOutput;
@@ -497,7 +525,7 @@ public static class TokenRaderIndexer
             EnsureFileMetadataColumn(db, "content_retained", "INTEGER NOT NULL DEFAULT 1");
             EnsureFileMetadataColumn(db, "root_session_id", "TEXT NOT NULL DEFAULT ''");
 
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '')";
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', response_id TEXT NOT NULL DEFAULT '', identity_source TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', rate_limit_id TEXT NOT NULL DEFAULT '', rate_limit_name TEXT NOT NULL DEFAULT '', credits_balance REAL, credits_has INTEGER, credits_unlimited INTEGER, five_hour_used_tokens INTEGER, five_hour_remaining_tokens INTEGER, five_hour_limit_tokens INTEGER, weekly_used_tokens INTEGER, weekly_remaining_tokens INTEGER, weekly_limit_tokens INTEGER, rate_limit_individual INTEGER, rate_limit_reached_type TEXT NOT NULL DEFAULT '', spend_control_reached INTEGER)";
             cmd.ExecuteNonQuery();
 
             // New columns are additive so databases created by older builds
@@ -508,6 +536,26 @@ public static class TokenRaderIndexer
             EnsureTokenRecordColumn(db, "root_session_id", "TEXT NOT NULL DEFAULT ''");
             EnsureTokenRecordColumn(db, "index_revision", "INTEGER NOT NULL DEFAULT 0");
             EnsureTokenRecordColumn(db, "model_source", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "turn_id", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "request_id", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "response_id", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "identity_source", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "service_tier", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "reasoning_effort", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "rate_limit_id", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "rate_limit_name", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "credits_balance", "REAL");
+            EnsureTokenRecordColumn(db, "credits_has", "INTEGER");
+            EnsureTokenRecordColumn(db, "credits_unlimited", "INTEGER");
+            EnsureTokenRecordColumn(db, "five_hour_used_tokens", "INTEGER");
+            EnsureTokenRecordColumn(db, "five_hour_remaining_tokens", "INTEGER");
+            EnsureTokenRecordColumn(db, "five_hour_limit_tokens", "INTEGER");
+            EnsureTokenRecordColumn(db, "weekly_used_tokens", "INTEGER");
+            EnsureTokenRecordColumn(db, "weekly_remaining_tokens", "INTEGER");
+            EnsureTokenRecordColumn(db, "weekly_limit_tokens", "INTEGER");
+            EnsureTokenRecordColumn(db, "rate_limit_individual", "INTEGER");
+            EnsureTokenRecordColumn(db, "rate_limit_reached_type", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "spend_control_reached", "INTEGER");
 
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_records_session ON token_records(session_id)";
             cmd.ExecuteNonQuery();
@@ -764,6 +812,16 @@ public static class TokenRaderIndexer
     private static readonly Regex _turnContextModel = new Regex(
         @"""type""\s*:\s*""turn_context"".*?""model""\s*:\s*""([^""]+)""",
         RegexOptions.Compiled);
+    private static readonly Regex _turnIdValue = new Regex(
+        @"""turn_id""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
+    private static readonly Regex _requestIdValue = new Regex(
+        @"""request_id""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
+    private static readonly Regex _responseIdValue = new Regex(
+        @"""response_id""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
+    private static readonly Regex _serviceTierValue = new Regex(
+        @"""service_tier""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
+    private static readonly Regex _reasoningEffortValue = new Regex(
+        @"""reasoning_effort""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
 
     private static readonly Regex _sessionIdFromPath = new Regex(
         @"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
@@ -844,14 +902,17 @@ public static class TokenRaderIndexer
         string inheritedModelSource;
         string inheritedModel = ResolveInheritedModel(db, sessionId, parentSessionId,
             effectiveRootSessionId, out inheritedModelSource);
+        string inheritedTurnId = GetLatestSessionTextColumn(db, sessionId, "turn_id");
+        string inheritedServiceTier = GetLatestSessionTextColumn(db, sessionId, "service_tier");
+        string inheritedReasoningEffort = GetLatestSessionTextColumn(db, sessionId, "reasoning_effort");
         bool insertedUnresolvedModel = false;
 
         using (var tx = db.BeginTransaction())
         using (var cmd = db.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision, model_source) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23,@p24)";
-            var p = new SQLiteParameter[24];
+            cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision, model_source, turn_id, request_id, response_id, identity_source, service_tier, reasoning_effort, rate_limit_id, rate_limit_name, credits_balance, credits_has, credits_unlimited, five_hour_used_tokens, five_hour_remaining_tokens, five_hour_limit_tokens, weekly_used_tokens, weekly_remaining_tokens, weekly_limit_tokens, rate_limit_individual, rate_limit_reached_type, spend_control_reached) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23,@p24,@p25,@p26,@p27,@p28,@p29,@p30,@p31,@p32,@p33,@p34,@p35,@p36,@p37,@p38,@p39,@p40,@p41,@p42,@p43,@p44)";
+            var p = new SQLiteParameter[44];
             for (int i = 0; i < p.Length; i++)
             {
                 var prm = new SQLiteParameter("@p" + (i + 1));
@@ -893,6 +954,9 @@ public static class TokenRaderIndexer
                     // a later turn_context in the appended segment still wins.
                     string currentModel = inheritedModel;
                     string currentModelSource = inheritedModelSource;
+                    string currentTurnId = inheritedTurnId;
+                    string currentServiceTier = inheritedServiceTier;
+                    string currentReasoningEffort = inheritedReasoningEffort;
                     string line; long lineEndOffset; bool lineTerminated;
                     while (lineReader.ReadLine(out line, out lineEndOffset, out lineTerminated))
                     {
@@ -902,6 +966,24 @@ public static class TokenRaderIndexer
                         if (!lineTerminated) break;
                         if (string.IsNullOrWhiteSpace(line)) continue;
                         line = line.TrimStart('\uFEFF');
+
+                        if (line.Contains("turn_id") &&
+                            (line.Contains("turn_context") || line.Contains("task_started") ||
+                             line.Contains("item_completed") || line.Contains("task_complete")))
+                        {
+                            Match turnMatch = _turnIdValue.Match(line);
+                            if (turnMatch.Success) currentTurnId = turnMatch.Groups[1].Value;
+                        }
+                        if (line.Contains("service_tier"))
+                        {
+                            Match tierMatch = _serviceTierValue.Match(line);
+                            if (tierMatch.Success) currentServiceTier = tierMatch.Groups[1].Value;
+                        }
+                        if (line.Contains("reasoning_effort"))
+                        {
+                            Match effortMatch = _reasoningEffortValue.Match(line);
+                            if (effortMatch.Success) currentReasoningEffort = effortMatch.Groups[1].Value;
+                        }
 
                         if (line.Contains("turn_context"))
                         {
@@ -963,11 +1045,31 @@ public static class TokenRaderIndexer
 
                             double? fiveHourUsed = null; int? fiveHourWindow = null; long? fiveHourResets = null;
                             double? weeklyUsed = null; int? weeklyWindow = null; long? weeklyResets = null;
+                            long? fiveHourUsedTokens = null; long? fiveHourRemainingTokens = null; long? fiveHourLimitTokens = null;
+                            long? weeklyUsedTokens = null; long? weeklyRemainingTokens = null; long? weeklyLimitTokens = null;
                             string planType = "";
+                            string rateLimitId = ""; string rateLimitName = "";
+                            int? rateLimitIndividual = null; int? spendControlReached = null;
+                            string rateLimitReachedType = "";
+                            double? creditsBalance = null; int? creditsHas = null; int? creditsUnlimited = null;
                             var rateLimits = payload.RateLimits;
                             if (rateLimits != null)
                             {
                                 planType = rateLimits.PlanType ?? "";
+                                rateLimitId = rateLimits.LimitId ?? "";
+                                rateLimitName = rateLimits.LimitName ?? "";
+                                rateLimitReachedType = rateLimits.RateLimitReachedType ?? "";
+                                bool parsedLimitBool;
+                                if (TryGetBooleanValue(rateLimits.IndividualLimit, out parsedLimitBool)) rateLimitIndividual = parsedLimitBool ? 1 : 0;
+                                if (TryGetBooleanValue(rateLimits.SpendControlReached, out parsedLimitBool)) spendControlReached = parsedLimitBool ? 1 : 0;
+                                if (rateLimits.Credits != null)
+                                {
+                                    double parsedBalance;
+                                    if (TryGetDoubleValue(rateLimits.Credits.Balance, out parsedBalance)) creditsBalance = parsedBalance;
+                                    bool parsedBool;
+                                    if (TryGetBooleanValue(rateLimits.Credits.HasCredits, out parsedBool)) creditsHas = parsedBool ? 1 : 0;
+                                    if (TryGetBooleanValue(rateLimits.Credits.Unlimited, out parsedBool)) creditsUnlimited = parsedBool ? 1 : 0;
+                                }
                                 DateTimeOffset observedAt;
                                 bool hasObservedAt = TryParseTimestamp(record.Timestamp, out observedAt);
                                 foreach (TokenRaderJsonRateWindow win in new[] { rateLimits.Primary, rateLimits.Secondary })
@@ -980,11 +1082,37 @@ public static class TokenRaderIndexer
                                         ? (long?)resetSeconds
                                         : null;
                                     if (winMin >= 240 && winMin <= 360)
-                                    { fiveHourUsed = ClampPercent(used); fiveHourWindow = winMin; fiveHourResets = normalizedResets; }
+                                    {
+                                        fiveHourUsed = ClampPercent(used); fiveHourWindow = winMin; fiveHourResets = normalizedResets;
+                                        fiveHourUsedTokens = GetNullableNonNegativeInt64(win.UsedTokens);
+                                        fiveHourRemainingTokens = GetNullableNonNegativeInt64(win.RemainingTokens);
+                                        fiveHourLimitTokens = GetNullablePositiveInt64(win.LimitTokens);
+                                    }
                                     else if (winMin >= 9000 && winMin <= 11520)
-                                    { weeklyUsed = ClampPercent(used); weeklyWindow = winMin; weeklyResets = normalizedResets; }
+                                    {
+                                        weeklyUsed = ClampPercent(used); weeklyWindow = winMin; weeklyResets = normalizedResets;
+                                        weeklyUsedTokens = GetNullableNonNegativeInt64(win.UsedTokens);
+                                        weeklyRemainingTokens = GetNullableNonNegativeInt64(win.RemainingTokens);
+                                        weeklyLimitTokens = GetNullablePositiveInt64(win.LimitTokens);
+                                    }
                                 }
                             }
+
+                            string requestId = payload.RequestId ?? "";
+                            string responseId = payload.ResponseId ?? "";
+                            if (string.IsNullOrWhiteSpace(requestId) && line.Contains("request_id"))
+                            {
+                                Match requestMatch = _requestIdValue.Match(line);
+                                if (requestMatch.Success) requestId = requestMatch.Groups[1].Value;
+                            }
+                            if (string.IsNullOrWhiteSpace(responseId) && line.Contains("response_id"))
+                            {
+                                Match responseMatch = _responseIdValue.Match(line);
+                                if (responseMatch.Success) responseId = responseMatch.Groups[1].Value;
+                            }
+                            string identitySource = !string.IsNullOrWhiteSpace(requestId) ? "request_id" :
+                                (!string.IsNullOrWhiteSpace(responseId) ? "response_id" :
+                                (!string.IsNullOrWhiteSpace(currentTurnId) ? "turn_id" : "unresolved"));
 
                             p[0].Value = sessionId; p[1].Value = Convert.ToString(record.Timestamp, CultureInfo.InvariantCulture) ?? ""; p[2].Value = currentModel;
                             p[3].Value = totalInput; p[4].Value = totalCached; p[5].Value = totalOutput; p[6].Value = totalReasoning;
@@ -1000,6 +1128,26 @@ public static class TokenRaderIndexer
                             p[21].Value = effectiveRootSessionId;
                             p[22].Value = indexRevision;
                             p[23].Value = currentModelSource;
+                            p[24].Value = currentTurnId ?? "";
+                            p[25].Value = requestId;
+                            p[26].Value = responseId;
+                            p[27].Value = identitySource;
+                            p[28].Value = currentServiceTier ?? "";
+                            p[29].Value = currentReasoningEffort ?? "";
+                            p[30].Value = rateLimitId;
+                            p[31].Value = rateLimitName;
+                            p[32].Value = (object)creditsBalance ?? DBNull.Value;
+                            p[33].Value = (object)creditsHas ?? DBNull.Value;
+                            p[34].Value = (object)creditsUnlimited ?? DBNull.Value;
+                            p[35].Value = (object)fiveHourUsedTokens ?? DBNull.Value;
+                            p[36].Value = (object)fiveHourRemainingTokens ?? DBNull.Value;
+                            p[37].Value = (object)fiveHourLimitTokens ?? DBNull.Value;
+                            p[38].Value = (object)weeklyUsedTokens ?? DBNull.Value;
+                            p[39].Value = (object)weeklyRemainingTokens ?? DBNull.Value;
+                            p[40].Value = (object)weeklyLimitTokens ?? DBNull.Value;
+                            p[41].Value = (object)rateLimitIndividual ?? DBNull.Value;
+                            p[42].Value = rateLimitReachedType;
+                            p[43].Value = (object)spendControlReached ?? DBNull.Value;
                             cmd.ExecuteNonQuery();
                             if (string.IsNullOrWhiteSpace(currentModel)) insertedUnresolvedModel = true;
                             count++;
@@ -1769,7 +1917,8 @@ public static class TokenRaderIndexer
                 // semantics. No SELECT * and no SQL-side/global sort are used.
                 cmd.CommandText =
                     "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
-                    "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id " +
+                    "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
+                    "turn_id,request_id,response_id,identity_source " +
                     "FROM token_records WHERE source_path=@path AND source_offset_end>@start AND source_offset_end<=@end " +
                     "ORDER BY source_offset_end ASC";
                 cmd.Parameters.AddWithValue("@path", range.Path);
@@ -1802,6 +1951,10 @@ public static class TokenRaderIndexer
                         string fingerprint = ReadReaderString(reader, 11);
                         string sourcePath = ReadReaderString(reader, 12);
                         string rootSessionId = ReadReaderString(reader, 14);
+                        string turnId = ReadReaderString(reader, 15);
+                        string requestId = ReadReaderString(reader, 16);
+                        string responseId = ReadReaderString(reader, 17);
+                        string identitySource = ReadReaderString(reader, 18);
 
                         if (callInput <= 0L && callOutput <= 0L) continue;
 
@@ -1830,6 +1983,8 @@ public static class TokenRaderIndexer
                         string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
+                        if (!string.IsNullOrWhiteSpace(requestId)) eventKey = rootSessionId.ToLowerInvariant() + "|request:" + requestId;
+                        else if (!string.IsNullOrWhiteSpace(responseId)) eventKey = rootSessionId.ToLowerInvariant() + "|response:" + responseId;
                         AddAggregateLineageCandidate(lineageGroups, eventKey,
                             new AggregateEventCandidate {
                                 SessionId = sessionId,
@@ -1838,6 +1993,10 @@ public static class TokenRaderIndexer
                                 Model = model,
                                 EventAt = eventAt,
                                 HasTimestamp = hasTimestamp,
+                                TurnId = turnId,
+                                RequestId = requestId,
+                                ResponseId = responseId,
+                                IdentitySource = identitySource,
                                 CallInput = callInput,
                                 CallCached = callCached,
                                 CallOutput = callOutput,
@@ -1899,7 +2058,8 @@ public static class TokenRaderIndexer
         {
             cmd.CommandText =
                 "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
-                "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id " +
+                "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
+                "turn_id,request_id,response_id,identity_source " +
                 "FROM token_records WHERE source_offset_end>0 AND timestamp>=@broad_start AND timestamp<@broad_end " +
                 "ORDER BY timestamp ASC,source_path ASC,source_offset_end ASC";
             cmd.Parameters.AddWithValue("@broad_start", broadStart);
@@ -1929,6 +2089,10 @@ public static class TokenRaderIndexer
                     string fingerprint = ReadReaderString(reader, 11);
                     string sourcePath = ReadReaderString(reader, 12);
                     string rootSessionId = ReadReaderString(reader, 14);
+                    string turnId = ReadReaderString(reader, 15);
+                    string requestId = ReadReaderString(reader, 16);
+                    string responseId = ReadReaderString(reader, 17);
+                    string identitySource = ReadReaderString(reader, 18);
 
                     DateTimeOffset eventAt;
                     if (!TryParseTimestamp(timestampText, out eventAt) || eventAt < startedAt || eventAt >= endedAt) continue;
@@ -1947,6 +2111,8 @@ public static class TokenRaderIndexer
                     string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                         totalInput, totalCached, totalOutput, totalReasoning,
                         callInput, callCached, callOutput, callReasoning, fingerprint);
+                    if (!string.IsNullOrWhiteSpace(requestId)) eventKey = rootSessionId.ToLowerInvariant() + "|request:" + requestId;
+                    else if (!string.IsNullOrWhiteSpace(responseId)) eventKey = rootSessionId.ToLowerInvariant() + "|response:" + responseId;
                     AddAggregateLineageCandidate(lineageGroups, eventKey,
                         new AggregateEventCandidate {
                             SessionId = sessionId,
@@ -1955,6 +2121,10 @@ public static class TokenRaderIndexer
                             Model = model,
                             EventAt = eventAt,
                             HasTimestamp = true,
+                            TurnId = turnId,
+                            RequestId = requestId,
+                            ResponseId = responseId,
+                            IdentitySource = identitySource,
                             CallInput = callInput,
                             CallCached = callCached,
                             CallOutput = callOutput,
@@ -2016,7 +2186,8 @@ public static class TokenRaderIndexer
             {
                 cmd.CommandText =
                     "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
-                    "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id " +
+                    "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
+                    "turn_id,request_id,response_id,identity_source " +
                     "FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<=@end " +
                     "AND timestamp>=@broad_start AND timestamp<@broad_end ORDER BY source_offset_end ASC";
                 cmd.Parameters.AddWithValue("@path", range.Path);
@@ -2051,6 +2222,10 @@ public static class TokenRaderIndexer
                         string fingerprint = ReadReaderString(reader, 11);
                         string sourcePath = ReadReaderString(reader, 12);
                         string rootSessionId = ReadReaderString(reader, 14);
+                        string turnId = ReadReaderString(reader, 15);
+                        string requestId = ReadReaderString(reader, 16);
+                        string responseId = ReadReaderString(reader, 17);
+                        string identitySource = ReadReaderString(reader, 18);
                         if (callInput <= 0L && callOutput <= 0L) continue;
 
                         string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
@@ -2064,6 +2239,8 @@ public static class TokenRaderIndexer
                         string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
+                        if (!string.IsNullOrWhiteSpace(requestId)) eventKey = rootSessionId.ToLowerInvariant() + "|request:" + requestId;
+                        else if (!string.IsNullOrWhiteSpace(responseId)) eventKey = rootSessionId.ToLowerInvariant() + "|response:" + responseId;
                         AddAggregateLineageCandidate(lineageGroups, eventKey,
                             new AggregateEventCandidate {
                                 SessionId = sessionId,
@@ -2072,6 +2249,10 @@ public static class TokenRaderIndexer
                                 Model = model,
                                 EventAt = eventAt,
                                 HasTimestamp = true,
+                                TurnId = turnId,
+                                RequestId = requestId,
+                                ResponseId = responseId,
+                                IdentitySource = identitySource,
                                 CallInput = callInput,
                                 CallCached = callCached,
                                 CallOutput = callOutput,
@@ -2225,6 +2406,17 @@ public static class TokenRaderIndexer
         for (int i = 0; i < representatives.Count; i++)
         {
             AggregateEventCandidate existing = representatives[i];
+            string candidateStableId = !string.IsNullOrWhiteSpace(candidate.RequestId)
+                ? "request:" + candidate.RequestId
+                : (!string.IsNullOrWhiteSpace(candidate.ResponseId) ? "response:" + candidate.ResponseId : "");
+            string existingStableId = !string.IsNullOrWhiteSpace(existing.RequestId)
+                ? "request:" + existing.RequestId
+                : (!string.IsNullOrWhiteSpace(existing.ResponseId) ? "response:" + existing.ResponseId : "");
+            if (!string.IsNullOrWhiteSpace(candidateStableId) && !string.IsNullOrWhiteSpace(existingStableId) &&
+                !string.Equals(candidateStableId, existingStableId, StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.IsNullOrWhiteSpace(candidateStableId) && string.IsNullOrWhiteSpace(existingStableId) &&
+                !string.IsNullOrWhiteSpace(candidate.TurnId) && !string.IsNullOrWhiteSpace(existing.TurnId) &&
+                !string.Equals(candidate.TurnId, existing.TurnId, StringComparison.OrdinalIgnoreCase)) continue;
             bool sameSession = string.Equals(candidate.SessionId, existing.SessionId,
                 StringComparison.OrdinalIgnoreCase);
             bool candidateIsRoot = !string.IsNullOrWhiteSpace(candidate.RootSessionId) &&
@@ -2242,6 +2434,10 @@ public static class TokenRaderIndexer
             // and token usage. Replacing a previously seen descendant makes
             // aggregation independent of file enumeration order.
             if (candidateAncestor && !existingAncestor) representatives[i] = candidate;
+            else if (sameSession && !string.IsNullOrWhiteSpace(candidateStableId) &&
+                string.Equals(candidateStableId, existingStableId, StringComparison.OrdinalIgnoreCase) &&
+                candidate.HasTimestamp && (!existing.HasTimestamp || candidate.EventAt >= existing.EventAt))
+                representatives[i] = candidate;
             return;
         }
         representatives.Add(candidate);
@@ -2256,6 +2452,7 @@ public static class TokenRaderIndexer
         var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var buckets = new Dictionary<string, TokenRaderIntervalAggregateBucket>(StringComparer.OrdinalIgnoreCase);
         var resolvedThresholds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        var identitySources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         DateTimeOffset? firstCountedAt = null;
         DateTimeOffset? lastCountedAt = null;
 
@@ -2271,6 +2468,17 @@ public static class TokenRaderIndexer
                 result.TotalReasoning += candidate.CallReasoning;
                 if (!string.IsNullOrWhiteSpace(candidate.SourcePath)) activeFiles.Add(candidate.SourcePath);
                 if (!string.IsNullOrWhiteSpace(candidate.Model)) models.Add(candidate.Model);
+                string identitySource = candidate.IdentitySource;
+                if (string.IsNullOrWhiteSpace(identitySource))
+                {
+                    identitySource = !string.IsNullOrWhiteSpace(candidate.RequestId) ? "request_id" :
+                        (!string.IsNullOrWhiteSpace(candidate.ResponseId) ? "response_id" :
+                        (!string.IsNullOrWhiteSpace(candidate.TurnId) ? "turn_id" : "unresolved"));
+                }
+                identitySources.Add(identitySource);
+                if (!string.Equals(identitySource, "request_id", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(identitySource, "response_id", StringComparison.OrdinalIgnoreCase))
+                    result.UnidentifiedEvents++;
                 if (candidate.HasTimestamp)
                 {
                     if (!firstCountedAt.HasValue || candidate.EventAt < firstCountedAt.Value)
@@ -2307,6 +2515,10 @@ public static class TokenRaderIndexer
 
         result.FirstCountedAt = firstCountedAt;
         result.LastCountedAt = lastCountedAt;
+        result.IdentityComplete = result.CountedEvents > 0L && result.UnidentifiedEvents == 0L;
+        var sortedIdentitySources = new List<string>(identitySources);
+        sortedIdentitySources.Sort(StringComparer.OrdinalIgnoreCase);
+        result.IdentitySources = sortedIdentitySources.ToArray();
         result.ChangedSessions = activeFiles.Count;
         var sortedModels = new List<string>(models);
         sortedModels.Sort(StringComparer.OrdinalIgnoreCase);
@@ -3523,6 +3735,21 @@ public static class TokenRaderIndexer
         }
     }
 
+    private static string GetLatestSessionTextColumn(SQLiteConnection db, string sessionId, string columnName)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(columnName)) return "";
+        using (var cmd = db.CreateCommand())
+        {
+            // columnName is supplied only by private constant call sites.
+            cmd.CommandText = "SELECT " + columnName + " FROM token_records WHERE session_id=@session AND " +
+                columnName + " IS NOT NULL AND " + columnName + "<>'' ORDER BY id DESC LIMIT 1";
+            cmd.Parameters.AddWithValue("@session", sessionId);
+            object value = cmd.ExecuteScalar();
+            return value == null || value == DBNull.Value ? "" :
+                (Convert.ToString(value, CultureInfo.InvariantCulture) ?? "");
+        }
+    }
+
     private static string ResolveInheritedModel(
         SQLiteConnection db,
         string sessionId,
@@ -3762,6 +3989,36 @@ public static class TokenRaderIndexer
         string text = raw as string;
         if (text == null) return false;
         return double.TryParse(text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+    }
+
+    private static bool TryGetBooleanValue(object raw, out bool value)
+    {
+        value = false;
+        if (raw == null || raw == DBNull.Value) return false;
+        if (raw is bool) { value = (bool)raw; return true; }
+        string text = Convert.ToString(raw, CultureInfo.InvariantCulture) ?? "";
+        if (bool.TryParse(text, out value)) return true;
+        long number;
+        if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out number))
+        {
+            value = number != 0L;
+            return true;
+        }
+        return false;
+    }
+
+    private static long? GetNullableNonNegativeInt64(object raw)
+    {
+        if (raw == null || raw == DBNull.Value) return null;
+        long value;
+        if (!TryConvertInt64(raw, out value) || value < 0L) return null;
+        return value;
+    }
+
+    private static long? GetNullablePositiveInt64(object raw)
+    {
+        long? value = GetNullableNonNegativeInt64(raw);
+        return value.HasValue && value.Value > 0L ? value : null;
     }
 
     private static long GetInt64Value(object raw)

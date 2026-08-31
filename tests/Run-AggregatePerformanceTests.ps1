@@ -35,7 +35,10 @@ function Add-TestAggregateRow {
         [string]$Fingerprint,
         [string]$SourcePath,
         [Int64]$SourceOffset,
-        [string]$RootSessionId
+        [string]$RootSessionId,
+        [string]$TurnId = '',
+        [string]$RequestId = '',
+        [string]$IdentitySource = ''
     )
     $command = $Connection.CreateCommand()
     try {
@@ -43,11 +46,11 @@ function Add-TestAggregateRow {
 INSERT INTO token_records
 (session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning,
  call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,
- source_offset_end,root_session_id,index_revision)
+ source_offset_end,root_session_id,index_revision,turn_id,request_id,identity_source)
 VALUES
 (@session,@timestamp,@model,@total_input,@total_cached,@total_output,0,
  @call_input,@call_cached,@call_output,0,@fingerprint,@source_path,
- @source_offset,@root_session,1)
+ @source_offset,@root_session,1,@turn_id,@request_id,@identity_source)
 '@
         [void]$command.Parameters.AddWithValue('@session', $SessionId)
         [void]$command.Parameters.AddWithValue('@timestamp', $Timestamp)
@@ -62,6 +65,9 @@ VALUES
         [void]$command.Parameters.AddWithValue('@source_path', $SourcePath)
         [void]$command.Parameters.AddWithValue('@source_offset', $SourceOffset)
         [void]$command.Parameters.AddWithValue('@root_session', $RootSessionId)
+        [void]$command.Parameters.AddWithValue('@turn_id', $TurnId)
+        [void]$command.Parameters.AddWithValue('@request_id', $RequestId)
+        [void]$command.Parameters.AddWithValue('@identity_source', $IdentitySource)
         [void]$command.ExecuteNonQuery()
     } finally { $command.Dispose() }
 }
@@ -151,6 +157,23 @@ try {
         $correctness, @{}, $reverseEnds, $startedAt, $thresholds, $none, $null)
     Assert-AggregateTest ($reverse.CountedEvents -eq 1 -and $reverse.DuplicateEventsDropped -eq 1) 'reverse-order lineage copy was not counted once'
     Assert-AggregateTest ($reverse.Buckets.Count -eq 1 -and $reverse.Buckets[0].Model -eq 'gpt-5.6-sol') 'reverse-order lineage copy did not select the ancestor model'
+
+    Add-TestAggregateRelationship $correctness 'turn-parent' 'turn-root' 'turn-root' 'synthetic://turn-parent'
+    Add-TestAggregateRelationship $correctness 'turn-child' 'turn-parent' 'turn-root' 'synthetic://turn-child'
+    Add-TestAggregateRow $correctness 'turn-parent' '2026-08-28T00:00:13Z' 'gpt-5.6-sol' 800 80 80 800 80 80 'fp-turns' 'synthetic://turn-parent' 10 'turn-root' 'turn-one' '' 'turn_id'
+    Add-TestAggregateRow $correctness 'turn-child' '2026-08-28T00:00:14Z' 'gpt-5.6-sol' 800 80 80 800 80 80 'fp-turns' 'synthetic://turn-child' 10 'turn-root' 'turn-two' '' 'turn_id'
+    $differentTurns = [TokenRaderIndexer]::AggregateIntervalRecords(
+        $correctness, @{}, @{ 'synthetic://turn-parent' = 10L; 'synthetic://turn-child' = 10L },
+        $startedAt, $thresholds, $none, $null)
+    Assert-AggregateTest ($differentTurns.CountedEvents -eq 2) 'different turns in one lineage were collapsed by token fingerprint alone'
+    Assert-AggregateTest (-not $differentTurns.IdentityComplete -and $differentTurns.UnidentifiedEvents -eq 2) 'turn-level identity was incorrectly reported as request-complete'
+
+    Add-TestAggregateRow $correctness 'request' '2026-08-28T00:00:15Z' 'gpt-5.6-sol' 100 10 10 100 10 10 'request-partial' 'synthetic://request' 10 'request-root' 'turn-request' 'request-one' 'request_id'
+    Add-TestAggregateRow $correctness 'request' '2026-08-28T00:00:16Z' 'gpt-5.6-sol' 300 30 30 200 20 20 'request-final' 'synthetic://request' 20 'request-root' 'turn-request' 'request-one' 'request_id'
+    $stableRequest = [TokenRaderIndexer]::AggregateIntervalRecords(
+        $correctness, @{}, @{ 'synthetic://request' = 20L }, $startedAt, $thresholds, $none, $null)
+    Assert-AggregateTest ($stableRequest.CountedEvents -eq 1 -and $stableRequest.TotalInput -eq 200) 'stable request id did not retain only the latest terminal usage'
+    Assert-AggregateTest ($stableRequest.IdentityComplete -and $stableRequest.IdentitySources[0] -eq 'request_id') 'request-level identity completeness was not reported'
 
     # The first row after a frozen start may only repeat the last pre-start
     # snapshot. It must be removed even though its timestamp changed; the next

@@ -129,6 +129,29 @@ try {
     Assert-ModelTest ([string]$childRows.Rows[0]['model'] -eq 'gpt-5.6-sol' -and [string]$childRows.Rows[0]['model_source'] -eq 'parent') 'pre-turn child row did not inherit its direct parent model'
     Assert-ModelTest ([string]$childRows.Rows[1]['model'] -eq 'gpt-5.6-luna' -and [string]$childRows.Rows[1]['model_source'] -eq 'turn_context') 'post-turn child row did not switch to its own model'
 
+    $metadataId = '10000000-0000-0000-0000-000000000007'
+    $metadataPath = Join-Path $tempRoot ('rollout-' + $metadataId + '.jsonl')
+    $metadataLines = @(
+        '{"timestamp":"2026-08-30T00:01:00Z","type":"turn_context","payload":{"turn_id":"turn-synthetic","model":"gpt-5.6-sol","service_tier":"priority","reasoning_effort":"ultra"}}',
+        '{"timestamp":"2026-08-30T00:01:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":10,"reasoning_output_tokens":4},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":10,"reasoning_output_tokens":4}},"rate_limits":{"plan_type":"pro","limit_id":"codex","limit_name":"main","credits":{"balance":3,"has_credits":true,"unlimited":false},"primary":{"used_percent":25,"window_minutes":10080,"resets_at":1890000000,"used_tokens":2500,"remaining_tokens":7500,"limit_tokens":10000},"secondary":{"used_percent":10,"window_minutes":300,"resets_at":1889500000,"used_tokens":100,"remaining_tokens":900,"limit_tokens":1000}}}}'
+    )
+    [void](Write-ModelTestLog $metadataPath $metadataLines)
+    [void][TokenRaderIndexer]::ImportFile($db, $metadataPath, 0L, [IO.FileInfo]::new($metadataPath).Length, $metadataId, '', 1L)
+    $metadataCommand = $db.CreateCommand()
+    try {
+        $metadataCommand.CommandText = 'SELECT turn_id,identity_source,service_tier,reasoning_effort,rate_limit_id,rate_limit_name,credits_balance,credits_has,credits_unlimited,five_hour_limit_tokens,weekly_limit_tokens FROM token_records WHERE session_id=@session LIMIT 1'
+        [void]$metadataCommand.Parameters.AddWithValue('@session', $metadataId)
+        $reader = $metadataCommand.ExecuteReader()
+        try {
+            Assert-ModelTest ($reader.Read()) 'synthetic metadata token row missing'
+            Assert-ModelTest ($reader.GetString(0) -eq 'turn-synthetic' -and $reader.GetString(1) -eq 'turn_id') 'turn identity was not attached to token row'
+            Assert-ModelTest ($reader.GetString(2) -eq 'priority' -and $reader.GetString(3) -eq 'ultra') 'service tier or reasoning effort was not inherited'
+            Assert-ModelTest ($reader.GetString(4) -eq 'codex' -and $reader.GetString(5) -eq 'main') 'quota namespace metadata missing'
+            Assert-ModelTest ($reader.GetDouble(6) -eq 3 -and $reader.GetInt32(7) -eq 1 -and $reader.GetInt32(8) -eq 0) 'credits metadata missing'
+            Assert-ModelTest ($reader.GetInt64(9) -eq 1000 -and $reader.GetInt64(10) -eq 10000) 'direct window token capacities missing'
+        } finally { $reader.Dispose() }
+    } finally { $metadataCommand.Dispose() }
+
     # Recreate the same child shape as a legacy empty-model index. A later
     # same-session Luna row must not leak backward before the first turn_context.
     $legacyChildId = '10000000-0000-0000-0000-000000000003'
