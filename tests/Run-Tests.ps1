@@ -411,6 +411,12 @@ try {
         -WeeklyReset ([DateTimeOffset]::Parse('2026-07-20T10:00:00Z'))
     $negativeDeltaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $negativeDeltaEnd -IntervalCost 1.25 -CostComplete $true
     Assert-Equal $null $negativeDeltaEstimate.FiveHour 'negative quota delta remains invalid'
+    $expiredAtStart = Get-TokenRaderQuotaEstimate -StartRateLimits $minimumDeltaStart -EndRateLimits $minimumDeltaEnd `
+        -IntervalCost 1.25 -CostComplete $true `
+        -StartReferenceAt ([DateTimeOffset]::Parse('2026-07-14T10:00:01Z')) `
+        -EndReferenceAt ([DateTimeOffset]::Parse('2026-07-14T10:00:02Z'))
+    Assert-Equal $null $expiredAtStart.FiveHour 'a rate-limit window already reset at the measurement boundary is rejected'
+    Assert-Equal $false ($null -eq $expiredAtStart.Weekly) 'an independent current weekly window survives an expired five-hour window'
 
     # Explicit measurement capture contract used by the asynchronous UI.  The
     # public commands freeze offsets/snapshots before the worker starts; the end
@@ -1714,6 +1720,7 @@ try {
     $aggregateTestScript = Join-Path $PSScriptRoot 'Run-AggregatePerformanceTests.ps1'
     if ($Performance) { & $aggregateTestScript -IncludeLegacyInterference }
     else { & $aggregateTestScript }
+    & (Join-Path $PSScriptRoot 'Run-ModelBackfillTests.ps1')
 
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')
@@ -1764,6 +1771,20 @@ try {
     # compute path must not fall back to invoking the parser on the UI thread.
     $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
     $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
+    $combinedUiSource = $xamlSource + "`n" + $uiSource
+    foreach ($forbiddenUiText in @('估算，不是账单', '存在未收录价格的模型', '存在未知模型价格', '存在未收录官方价格的模型')) {
+        if ($combinedUiSource.Contains($forbiddenUiText)) { throw ('UI CONTRACT FAILED: forbidden pricing warning remains: ' + $forbiddenUiText) }
+    }
+    if (-not $uiSource.Contains('（部分）')) {
+        throw 'UI CONTRACT FAILED: compact partial-pricing marker was removed'
+    }
+    if ($uiSource -notmatch '\$canRetainPrevious\s*=\s*\$accountUnchanged\s*(\r?\n|$)' -or
+        $uiSource -match '\$canRetainPrevious\s*=\s*\$accountUnchanged\s*-and\s*\$pricingComplete') {
+        throw 'QUOTA CONTRACT FAILED: transient partial pricing must retain a same-window prior estimate'
+    }
+    if ($uiSource -notmatch '暂无当前窗口' -or $coreSource -notmatch 'StartReferenceAt' -or $coreSource -notmatch 'EndReferenceAt') {
+        throw 'QUOTA CONTRACT FAILED: expired quota windows are not rejected and hidden'
+    }
     if ($uiSource.Contains('待时间段校准') -or
         $uiSource -notmatch '当前用量 \{0:0\.####\}% · 反推总额度≈\{1\}.*?从 \{4:0\.####\}% 开始') {
         throw 'UI CONTRACT FAILED: quota estimates must lead with current usage and inferred total before the starting percentage'

@@ -1460,7 +1460,9 @@ function Get-TokenRaderQuotaEstimate {
         $StartRateLimits,
         $EndRateLimits,
         [double]$IntervalCost,
-        [bool]$CostComplete = $true
+        [bool]$CostComplete = $true,
+        $StartReferenceAt = $null,
+        $EndReferenceAt = $null
     )
 
     function Get-WindowPercentResolution {
@@ -1484,6 +1486,8 @@ function Get-TokenRaderQuotaEstimate {
         if (-not $StartPlanType.Equals($EndPlanType, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
         if ([int]$StartWindow.WindowMinutes -ne [int]$EndWindow.WindowMinutes) { return $null }
         if ($null -eq $StartWindow.ResetsAt -or $null -eq $EndWindow.ResetsAt) { return $null }
+        if ($null -ne $StartReferenceAt -and [DateTimeOffset]$StartWindow.ResetsAt -le [DateTimeOffset]$StartReferenceAt) { return $null }
+        if ($null -ne $EndReferenceAt -and [DateTimeOffset]$EndWindow.ResetsAt -le [DateTimeOffset]$EndReferenceAt) { return $null }
         $startResetIdentity = if ($null -ne $StartWindow.PSObject.Properties['ResetIdentity']) { [string]$StartWindow.ResetIdentity } else {
             Get-TokenRaderResetIdentity -WindowMinutes ([int]$StartWindow.WindowMinutes) -ResetsAt $StartWindow.ResetsAt
         }
@@ -1816,6 +1820,9 @@ function Sync-TokenRaderIndexFiles {
         })
     }
     if ($hasRelationshipChanges) {
+        # A newly discovered parent/root can resolve rows that were genuinely
+        # orphaned during the previous backfill pass.
+        [TokenRaderIndexer]::SetSetting($conn, 'missing_model_backfill_version', '0')
         # Relationship traversal/backfill is only needed when a candidate adds
         # or changes task ancestry. Ordinary token appends reuse the already
         # resolved root from their cursor row and avoid walking the whole
@@ -1948,7 +1955,11 @@ function Sync-TokenRaderIndexFiles {
             }
 
             $count = if ($completeOffset -gt $startOffset) {
-                [TokenRaderIndexer]::ImportFile($conn, $canonical, $startOffset, $completeOffset, [string]$rootSessionId, $nextRevision)
+                $directParentId = if (-not [string]::IsNullOrWhiteSpace([string]$metadata.ParentThreadId)) {
+                    [string]$metadata.ParentThreadId
+                } else { [string]$metadata.ForkedFromId }
+                [TokenRaderIndexer]::ImportFile($conn, $canonical, $startOffset, $completeOffset,
+                    [string]$rootSessionId, $directParentId, $nextRevision)
             } else { 0 }
             $fresh = Get-Item -LiteralPath $canonical -ErrorAction Stop
             [TokenRaderIndexer]::UpdateFileMetadata(
@@ -2077,6 +2088,13 @@ function New-TokenRaderIndex {
     }
     $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
     $result = Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile
+    $modelBackfill = [TokenRaderIndexer]::BackfillMissingTokenModels($result.Connection)
+    $result.IndexRevision = [Int64]$modelBackfill.IndexRevision
+    if (-not [bool]$modelBackfill.Completed) {
+        $result.SyncComplete = $false
+        $result.LastFailedFiles = @($result.LastFailedFiles) + @($modelBackfill.FailedSourcePaths)
+        throw ('空模型索引回填有 {0} 个日志暂时无法校验；未将不完整索引视为成功。' -f [int]$modelBackfill.FailedFiles)
+    }
     if (-not [bool]$result.SyncComplete) {
         throw ('索引构建有 {0} 个日志暂时无法读取；已保留待重试路径，未将不完整索引视为成功。' -f @($result.LastFailedFiles).Count)
     }
@@ -2127,6 +2145,15 @@ function Update-TokenRaderIndex {
                 $ProgressState.LastProgressAt = [DateTimeOffset]::Now
             }
             $index
+        }
+    }
+    $modelBackfill = [TokenRaderIndexer]::BackfillMissingTokenModels($result.Connection)
+    $result.IndexRevision = [Int64]$modelBackfill.IndexRevision
+    if (-not [bool]$modelBackfill.Completed) {
+        $result.SyncComplete = $false
+        $result.LastFailedFiles = @($result.LastFailedFiles) + @($modelBackfill.FailedSourcePaths)
+        if (-not $AllowIncomplete) {
+            throw ('空模型索引回填有 {0} 个日志暂时无法校验；未将不完整计价视为成功。' -f [int]$modelBackfill.FailedFiles)
         }
     }
     if (-not $AllowIncomplete -and -not [bool]$result.SyncComplete) {
@@ -2386,6 +2413,7 @@ function ConvertFrom-TokenRaderIndexRecord {
         FilePath = $FilePath
         Timestamp = $timestamp
         Model = [string]$Row['model']
+        ModelSource = if ($Row.Table.Columns.Contains('model_source')) { [string]$Row['model_source'] } else { '' }
         PlanType = [string]$Row['plan_type']
         RateLimits = $rateLimits
         Task = [pscustomobject]@{

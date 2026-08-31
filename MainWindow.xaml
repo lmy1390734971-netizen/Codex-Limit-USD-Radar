@@ -369,7 +369,6 @@
                                 <TextBlock x:Name="CostBreakdownText" Text="未缓存 $0 · 缓存 $0 · 输出 $0" Foreground="#8FA9A5" FontSize="11" Margin="0,4,0,0"/>
                             </StackPanel>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
-                                <TextBlock Text="估算，不是账单" Foreground="#8FA9A5" FontSize="10" HorizontalAlignment="Right"/>
                                 <TextBlock x:Name="LongContextText" Text="标准上下文费率" Foreground="#D7E7E3" FontSize="11" Margin="0,5,0,0" HorizontalAlignment="Right"/>
                             </StackPanel>
                         </Grid>

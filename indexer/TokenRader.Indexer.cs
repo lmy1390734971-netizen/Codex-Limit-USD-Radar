@@ -215,6 +215,24 @@ public sealed class TokenRaderToolBackfillResult
     public long ScannedBytes { get; set; }
 }
 
+/// <summary>Missing token-model repair diagnostics.</summary>
+public sealed class TokenRaderModelBackfillResult
+{
+    public int CandidateFiles { get; set; }
+    public int ProcessedFiles { get; set; }
+    public int FailedFiles { get; set; }
+    public long UpdatedRows { get; set; }
+    public long UnresolvedRows { get; set; }
+    public bool Completed { get; set; }
+    public long IndexRevision { get; set; }
+    public string[] FailedSourcePaths { get; set; }
+
+    public TokenRaderModelBackfillResult()
+    {
+        FailedSourcePaths = new string[0];
+    }
+}
+
 /// <summary>
 /// 磁盘 SQLite 索引引擎。将 Codex 会话日志（JSONL）中的 token 记录解析后
 /// 写入项目 data/private/index/index.db，后续所有查询走 SQL，
@@ -463,7 +481,7 @@ public static class TokenRaderIndexer
             EnsureFileMetadataColumn(db, "content_retained", "INTEGER NOT NULL DEFAULT 1");
             EnsureFileMetadataColumn(db, "root_session_id", "TEXT NOT NULL DEFAULT ''");
 
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0)";
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '')";
             cmd.ExecuteNonQuery();
 
             // New columns are additive so databases created by older builds
@@ -473,6 +491,7 @@ public static class TokenRaderIndexer
             EnsureTokenRecordColumn(db, "source_offset_end", "INTEGER NOT NULL DEFAULT 0");
             EnsureTokenRecordColumn(db, "root_session_id", "TEXT NOT NULL DEFAULT ''");
             EnsureTokenRecordColumn(db, "index_revision", "INTEGER NOT NULL DEFAULT 0");
+            EnsureTokenRecordColumn(db, "model_source", "TEXT NOT NULL DEFAULT ''");
 
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_records_session ON token_records(session_id)";
             cmd.ExecuteNonQuery();
@@ -756,13 +775,13 @@ public static class TokenRaderIndexer
     /// <summary>增量解析一个 JSONL 文件，插入 SQLite，返回新记录数。</summary>
     public static int ImportFile(SQLiteConnection db, string filePath, long startOffset)
     {
-        return ImportFile(db, filePath, startOffset, long.MaxValue, null, null);
+        return ImportFile(db, filePath, startOffset, long.MaxValue, null, null, null);
     }
 
     /// <summary>解析指定字节边界内的 JSONL，避免并发追加越过冻结边界。</summary>
     public static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset)
     {
-        return ImportFile(db, filePath, startOffset, endOffset, null, null);
+        return ImportFile(db, filePath, startOffset, endOffset, null, null, null);
     }
 
     /// <summary>
@@ -771,7 +790,7 @@ public static class TokenRaderIndexer
     /// </summary>
     public static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset, string rootSessionId)
     {
-        return ImportFile(db, filePath, startOffset, endOffset, rootSessionId, null);
+        return ImportFile(db, filePath, startOffset, endOffset, rootSessionId, null, null);
     }
 
     /// <summary>
@@ -780,10 +799,21 @@ public static class TokenRaderIndexer
     /// </summary>
     public static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset, string rootSessionId, long indexRevision)
     {
-        return ImportFile(db, filePath, startOffset, endOffset, rootSessionId, (long?)indexRevision);
+        return ImportFile(db, filePath, startOffset, endOffset, rootSessionId, null, (long?)indexRevision);
     }
 
-    private static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset, string rootSessionId, long? explicitIndexRevision)
+    /// <summary>
+    /// Relationship-aware overload used by the incremental indexer. Existing
+    /// callers remain source compatible with the older overloads above.
+    /// </summary>
+    public static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset,
+        string rootSessionId, string parentSessionId, long indexRevision)
+    {
+        return ImportFile(db, filePath, startOffset, endOffset, rootSessionId, parentSessionId, (long?)indexRevision);
+    }
+
+    private static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset,
+        string rootSessionId, string parentSessionId, long? explicitIndexRevision)
     {
         int count = 0;
         string sessionId = ExtractSessionId(filePath);
@@ -795,14 +825,17 @@ public static class TokenRaderIndexer
 
         // Read this before opening the import transaction: the lookup command
         // intentionally uses the connection's normal transaction context.
-        string inheritedModel = GetLatestSessionModel(db, sessionId);
+        string inheritedModelSource;
+        string inheritedModel = ResolveInheritedModel(db, sessionId, parentSessionId,
+            effectiveRootSessionId, out inheritedModelSource);
+        bool insertedUnresolvedModel = false;
 
         using (var tx = db.BeginTransaction())
         using (var cmd = db.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23)";
-            var p = new SQLiteParameter[23];
+            cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision, model_source) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23,@p24)";
+            var p = new SQLiteParameter[24];
             for (int i = 0; i < p.Length; i++)
             {
                 var prm = new SQLiteParameter("@p" + (i + 1));
@@ -843,6 +876,7 @@ public static class TokenRaderIndexer
                     // the latest non-empty model already indexed for this session;
                     // a later turn_context in the appended segment still wins.
                     string currentModel = inheritedModel;
+                    string currentModelSource = inheritedModelSource;
                     string line; long lineEndOffset; bool lineTerminated;
                     while (lineReader.ReadLine(out line, out lineEndOffset, out lineTerminated))
                     {
@@ -856,7 +890,11 @@ public static class TokenRaderIndexer
                         if (line.Contains("turn_context"))
                         {
                             var m = _turnContextModel.Match(line);
-                            if (m.Success) currentModel = m.Groups[1].Value;
+                            if (m.Success)
+                            {
+                                currentModel = m.Groups[1].Value;
+                                currentModelSource = "turn_context";
+                            }
                             continue;
                         }
                         if (MightContainToolMetadata(line))
@@ -945,7 +983,9 @@ public static class TokenRaderIndexer
                             p[20].Value = lineEndOffset;
                             p[21].Value = effectiveRootSessionId;
                             p[22].Value = indexRevision;
+                            p[23].Value = currentModelSource;
                             cmd.ExecuteNonQuery();
+                            if (string.IsNullOrWhiteSpace(currentModel)) insertedUnresolvedModel = true;
                             count++;
                         }
                         catch { continue; }
@@ -954,6 +994,7 @@ public static class TokenRaderIndexer
             }
             tx.Commit();
         }
+        if (insertedUnresolvedModel) SetSetting(db, "missing_model_backfill_version", "0");
         return count;
     }
 
@@ -2297,9 +2338,12 @@ public static class TokenRaderIndexer
                 totalInput, totalCached, totalOutput, totalReasoning,
                 callInput, callCached, callOutput, callReasoning)
             : fingerprint;
-        string timestamp = eventAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
-        return (rootSessionId ?? "").ToLowerInvariant() + "|" + timestamp + "|" +
-            (model ?? "").ToLowerInvariant() + "|" + usage;
+        // A parent and its descendant can serialize the same inherited call at
+        // different times. Timestamp is therefore deliberately excluded from
+        // the lineage identity. The caller still requires an actual ancestor-
+        // descendant relationship, so identical sibling calls remain distinct.
+        return (rootSessionId ?? "").ToLowerInvariant() + "|" +
+            (model ?? "").Trim().ToLowerInvariant() + "|" + usage;
     }
 
     private static long ComputeRangeBytes(List<OffsetRange> ranges)
@@ -2478,6 +2522,185 @@ public static class TokenRaderIndexer
             tx.Commit();
         }
         return affected;
+    }
+
+    /// <summary>
+    /// Repairs only retained token rows whose model is empty. The source file
+    /// is streamed once, and only turn_context/token_count line boundaries are
+    /// considered. Parent/root fallbacks come from indexed relationship
+    /// metadata; prompt and response content is never copied to the database.
+    /// </summary>
+    public static TokenRaderModelBackfillResult BackfillMissingTokenModels(SQLiteConnection db)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        var result = new TokenRaderModelBackfillResult();
+        string version = GetSetting(db, "missing_model_backfill_version");
+        if (string.Equals(version, "1", StringComparison.Ordinal))
+        {
+            result.Completed = true;
+            result.IndexRevision = GetIndexRevision(db);
+            result.UnresolvedRows = CountMissingTokenModels(db);
+            return result;
+        }
+
+        var candidates = new DataTable();
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT tr.source_path,tr.session_id,MIN(tr.source_offset_end) AS first_offset," +
+                "MAX(tr.source_offset_end) AS last_offset," +
+                "COALESCE(fm.parent_thread_id,''),COALESCE(fm.forked_from_id,'')," +
+                "COALESCE(fm.root_session_id,tr.root_session_id,'') " +
+                "FROM token_records tr LEFT JOIN file_metadata fm ON fm.path=tr.source_path " +
+                "WHERE (tr.model IS NULL OR tr.model='') AND tr.source_path<>'' AND tr.source_offset_end>0 " +
+                "GROUP BY tr.source_path,tr.session_id";
+            using (var adapter = new SQLiteDataAdapter(cmd)) adapter.Fill(candidates);
+        }
+        result.CandidateFiles = candidates.Rows.Count;
+        long targetRevision = GetIndexRevision(db) + 1L;
+        var failedSourcePaths = new List<string>();
+
+        foreach (DataRow row in candidates.Rows)
+        {
+            string sourcePath = Convert.ToString(row[0], CultureInfo.InvariantCulture) ?? "";
+            string sessionId = Convert.ToString(row[1], CultureInfo.InvariantCulture) ?? "";
+            long firstOffset = Convert.ToInt64(row[2], CultureInfo.InvariantCulture);
+            long lastOffset = Convert.ToInt64(row[3], CultureInfo.InvariantCulture);
+            string parentSessionId = Convert.ToString(row[4], CultureInfo.InvariantCulture) ?? "";
+            if (string.IsNullOrWhiteSpace(parentSessionId))
+                parentSessionId = Convert.ToString(row[5], CultureInfo.InvariantCulture) ?? "";
+            string rootSessionId = Convert.ToString(row[6], CultureInfo.InvariantCulture) ?? "";
+
+            try
+            {
+                string modelSource;
+                string currentModel = GetLatestSourceModelBefore(db, sourcePath, firstOffset);
+                if (!string.IsNullOrWhiteSpace(currentModel)) modelSource = "same_session";
+                // Do not use a later same-session model for rows that precede
+                // the child's first turn_context. Only an earlier row in this
+                // same source is valid; otherwise ancestry supplies the model.
+                else currentModel = ResolveInheritedModel(db, "", parentSessionId, rootSessionId, out modelSource);
+
+                var targetOffsets = ReadMissingModelOffsets(db, sourcePath);
+                if (File.Exists(sourcePath))
+                {
+                    using (var fs = new FileStream(sourcePath, FileMode.Open, FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete))
+                    using (var reader = new Utf8JsonlLineReader(fs, 0L, Math.Min(fs.Length, lastOffset)))
+                    {
+                        string line; long lineEndOffset; bool lineTerminated;
+                        while (reader.ReadLine(out line, out lineEndOffset, out lineTerminated))
+                        {
+                            if (!lineTerminated) break;
+                            if (string.IsNullOrWhiteSpace(line)) continue;
+                            line = line.TrimStart('\uFEFF');
+                            if (line.Contains("turn_context"))
+                            {
+                                Match match = _turnContextModel.Match(line);
+                                if (match.Success)
+                                {
+                                    currentModel = match.Groups[1].Value;
+                                    modelSource = "turn_context";
+                                }
+                                continue;
+                            }
+                            if (!line.Contains("token_count") || !targetOffsets.Contains(lineEndOffset)) continue;
+                            result.UpdatedRows += UpdateMissingModelAtOffset(db, sourcePath, lineEndOffset,
+                                currentModel, modelSource, targetRevision);
+                            targetOffsets.Remove(lineEndOffset);
+                        }
+                    }
+                    // If a file was replaced after it was indexed, byte
+                    // offsets are no longer trustworthy. Leave the completion
+                    // marker unset so the next full sync can replace/retry it.
+                    if (targetOffsets.Count > 0) throw new IOException("Token model offsets no longer match the source file.");
+                }
+                else
+                {
+                    // Missing retained source files can still be repaired from
+                    // explicit ancestry. Truly orphaned rows remain unresolved.
+                    result.UpdatedRows += UpdateMissingModelsForSource(db, sourcePath,
+                        currentModel, modelSource, targetRevision);
+                }
+                result.ProcessedFiles++;
+            }
+            catch
+            {
+                result.FailedFiles++;
+                failedSourcePaths.Add(sourcePath);
+            }
+        }
+
+        if (result.UpdatedRows > 0L) result.IndexRevision = IncrementIndexRevision(db);
+        else result.IndexRevision = GetIndexRevision(db);
+        result.UnresolvedRows = CountMissingTokenModels(db);
+        result.Completed = result.FailedFiles == 0;
+        result.FailedSourcePaths = failedSourcePaths.ToArray();
+        if (result.Completed) SetSetting(db, "missing_model_backfill_version", "1");
+        return result;
+    }
+
+    private static HashSet<long> ReadMissingModelOffsets(SQLiteConnection db, string sourcePath)
+    {
+        var result = new HashSet<long>();
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT source_offset_end FROM token_records WHERE source_path=@path AND source_offset_end>0 AND (model IS NULL OR model='')";
+            cmd.Parameters.AddWithValue("@path", sourcePath ?? "");
+            using (var reader = cmd.ExecuteReader())
+                while (reader.Read()) result.Add(ReadReaderInt64(reader, 0));
+        }
+        return result;
+    }
+
+    private static string GetLatestSourceModelBefore(SQLiteConnection db, string sourcePath, long offset)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT model FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<@offset AND model<>'' ORDER BY source_offset_end DESC LIMIT 1";
+            cmd.Parameters.AddWithValue("@path", sourcePath ?? "");
+            cmd.Parameters.AddWithValue("@offset", offset);
+            object value = cmd.ExecuteScalar();
+            return value == null || value == DBNull.Value ? "" : (Convert.ToString(value, CultureInfo.InvariantCulture) ?? "");
+        }
+    }
+
+    private static int UpdateMissingModelAtOffset(SQLiteConnection db, string sourcePath, long offset,
+        string model, string modelSource, long indexRevision)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "UPDATE token_records SET model=@model,model_source=@source,index_revision=@revision WHERE source_path=@path AND source_offset_end=@offset AND (model IS NULL OR model='')";
+            cmd.Parameters.AddWithValue("@model", model ?? "");
+            cmd.Parameters.AddWithValue("@source", string.IsNullOrWhiteSpace(model) ? "unresolved" : (modelSource ?? "unresolved"));
+            cmd.Parameters.AddWithValue("@revision", indexRevision);
+            cmd.Parameters.AddWithValue("@path", sourcePath ?? "");
+            cmd.Parameters.AddWithValue("@offset", offset);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    private static int UpdateMissingModelsForSource(SQLiteConnection db, string sourcePath,
+        string model, string modelSource, long indexRevision)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "UPDATE token_records SET model=@model,model_source=@source,index_revision=@revision WHERE source_path=@path AND (model IS NULL OR model='')";
+            cmd.Parameters.AddWithValue("@model", model ?? "");
+            cmd.Parameters.AddWithValue("@source", string.IsNullOrWhiteSpace(model) ? "unresolved" : (modelSource ?? "unresolved"));
+            cmd.Parameters.AddWithValue("@revision", indexRevision);
+            cmd.Parameters.AddWithValue("@path", sourcePath ?? "");
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    private static long CountMissingTokenModels(SQLiteConnection db)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(*) FROM token_records WHERE model IS NULL OR model=''";
+            return Convert.ToInt64(cmd.ExecuteScalar(), CultureInfo.InvariantCulture);
+        }
     }
 
     private static void UpsertFileMetadata(
@@ -3154,6 +3377,44 @@ public static class TokenRaderIndexer
             if (value == null || value == DBNull.Value) return "";
             return Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
         }
+    }
+
+    private static string ResolveInheritedModel(
+        SQLiteConnection db,
+        string sessionId,
+        string parentSessionId,
+        string rootSessionId,
+        out string modelSource)
+    {
+        string model = GetLatestSessionModel(db, sessionId);
+        if (!string.IsNullOrWhiteSpace(model))
+        {
+            modelSource = "same_session";
+            return model;
+        }
+        if (!string.IsNullOrWhiteSpace(parentSessionId) &&
+            !string.Equals(parentSessionId, sessionId, StringComparison.OrdinalIgnoreCase))
+        {
+            model = GetLatestSessionModel(db, parentSessionId);
+            if (!string.IsNullOrWhiteSpace(model))
+            {
+                modelSource = "parent";
+                return model;
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(rootSessionId) &&
+            !string.Equals(rootSessionId, sessionId, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(rootSessionId, parentSessionId, StringComparison.OrdinalIgnoreCase))
+        {
+            model = GetLatestSessionModel(db, rootSessionId);
+            if (!string.IsNullOrWhiteSpace(model))
+            {
+                modelSource = "root";
+                return model;
+            }
+        }
+        modelSource = "unresolved";
+        return "";
     }
 
     private static string ExtractSessionId(string filePath)

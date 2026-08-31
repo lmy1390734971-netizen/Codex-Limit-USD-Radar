@@ -111,7 +111,7 @@ try {
     Add-TestAggregateRelationship $correctness 'parent' 'root' 'root' 'synthetic://parent'
     Add-TestAggregateRelationship $correctness 'child' 'parent' 'root' 'synthetic://child'
     Add-TestAggregateRow $correctness 'parent' '2026-08-28T00:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://parent' 10 'root'
-    Add-TestAggregateRow $correctness 'child' '2026-08-28T00:00:00Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://child' 10 'root'
+    Add-TestAggregateRow $correctness 'child' '2026-08-28T00:00:09Z' 'gpt-5.5' 1000 100 100 1000 100 100 'fp-standard' 'synthetic://child' 10 'root'
     Add-TestAggregateRow $correctness 'parent' '2026-08-28T00:00:01Z' 'gpt-5.5' 2000 200 200 1000 100 100 'fp-standard-2' 'synthetic://parent' 20 'root'
     Add-TestAggregateRow $correctness 'long' '2026-08-28T00:00:02Z' 'gpt-5.6-sol' 300001 100001 200 300001 100001 200 'fp-long' 'synthetic://long' 10 'long-root'
     Add-TestAggregateRow $correctness 'unknown' '2026-08-28T00:00:03Z' 'synthetic-unknown' 500 0 50 500 0 50 'fp-unknown' 'synthetic://unknown' 10 'unknown-root'

@@ -777,9 +777,7 @@ function Show-TokenRaderUsageHistoryResult {
     $script:UsageHistoryWindowText.Text = ('{0:MM-dd HH:mm} — {1:MM-dd HH:mm}' -f $start, $end)
     $script:UsageHistoryModelText.Text = ('{0} · {1:N0} 次调用' -f [string]$Result.ModelDisplay, [Int64]$Result.CountedEvents)
     $sourceLabel = if ([bool]$Result.FromCache) { '读取磁盘缓存' } else { '已更新磁盘缓存' }
-    $script:UsageHistoryStatusText.Text = if ([bool]$Result.PricingComplete) {
-        $sourceLabel
-    } else { $sourceLabel + ' · 存在未知模型价格' }
+    $script:UsageHistoryStatusText.Text = $sourceLabel
     $rows = foreach ($modelResult in @($Result.ModelBreakdown | Sort-Object Model)) {
         [pscustomobject]@{
             Model = [string]$modelResult.Model
@@ -1331,11 +1329,13 @@ function Set-QuotaWindowCard {
         [Parameter(Mandatory = $true)]$ResetText
     )
 
-    if ($null -eq $Window) {
+    $windowExpired = $null -ne $Window -and $null -ne $Window.ResetsAt -and
+        [DateTimeOffset]$Window.ResetsAt -le [DateTimeOffset]::Now
+    if ($null -eq $Window -or $windowExpired) {
         $UsageText.Text = '暂无'
         $Progress.Value = 0
-        $DollarText.Text = '美金额度：暂无可用数据'
-        $ResetText.Text = '暂无窗口'
+        $DollarText.Text = '美金额度：暂无当前窗口'
+        $ResetText.Text = '暂无当前窗口'
         return
     }
     $UsageText.Text = ('{0:0.####}%' -f [double]$Window.UsedPercent)
@@ -1379,6 +1379,7 @@ function Test-TokenRaderQuotaEstimateMatchesWindow {
     # to the current measurement generation, so retain it until a concrete
     # incompatible window is observed.
     if ($null -eq $Window) { return $true }
+    if ($null -ne $Window.ResetsAt -and [DateTimeOffset]$Window.ResetsAt -le [DateTimeOffset]::Now) { return $false }
     if ($null -ne $Estimate.PSObject.Properties['WindowMinutes'] -and
         [int]$Estimate.WindowMinutes -ne [int]$Window.WindowMinutes) { return $false }
     if ($null -ne $Estimate.PSObject.Properties['PlanType'] -and
@@ -1416,14 +1417,18 @@ function Update-QuotaEstimatesFromInterval {
         -StartRateLimits $(if ($accountUnchanged) { $startRateLimits } else { $null }) `
         -EndRateLimits $(if ($accountUnchanged) { $endRateLimits } else { $null }) `
         -IntervalCost ([double]$Result.TotalCost) `
-        -CostComplete $pricingComplete
+        -CostComplete $pricingComplete `
+        -StartReferenceAt $script:State.IntervalBaseline.StartedAt `
+        -EndReferenceAt $(if ($null -ne $Result.PSObject.Properties['EndedAt']) { $Result.EndedAt } else { [DateTimeOffset]::Now })
     $previousEstimates = $script:State.QuotaEstimates
     $validationRateLimits = if ($null -ne $endRateLimits) { $endRateLimits } else { $script:State.RateLimits }
     $validationFive = if ($null -ne $validationRateLimits) { $validationRateLimits.FiveHour } else { $null }
     $validationWeekly = if ($null -ne $validationRateLimits) { $validationRateLimits.Weekly } else { $null }
     $previousFive = if ($null -ne $previousEstimates) { $previousEstimates.FiveHour } else { $null }
     $previousWeekly = if ($null -ne $previousEstimates) { $previousEstimates.Weekly } else { $null }
-    $canRetainPrevious = $accountUnchanged -and $pricingComplete
+    # Price incompleteness blocks a new estimate but must not erase a valid
+    # estimate already calibrated for the same account/window/reset cycle.
+    $canRetainPrevious = $accountUnchanged
     $retainedFive = $false
     $retainedWeekly = $false
     $effectiveFive = $newEstimates.FiveHour
@@ -1470,7 +1475,7 @@ function Update-QuotaEstimatesFromInterval {
     } elseif (-not $accountUnchanged) {
         '测量期间账号标签发生变化，本次不反推美金额度。'
     } elseif (-not $pricingComplete) {
-        '存在未收录价格的模型，暂时无法反推完整美金额度。'
+        ''
     } elseif ([double]$Result.TotalCost -le 0) {
         '当前时间段尚无可计价消耗，点击“查看结果”会再次检查。'
     } else {
@@ -1505,7 +1510,7 @@ function Show-IntervalResult {
         (Format-TokenRaderUsd ([double]$Result.InputCost)),
         (Format-TokenRaderUsd ([double]$Result.CachedCost)),
         (Format-TokenRaderUsd ([double]$Result.OutputCost)))
-    $script:LongContextText.Text = if ($Result.CostComplete) { '按唯一调用及各自模型 API 价汇总' } else { '存在未收录价格的模型' }
+    $script:LongContextText.Text = '按唯一调用及各自模型 API 价汇总'
 
     if (@($Result.Models).Count -eq 1) {
         $price = Resolve-TokenRaderPrice -Model ([string]$Result.Models[0]) -PricingDocument $script:Prices
@@ -1993,7 +1998,7 @@ function Update-ProjectView {
         (Format-TokenRaderUsd ([double]$result.InputCost)),
         (Format-TokenRaderUsd ([double]$result.CachedCost)),
         (Format-TokenRaderUsd ([double]$result.OutputCost)))
-    $script:LongContextText.Text = if ($result.CostComplete) { '按任务树去重，并按每次调用的模型计价' } else { '存在未收录官方价格的模型，金额为部分合计' }
+    $script:LongContextText.Text = '按任务树去重，并按每次调用的模型计价'
 
     if (@($result.Models).Count -eq 1) {
         $price = Resolve-TokenRaderPrice -Model ([string]$result.Models[0]) -PricingDocument $script:Prices
@@ -2210,9 +2215,13 @@ function Update-UsageView {
     if ($scope -eq 'task') {
         $taskResult = Get-TokenRaderSessionResult -FilePath ([string]$selected.FilePath) -SessionsRoot $script:Paths.SessionsRoot -PricingDocument $script:Prices
         if ($null -eq $taskResult -or -not $taskResult.CostComplete) {
-            $unknownModels = if ($null -ne $taskResult) { @($taskResult.UnknownModels) -join '、' } else { '未知模型' }
-            $script:UsdCostText.Text = '无法估算'
-            $script:CostBreakdownText.Text = ('存在未收录价格的模型：{0}' -f $unknownModels)
+            $script:UsdCostText.Text = if ($null -ne $taskResult) { (Format-TokenRaderUsd ([double]$taskResult.TotalCost)) + '（部分）' } else { '$0.0000（部分）' }
+            $script:CostBreakdownText.Text = if ($null -ne $taskResult) {
+                ('未缓存 {0} · 缓存 {1} · 输出 {2}' -f
+                    (Format-TokenRaderUsd ([double]$taskResult.InputCost)),
+                    (Format-TokenRaderUsd ([double]$taskResult.CachedCost)),
+                    (Format-TokenRaderUsd ([double]$taskResult.OutputCost)))
+            } else { '' }
         } else {
             $script:UsdCostText.Text = Format-TokenRaderUsd ([double]$taskResult.TotalCost)
             $script:CostBreakdownText.Text = ('未缓存 {0} · 缓存 {1} · 输出 {2}' -f
