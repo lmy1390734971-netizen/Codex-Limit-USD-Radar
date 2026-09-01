@@ -327,6 +327,14 @@ public static class TokenRaderIndexer
         public long CallCached;
         public long CallOutput;
         public long CallReasoning;
+        public bool IncludeInResult = true;
+    }
+
+    private sealed class QuotaSnapshotCandidate
+    {
+        public long Id;
+        public DateTimeOffset ObservedAt;
+        public double UsedPercent;
     }
 
     private sealed class WatchState : IDisposable
@@ -2019,8 +2027,12 @@ public static class TokenRaderIndexer
         var ranges = ReadAggregateOffsetRanges(startOffsets, endOffsets);
         var thresholds = ReadLongContextThresholds(longContextThresholds);
         var baselinePaths = ReadOffsetPathSet(startOffsets);
+        var baselineOffsets = ReadAggregateOffsetMap(startOffsets);
         var result = new TokenRaderIntervalAggregateResult();
         var parentBySession = ReadAggregateParentMap(db);
+        Dictionary<string, string> sessionByPath;
+        var pathBySession = ReadAggregateSessionPathMaps(db, out sessionByPath);
+        var seededAncestorSessions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var lineageGroups = new Dictionary<string, List<AggregateEventCandidate>>(StringComparer.Ordinal);
         // token_count is also emitted for status/rate-limit refreshes. Those
         // rows can carry the same cumulative total_token_usage and the same
@@ -2035,7 +2047,11 @@ public static class TokenRaderIndexer
         {
             cancellationToken.ThrowIfCancellationRequested();
             OffsetRange range = ranges[rangeIndex];
-            SeedAggregateCumulativeSnapshot(db, range, seenCumulativeSnapshots);
+            SeedAggregateCumulativeSnapshot(db, range, seenCumulativeSnapshots,
+                lineageGroups, parentBySession, result);
+            SeedAggregateAncestorSnapshots(db, range.Path, baselineOffsets,
+                pathBySession, sessionByPath, parentBySession, seededAncestorSessions,
+                seenCumulativeSnapshots, lineageGroups, result);
             using (var cmd = db.CreateCommand())
             {
                 // Select only columns required by the existing interval
@@ -2114,8 +2130,6 @@ public static class TokenRaderIndexer
                         string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
-                        if (!string.IsNullOrWhiteSpace(requestId)) eventKey = rootSessionId.ToLowerInvariant() + "|request:" + requestId;
-                        else if (!string.IsNullOrWhiteSpace(responseId)) eventKey = rootSessionId.ToLowerInvariant() + "|response:" + responseId;
                         AddAggregateLineageCandidate(lineageGroups, eventKey,
                             new AggregateEventCandidate {
                                 SessionId = sessionId,
@@ -2189,7 +2203,8 @@ public static class TokenRaderIndexer
         SetAggregateProgress(progressState, 0L, "读取24小时磁盘记录");
         string[] sourcePaths = ReadTimeRangeSourcePaths(db, broadStart, broadEnd);
         SeedTimeRangeCumulativeSnapshots(db, sourcePaths, startedAt,
-            seenCumulativeSnapshots, cancellationToken);
+            seenCumulativeSnapshots, lineageGroups, parentBySession, result,
+            cancellationToken);
 
         using (var cmd = db.CreateCommand())
         {
@@ -2254,8 +2269,6 @@ public static class TokenRaderIndexer
                     string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                         totalInput, totalCached, totalOutput, totalReasoning,
                         callInput, callCached, callOutput, callReasoning, fingerprint);
-                    if (!string.IsNullOrWhiteSpace(requestId)) eventKey = rootSessionId.ToLowerInvariant() + "|request:" + requestId;
-                    else if (!string.IsNullOrWhiteSpace(responseId)) eventKey = rootSessionId.ToLowerInvariant() + "|response:" + responseId;
                     AddAggregateLineageCandidate(lineageGroups, eventKey,
                         new AggregateEventCandidate {
                             SessionId = sessionId,
@@ -2330,7 +2343,8 @@ public static class TokenRaderIndexer
             OffsetRange range = ranges[rangeIndex];
             if (!relevantPaths.Contains(range.Path)) continue;
             SeedTimeRangeCumulativeSnapshotAtOffset(db, range, startedExclusive,
-                seenCumulativeSnapshots, cancellationToken);
+                seenCumulativeSnapshots, lineageGroups, parentBySession, result,
+                cancellationToken);
             using (var cmd = db.CreateCommand())
             {
                 cmd.CommandText =
@@ -2394,8 +2408,6 @@ public static class TokenRaderIndexer
                         string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
-                        if (!string.IsNullOrWhiteSpace(requestId)) eventKey = rootSessionId.ToLowerInvariant() + "|request:" + requestId;
-                        else if (!string.IsNullOrWhiteSpace(responseId)) eventKey = rootSessionId.ToLowerInvariant() + "|response:" + responseId;
                         AddAggregateLineageCandidate(lineageGroups, eventKey,
                             new AggregateEventCandidate {
                                 SessionId = sessionId,
@@ -2458,6 +2470,9 @@ public static class TokenRaderIndexer
         IEnumerable<string> sourcePaths,
         DateTimeOffset startedAt,
         HashSet<string> seenCumulativeSnapshots,
+        Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
+        Dictionary<string, string> parentBySession,
+        TokenRaderIntervalAggregateResult result,
         CancellationToken cancellationToken)
     {
         int pathIndex = 0;
@@ -2467,7 +2482,9 @@ public static class TokenRaderIndexer
             using (var cmd = db.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT session_id,timestamp,total_input,total_cached,total_output,total_reasoning " +
+                    "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
+                    "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
+                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
                     "FROM token_records WHERE source_path=@path AND source_offset_end>0 " +
                     "ORDER BY source_offset_end DESC";
                 cmd.Parameters.AddWithValue("@path", path);
@@ -2477,12 +2494,8 @@ public static class TokenRaderIndexer
                     {
                         DateTimeOffset eventAt;
                         if (!TryParseTimestamp(ReadReaderString(reader, 1), out eventAt) || eventAt >= startedAt) continue;
-                        seenCumulativeSnapshots.Add(BuildAggregateCumulativeKey(
-                            ReadReaderString(reader, 0),
-                            ReadReaderInt64(reader, 2),
-                            ReadReaderInt64(reader, 3),
-                            ReadReaderInt64(reader, 4),
-                            ReadReaderInt64(reader, 5)));
+                        SeedAggregateLineageFromReader(reader, seenCumulativeSnapshots,
+                            lineageGroups, parentBySession, result);
                         break;
                     }
                 }
@@ -2495,13 +2508,18 @@ public static class TokenRaderIndexer
         OffsetRange range,
         DateTimeOffset startedExclusive,
         HashSet<string> seenCumulativeSnapshots,
+        Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
+        Dictionary<string, string> parentBySession,
+        TokenRaderIntervalAggregateResult result,
         CancellationToken cancellationToken)
     {
         if (db == null || range == null || seenCumulativeSnapshots == null) return;
         using (var cmd = db.CreateCommand())
         {
             cmd.CommandText =
-                "SELECT session_id,timestamp,total_input,total_cached,total_output,total_reasoning " +
+                "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
+                "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
+                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
                 "FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<=@end " +
                 "ORDER BY source_offset_end DESC";
             cmd.Parameters.AddWithValue("@path", range.Path);
@@ -2515,12 +2533,8 @@ public static class TokenRaderIndexer
                     DateTimeOffset eventAt;
                     if (!TryParseTimestamp(ReadReaderString(reader, 1), out eventAt) ||
                         eventAt > startedExclusive) continue;
-                    seenCumulativeSnapshots.Add(BuildAggregateCumulativeKey(
-                        ReadReaderString(reader, 0),
-                        ReadReaderInt64(reader, 2),
-                        ReadReaderInt64(reader, 3),
-                        ReadReaderInt64(reader, 4),
-                        ReadReaderInt64(reader, 5)));
+                    SeedAggregateLineageFromReader(reader, seenCumulativeSnapshots,
+                        lineageGroups, parentBySession, result);
                     break;
                 }
             }
@@ -2550,6 +2564,64 @@ public static class TokenRaderIndexer
         return result;
     }
 
+    private static Dictionary<string, string> ReadAggregateSessionPathMaps(
+        SQLiteConnection db,
+        out Dictionary<string, string> sessionByPath)
+    {
+        var pathBySession = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        sessionByPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT session_id,path FROM file_metadata WHERE session_id IS NOT NULL AND session_id<>'' AND path IS NOT NULL AND path<>''";
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string session = ReadReaderString(reader, 0);
+                    string path = ReadReaderString(reader, 1);
+                    if (string.IsNullOrWhiteSpace(session) || string.IsNullOrWhiteSpace(path)) continue;
+                    pathBySession[session] = path;
+                    sessionByPath[path] = session;
+                }
+            }
+        }
+        return pathBySession;
+    }
+
+    private static void SeedAggregateAncestorSnapshots(
+        SQLiteConnection db,
+        string changedPath,
+        Dictionary<string, long> baselineOffsets,
+        Dictionary<string, string> pathBySession,
+        Dictionary<string, string> sessionByPath,
+        Dictionary<string, string> parentBySession,
+        HashSet<string> seededAncestorSessions,
+        HashSet<string> seenCumulativeSnapshots,
+        Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
+        TokenRaderIntervalAggregateResult result)
+    {
+        if (string.IsNullOrWhiteSpace(changedPath) || sessionByPath == null ||
+            pathBySession == null || parentBySession == null) return;
+        string session;
+        if (!sessionByPath.TryGetValue(changedPath, out session)) return;
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string current = session;
+        for (int depth = 0; depth < 64 && visited.Add(current); depth++)
+        {
+            string parent;
+            if (!parentBySession.TryGetValue(current, out parent) || string.IsNullOrWhiteSpace(parent)) break;
+            current = parent;
+            if (!seededAncestorSessions.Add(current)) continue;
+            string parentPath;
+            long parentOffset;
+            if (!pathBySession.TryGetValue(current, out parentPath) ||
+                !baselineOffsets.TryGetValue(parentPath, out parentOffset) || parentOffset <= 0L) continue;
+            SeedAggregateCumulativeSnapshot(db,
+                new OffsetRange { Path = parentPath, Start = parentOffset, End = parentOffset },
+                seenCumulativeSnapshots, lineageGroups, parentBySession, result);
+        }
+    }
+
     private static void AddAggregateLineageCandidate(
         Dictionary<string, List<AggregateEventCandidate>> groups,
         string eventKey,
@@ -2564,6 +2636,8 @@ public static class TokenRaderIndexer
             groups.Add(eventKey, representatives);
         }
 
+        var relatedIndexes = new List<int>();
+        bool existingAncestorFound = false;
         for (int i = 0; i < representatives.Count; i++)
         {
             AggregateEventCandidate existing = representatives[i];
@@ -2576,16 +2650,24 @@ public static class TokenRaderIndexer
             // the explicit same-session/ancestor relationship check.
             bool sameSession = string.Equals(candidate.SessionId, existing.SessionId,
                 StringComparison.OrdinalIgnoreCase);
-            // Distinct turn IDs on the same model are evidence of two real
-            // calls whose cumulative counters happen to coincide. Keep both.
-            // When model attribution differs, token identity remains the
-            // stronger signal because inherited child copies commonly switch
-            // model labels after a child turn_context is observed.
-            if (!string.IsNullOrWhiteSpace(candidate.TurnId) &&
-                !string.IsNullOrWhiteSpace(existing.TurnId) &&
-                !string.Equals(candidate.TurnId, existing.TurnId, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(candidate.Model, existing.Model, StringComparison.OrdinalIgnoreCase))
-                continue;
+            // Within one session, distinct strong identifiers may represent
+            // two real calls with an identical cumulative/token fingerprint.
+            // Across an ancestor/descendant boundary, however, identifiers and
+            // model labels are auxiliary: copied child records commonly receive
+            // a new turn/request id and a child turn_context model.
+            if (sameSession)
+            {
+                bool distinctRequest = !string.IsNullOrWhiteSpace(candidate.RequestId) &&
+                    !string.IsNullOrWhiteSpace(existing.RequestId) &&
+                    !string.Equals(candidate.RequestId, existing.RequestId, StringComparison.OrdinalIgnoreCase);
+                bool distinctResponse = !string.IsNullOrWhiteSpace(candidate.ResponseId) &&
+                    !string.IsNullOrWhiteSpace(existing.ResponseId) &&
+                    !string.Equals(candidate.ResponseId, existing.ResponseId, StringComparison.OrdinalIgnoreCase);
+                bool distinctTurn = !string.IsNullOrWhiteSpace(candidate.TurnId) &&
+                    !string.IsNullOrWhiteSpace(existing.TurnId) &&
+                    !string.Equals(candidate.TurnId, existing.TurnId, StringComparison.OrdinalIgnoreCase);
+                if (distinctRequest || distinctResponse || distinctTurn) continue;
+            }
             bool candidateIsRoot = !string.IsNullOrWhiteSpace(candidate.RootSessionId) &&
                 string.Equals(candidate.SessionId, candidate.RootSessionId, StringComparison.OrdinalIgnoreCase);
             bool existingIsRoot = !string.IsNullOrWhiteSpace(existing.RootSessionId) &&
@@ -2596,15 +2678,37 @@ public static class TokenRaderIndexer
                 (existingIsRoot || IsAggregateAncestor(existing.SessionId, candidate.SessionId, parentBySession));
             if (!sameSession && !candidateAncestor && !existingAncestor) continue;
 
-            result.DuplicateEventsDropped++;
-            // The shallowest ancestor is the canonical source of both model
-            // and token usage. Replacing a previously seen descendant makes
-            // aggregation independent of file enumeration order.
-            if (candidateAncestor && !existingAncestor) representatives[i] = candidate;
-            else if (sameSession && candidate.HasTimestamp &&
-                (!existing.HasTimestamp || candidate.EventAt >= existing.EventAt))
-                representatives[i] = candidate;
+            relatedIndexes.Add(i);
+            if (existingAncestor) existingAncestorFound = true;
+            if (sameSession)
+            {
+                if (candidate.IncludeInResult || existing.IncludeInResult) result.DuplicateEventsDropped++;
+                if (candidate.HasTimestamp && (!existing.HasTimestamp || candidate.EventAt >= existing.EventAt))
+                    representatives[i] = candidate;
+                return;
+            }
+        }
+
+        if (existingAncestorFound)
+        {
+            // A canonical ancestor is already present. The new descendant is a
+            // copied record and must never replace the ancestor's model/price.
+            if (candidate.IncludeInResult) result.DuplicateEventsDropped++;
             return;
+        }
+        if (relatedIndexes.Count > 0)
+        {
+            // The parent can be encountered after multiple descendant copies.
+            // Remove every related descendant before adding the parent so the
+            // result does not depend on file enumeration order.
+            int duplicateCount = 0;
+            for (int i = relatedIndexes.Count - 1; i >= 0; i--)
+            {
+                AggregateEventCandidate removed = representatives[relatedIndexes[i]];
+                if (candidate.IncludeInResult || removed.IncludeInResult) duplicateCount++;
+                representatives.RemoveAt(relatedIndexes[i]);
+            }
+            result.DuplicateEventsDropped += duplicateCount;
         }
         representatives.Add(candidate);
     }
@@ -2619,15 +2723,54 @@ public static class TokenRaderIndexer
         var buckets = new Dictionary<string, TokenRaderIntervalAggregateBucket>(StringComparer.OrdinalIgnoreCase);
         var resolvedThresholds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         var identitySources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var latestByStableIdentity = new Dictionary<string, AggregateEventCandidate>(StringComparer.OrdinalIgnoreCase);
         result.CacheWriteObservable = true;
         DateTimeOffset? firstCountedAt = null;
         DateTimeOffset? lastCountedAt = null;
+
+        // Request/response identifiers describe a lifecycle whose intermediate
+        // rows can carry progressively larger token totals. Lineage comparison
+        // above deliberately uses token fingerprints first; collapse lifecycle
+        // updates here, within the same session, so auxiliary IDs cannot block
+        // parent/child copy detection.
+        foreach (List<AggregateEventCandidate> representatives in groups.Values)
+        {
+            for (int i = 0; i < representatives.Count; i++)
+            {
+                AggregateEventCandidate candidate = representatives[i];
+                if (!candidate.IncludeInResult) continue;
+                string stableId = !string.IsNullOrWhiteSpace(candidate.RequestId)
+                    ? "request:" + candidate.RequestId
+                    : (!string.IsNullOrWhiteSpace(candidate.ResponseId) ? "response:" + candidate.ResponseId : "");
+                if (stableId.Length == 0) continue;
+                string stableKey = candidate.SessionId.ToLowerInvariant() + "|" + stableId;
+                AggregateEventCandidate current;
+                if (!latestByStableIdentity.TryGetValue(stableKey, out current) ||
+                    (candidate.HasTimestamp && (!current.HasTimestamp || candidate.EventAt >= current.EventAt)))
+                    latestByStableIdentity[stableKey] = candidate;
+            }
+        }
 
         foreach (List<AggregateEventCandidate> representatives in groups.Values)
         {
             for (int i = 0; i < representatives.Count; i++)
             {
                 AggregateEventCandidate candidate = representatives[i];
+                if (!candidate.IncludeInResult) continue;
+                string stableId = !string.IsNullOrWhiteSpace(candidate.RequestId)
+                    ? "request:" + candidate.RequestId
+                    : (!string.IsNullOrWhiteSpace(candidate.ResponseId) ? "response:" + candidate.ResponseId : "");
+                if (stableId.Length > 0)
+                {
+                    AggregateEventCandidate terminal;
+                    string stableKey = candidate.SessionId.ToLowerInvariant() + "|" + stableId;
+                    if (latestByStableIdentity.TryGetValue(stableKey, out terminal) &&
+                        !object.ReferenceEquals(candidate, terminal))
+                    {
+                        result.DuplicateEventsDropped++;
+                        continue;
+                    }
+                }
                 result.CountedEvents++;
                 result.TotalInput += candidate.CallInput;
                 result.TotalCached += candidate.CallCached;
@@ -2811,6 +2954,20 @@ public static class TokenRaderIndexer
         return paths;
     }
 
+    private static Dictionary<string, long> ReadAggregateOffsetMap(IDictionary offsets)
+    {
+        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        if (offsets == null) return result;
+        foreach (DictionaryEntry entry in offsets)
+        {
+            string path = entry.Key == null ? "" : Convert.ToString(entry.Key, CultureInfo.InvariantCulture);
+            long value;
+            if (!string.IsNullOrWhiteSpace(path) && TryConvertInt64(entry.Value, out value))
+                result[path] = Math.Max(0L, value);
+        }
+        return result;
+    }
+
     private static long ResolveAggregateLongContextThreshold(string model, Dictionary<string, long> thresholds)
     {
         if (string.IsNullOrWhiteSpace(model) || thresholds == null) return 0L;
@@ -2835,13 +2992,18 @@ public static class TokenRaderIndexer
     private static void SeedAggregateCumulativeSnapshot(
         SQLiteConnection db,
         OffsetRange range,
-        HashSet<string> seenCumulativeSnapshots)
+        HashSet<string> seenCumulativeSnapshots,
+        Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
+        Dictionary<string, string> parentBySession,
+        TokenRaderIntervalAggregateResult result)
     {
         if (db == null || range == null || range.Start <= 0L || seenCumulativeSnapshots == null) return;
         using (var cmd = db.CreateCommand())
         {
             cmd.CommandText =
-                "SELECT session_id,total_input,total_cached,total_output,total_reasoning " +
+                "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
+                "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
+                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
                 "FROM token_records WHERE source_path=@path AND source_offset_end<=@start " +
                 "ORDER BY source_offset_end DESC LIMIT 1";
             cmd.Parameters.AddWithValue("@path", range.Path);
@@ -2849,14 +3011,68 @@ public static class TokenRaderIndexer
             using (var reader = cmd.ExecuteReader())
             {
                 if (!reader.Read()) return;
-                seenCumulativeSnapshots.Add(BuildAggregateCumulativeKey(
-                    ReadReaderString(reader, 0),
-                    ReadReaderInt64(reader, 1),
-                    ReadReaderInt64(reader, 2),
-                    ReadReaderInt64(reader, 3),
-                    ReadReaderInt64(reader, 4)));
+                SeedAggregateLineageFromReader(reader, seenCumulativeSnapshots,
+                    lineageGroups, parentBySession, result);
             }
         }
+    }
+
+    private static void SeedAggregateLineageFromReader(
+        SQLiteDataReader reader,
+        HashSet<string> seenCumulativeSnapshots,
+        Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
+        Dictionary<string, string> parentBySession,
+        TokenRaderIntervalAggregateResult result)
+    {
+        if (reader == null) return;
+        string sessionId = ReadReaderString(reader, 0);
+        string model = ReadReaderString(reader, 2);
+        long totalInput = ReadReaderInt64(reader, 3);
+        long totalCached = ReadReaderInt64(reader, 4);
+        long totalOutput = ReadReaderInt64(reader, 5);
+        long totalReasoning = ReadReaderInt64(reader, 6);
+        long callInput = ReadReaderInt64(reader, 7);
+        long callCached = ReadReaderInt64(reader, 8);
+        long callOutput = ReadReaderInt64(reader, 9);
+        long callReasoning = ReadReaderInt64(reader, 10);
+        if (seenCumulativeSnapshots != null)
+            seenCumulativeSnapshots.Add(BuildAggregateCumulativeKey(sessionId,
+                totalInput, totalCached, totalOutput, totalReasoning));
+        if ((callInput <= 0L && callOutput <= 0L) || lineageGroups == null || result == null) return;
+
+        DateTimeOffset eventAt;
+        bool hasTimestamp = TryParseTimestamp(ReadReaderString(reader, 1), out eventAt);
+        if (!hasTimestamp) eventAt = DateTimeOffset.MinValue;
+        string rootSessionId = ReadReaderString(reader, 14);
+        if (string.IsNullOrWhiteSpace(rootSessionId)) rootSessionId = sessionId;
+        string fingerprint = ReadReaderString(reader, 11);
+        string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
+            totalInput, totalCached, totalOutput, totalReasoning,
+            callInput, callCached, callOutput, callReasoning, fingerprint);
+        AddAggregateLineageCandidate(lineageGroups, eventKey,
+            new AggregateEventCandidate {
+                SessionId = sessionId,
+                RootSessionId = rootSessionId,
+                SourcePath = ReadReaderString(reader, 12),
+                Model = model,
+                EventAt = eventAt,
+                HasTimestamp = hasTimestamp,
+                TurnId = ReadReaderString(reader, 15),
+                RequestId = ReadReaderString(reader, 16),
+                ResponseId = ReadReaderString(reader, 17),
+                IdentitySource = ReadReaderString(reader, 18),
+                ModelContextWindow = ReadReaderInt64(reader, 19),
+                LongContextThreshold = ReadReaderInt64(reader, 20),
+                LongContextApplied = ReadReaderInt64(reader, 21) != 0L,
+                LongContextSource = ReadReaderString(reader, 22),
+                CacheCreationTokens = ReadReaderInt64(reader, 23),
+                CacheWriteObservable = ReadReaderInt64(reader, 24) != 0L,
+                CallInput = callInput,
+                CallCached = callCached,
+                CallOutput = callOutput,
+                CallReasoning = callReasoning,
+                IncludeInResult = false
+            }, parentBySession, result);
     }
 
     private static string BuildAggregateCumulativeKey(
@@ -2955,6 +3171,167 @@ public static class TokenRaderIndexer
     public static DataTable QueryLatestRateLimitsByOffsets(SQLiteConnection db, IDictionary startOffsets, IDictionary endOffsets)
     {
         return QueryLatestRateLimitRowsByOffsetRanges(db, ReadOffsetRanges(startOffsets, endOffsets));
+    }
+
+    /// <summary>
+    /// Finds the most recent fully observed quota-percentage step within one
+    /// immutable reset cycle. The returned table contains exactly two rows in
+    /// chronological order: the earliest observation of the greatest usage
+    /// value below currentUsedPercent, followed by the first later observation
+    /// above that value. Callers can then aggregate token calls over the exact
+    /// (start, end] snapshot interval. No token rows are materialized here.
+    /// </summary>
+    public static DataTable QueryQuotaCalibrationPairByOffsets(
+        SQLiteConnection db,
+        IDictionary endOffsets,
+        string windowKind,
+        int windowMinutes,
+        long resetUnixSeconds,
+        string planType,
+        string rateLimitId,
+        double currentUsedPercent,
+        DateTimeOffset currentObservedAt,
+        CancellationToken cancellationToken)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        DataTable empty = CreateEmptyTokenRecordsTable(db);
+        if (endOffsets == null || windowMinutes <= 0 || resetUnixSeconds <= 0L ||
+            currentUsedPercent <= 0.0 || double.IsNaN(currentUsedPercent) ||
+            double.IsInfinity(currentUsedPercent)) return empty;
+
+        string usedColumn;
+        string windowColumn;
+        string resetColumn;
+        if (string.Equals(windowKind, "FiveHour", StringComparison.OrdinalIgnoreCase))
+        {
+            usedColumn = "five_hour_used";
+            windowColumn = "five_hour_window";
+            resetColumn = "five_hour_resets";
+        }
+        else if (string.Equals(windowKind, "Weekly", StringComparison.OrdinalIgnoreCase))
+        {
+            usedColumn = "weekly_used";
+            windowColumn = "weekly_window";
+            resetColumn = "weekly_resets";
+        }
+        else return empty;
+
+        List<OffsetRange> ranges = ReadAggregateOffsetRanges(null, endOffsets);
+        if (ranges.Count == 0) return empty;
+        var candidates = new List<QuotaSnapshotCandidate>();
+        const int chunkSize = 100;
+        const double epsilon = 0.000000001;
+        for (int offset = 0; offset < ranges.Count; offset += chunkSize)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int count = Math.Min(chunkSize, ranges.Count - offset);
+            using (var cmd = db.CreateCommand())
+            {
+                var predicates = new StringBuilder();
+                for (int i = 0; i < count; i++)
+                {
+                    if (i > 0) predicates.Append(" OR ");
+                    predicates.Append("(source_path=@path");
+                    predicates.Append(i.ToString(CultureInfo.InvariantCulture));
+                    predicates.Append(" AND source_offset_end>0 AND source_offset_end<=@end");
+                    predicates.Append(i.ToString(CultureInfo.InvariantCulture));
+                    predicates.Append(")");
+                    OffsetRange range = ranges[offset + i];
+                    cmd.Parameters.AddWithValue("@path" + i.ToString(CultureInfo.InvariantCulture), range.Path);
+                    cmd.Parameters.AddWithValue("@end" + i.ToString(CultureInfo.InvariantCulture), range.End);
+                }
+                cmd.CommandText =
+                    "SELECT id,timestamp," + usedColumn + " FROM token_records WHERE (" + predicates + ") " +
+                    "AND " + usedColumn + " IS NOT NULL AND " + windowColumn + "=@window " +
+                    "AND " + resetColumn + ">=@reset_min AND " + resetColumn + "<=@reset_max " +
+                    "AND (@plan='' OR plan_type=@plan COLLATE NOCASE) " +
+                    "AND (@limit_id='' OR rate_limit_id=@limit_id COLLATE NOCASE)";
+                cmd.Parameters.AddWithValue("@window", windowMinutes);
+                long resetMinute = (long)Math.Floor(resetUnixSeconds / 60.0);
+                cmd.Parameters.AddWithValue("@reset_min", resetMinute * 60L);
+                cmd.Parameters.AddWithValue("@reset_max", resetMinute * 60L + 59L);
+                cmd.Parameters.AddWithValue("@plan", planType ?? "");
+                cmd.Parameters.AddWithValue("@limit_id", rateLimitId ?? "");
+                using (var reader = cmd.ExecuteReader())
+                {
+                    int inspected = 0;
+                    while (reader.Read())
+                    {
+                        if ((inspected++ & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
+                        DateTimeOffset observedAt;
+                        double usedPercent;
+                        if (!TryParseTimestamp(ReadReaderString(reader, 1), out observedAt) ||
+                            !TryConvertDouble(reader.GetValue(2), out usedPercent) ||
+                            observedAt > currentObservedAt || usedPercent < -epsilon || usedPercent > 100.0 + epsilon)
+                            continue;
+                        candidates.Add(new QuotaSnapshotCandidate {
+                            Id = ReadReaderInt64(reader, 0),
+                            ObservedAt = observedAt,
+                            UsedPercent = usedPercent
+                        });
+                    }
+                }
+            }
+        }
+        if (candidates.Count < 2) return empty;
+        candidates.Sort(delegate(QuotaSnapshotCandidate left, QuotaSnapshotCandidate right) {
+            int comparison = DateTimeOffset.Compare(left.ObservedAt.ToUniversalTime(), right.ObservedAt.ToUniversalTime());
+            return comparison != 0 ? comparison : left.Id.CompareTo(right.Id);
+        });
+
+        // Concurrent sessions can append a slightly older snapshot after a
+        // newer one. Build a monotonic envelope and ignore only those stale
+        // regressions; if the envelope itself exceeds the current ending
+        // snapshot, the current snapshot is stale and calibration is unsafe.
+        var monotonicCandidates = new List<QuotaSnapshotCandidate>();
+        double runningMaximum = -1.0;
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            double used = candidates[i].UsedPercent;
+            if (used + epsilon < runningMaximum) continue;
+            if (used > runningMaximum) runningMaximum = used;
+            monotonicCandidates.Add(candidates[i]);
+        }
+        if (runningMaximum > currentUsedPercent + epsilon) return empty;
+        candidates = monotonicCandidates;
+
+        double previousUsed = -1.0;
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            double used = candidates[i].UsedPercent;
+            if (used < currentUsedPercent - epsilon && used > previousUsed) previousUsed = used;
+        }
+        if (previousUsed < -epsilon) return empty;
+
+        QuotaSnapshotCandidate start = null;
+        QuotaSnapshotCandidate end = null;
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            QuotaSnapshotCandidate point = candidates[i];
+            if (start == null && Math.Abs(point.UsedPercent - previousUsed) <= epsilon)
+            {
+                start = point;
+                continue;
+            }
+            if (start != null && point.ObservedAt > start.ObservedAt &&
+                point.UsedPercent > previousUsed + epsilon &&
+                point.UsedPercent <= currentUsedPercent + epsilon)
+            {
+                end = point;
+                break;
+            }
+        }
+        if (start == null || end == null || end.UsedPercent <= start.UsedPercent + epsilon) return empty;
+
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT * FROM token_records WHERE id=@start_id OR id=@end_id ORDER BY timestamp ASC,id ASC";
+            cmd.Parameters.AddWithValue("@start_id", start.Id);
+            cmd.Parameters.AddWithValue("@end_id", end.Id);
+            var result = new DataTable();
+            using (var adapter = new SQLiteDataAdapter(cmd)) { adapter.Fill(result); }
+            return result.Rows.Count == 2 ? result : empty;
+        }
     }
 
     public static void UpdateFileMetadata(SQLiteConnection db, string path, long length, long lastWriteTicks, long parsedOffset)
@@ -3748,6 +4125,20 @@ public static class TokenRaderIndexer
             return false;
         }
         return false;
+    }
+
+    private static bool TryConvertDouble(object raw, out double value)
+    {
+        value = 0.0;
+        if (raw == null || raw == DBNull.Value || raw is bool) return false;
+        try
+        {
+            value = Convert.ToDouble(raw, CultureInfo.InvariantCulture);
+            return !double.IsNaN(value) && !double.IsInfinity(value);
+        }
+        catch (FormatException) { return false; }
+        catch (InvalidCastException) { return false; }
+        catch (OverflowException) { return false; }
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────

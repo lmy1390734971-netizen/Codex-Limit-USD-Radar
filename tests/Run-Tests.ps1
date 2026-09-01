@@ -502,10 +502,10 @@ try {
     Assert-Near $indexedFrozenBeforeAppend.TotalCost $indexedFrozenAfterAppend.TotalCost 0.0000001 'indexed frozen cost remains stable'
     Assert-Near 5.0 $indexedFrozenAfterAppend.EndRateLimits.FiveHour.UsedPercent 0.0001 'indexed frozen five-hour snapshot remains stable'
     Assert-Near 6.0 $indexedFrozenAfterAppend.EndRateLimits.Weekly.UsedPercent 0.0001 'indexed frozen weekly snapshot remains stable'
-    Assert-Greater 0 ([Int64]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.CountedEvents) 'quota evidence counts the full current reset window'
+    Assert-Greater 0 ([Int64]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.CountedEvents) 'quota evidence counts the exact snapshot delta interval'
     Assert-Equal $true ([bool]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.BoundaryValid) 'fresh ending quota snapshot covers the last counted call'
-    Assert-Equal 'snapshot_window_usd_estimate' ([string]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.EstimateSource) 'quota dollar source for logs without direct capacity'
-    Assert-Greater ([Int64]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.ObservedTokens) ([Int64]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.TotalTokens) 'quota token capacity is extrapolated from full-window local tokens'
+    Assert-Equal 'snapshot_delta_usd_estimate' ([string]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.EstimateSource) 'quota dollars use the actual snapshot percentage delta'
+    Assert-Greater ([Int64]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.ObservedTokens) ([Int64]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.TotalTokens) 'quota token capacity diagnostic is extrapolated from the actual percentage delta'
     Assert-Equal ([DateTimeOffset]$indexedFrozenBeforeAppend.LastCountedAt) ([DateTimeOffset]$indexedFrozenBeforeAppend.QuotaEvidence.FiveHour.LastCountedAt) 'main and quota aggregate last-call timestamp agreement'
 
     $staleQuotaCall = New-TestTokenRecord -Timestamp '2026-07-14T01:33:00Z' -TotalInput 2250 -TotalCached 900 -TotalOutput 225 -CallInput 500 -CallCached 200 -CallOutput 50
@@ -527,6 +527,43 @@ try {
     if ($null -eq $staleQuotaEstimate.Weekly) { throw 'ASSERT FAILED: snapshot-aligned weekly dollars were not available immediately after the query' }
     Assert-Near ([double]$staleQuotaResult.QuotaEvidence.FiveHour.EstimatedTotalUsd) ([double]$staleQuotaEstimate.FiveHour.TotalUsd) 0.0000001 'five-hour quota estimate mixed the newer main-interval cost into the older aligned snapshot interval'
     Assert-Near ([double]$staleQuotaResult.QuotaEvidence.Weekly.EstimatedTotalUsd) ([double]$staleQuotaEstimate.Weekly.TotalUsd) 0.0000001 'quota estimate mixed the newer main-interval cost into the older aligned snapshot interval'
+
+    # A measurement that starts and ends at the same displayed percentage must
+    # not divide its short interval cost by the cumulative current percentage.
+    # Recover the latest complete step from the same reset cycle instead. The
+    # weekly fixture also proves that a real 0.1% log step remains 0.1%.
+    $historyQuotaRoot = Join-Path $tempRoot 'quota-history-calibration'
+    New-Item -ItemType Directory -Path $historyQuotaRoot | Out-Null
+    $historyQuotaPath = Join-Path $historyQuotaRoot 'rollout-history-quota.jsonl'
+    $historyFiveReset = 1784000000
+    $historyWeeklyReset = 1784500000
+    $historyQuotaRecords = @(
+        [ordered]@{ timestamp = '2026-07-14T02:00:00Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.6-sol' } },
+        (New-TestTokenRecord -Timestamp '2026-07-14T02:00:01Z' -TotalInput 100 -TotalCached 10 -TotalOutput 10 -CallInput 100 -CallCached 10 -CallOutput 10 -RateLimits (New-TestRawRateLimits -FiveHourUsed 50.0 -WeeklyUsed 70.9 -FiveHourReset $historyFiveReset -WeeklyReset $historyWeeklyReset)),
+        (New-TestTokenRecord -Timestamp '2026-07-14T02:01:00Z' -TotalInput 300 -TotalCached 30 -TotalOutput 30 -CallInput 200 -CallCached 20 -CallOutput 20 -RateLimits (New-TestRawRateLimits -FiveHourUsed 50.0 -WeeklyUsed 70.9 -FiveHourReset $historyFiveReset -WeeklyReset $historyWeeklyReset)),
+        (New-TestTokenRecord -Timestamp '2026-07-14T02:02:00Z' -TotalInput 600 -TotalCached 60 -TotalOutput 60 -CallInput 300 -CallCached 30 -CallOutput 30 -RateLimits (New-TestRawRateLimits -FiveHourUsed 51.0 -WeeklyUsed 71.0 -FiveHourReset $historyFiveReset -WeeklyReset $historyWeeklyReset))
+    )
+    @($historyQuotaRecords | ForEach-Object { $_ | ConvertTo-Json -Depth 8 -Compress }) | Set-Content -LiteralPath $historyQuotaPath -Encoding UTF8
+    $historyQuotaBaseline = CaptureMeasurementBaseline -SessionsRoot $historyQuotaRoot -PricingDocument $prices
+    $historyQuotaTail = New-TestTokenRecord -Timestamp '2026-07-14T02:03:00Z' -TotalInput 1000 -TotalCached 100 -TotalOutput 100 -CallInput 400 -CallCached 40 -CallOutput 40 -RateLimits (New-TestRawRateLimits -FiveHourUsed 51.0 -WeeklyUsed 71.0 -FiveHourReset $historyFiveReset -WeeklyReset $historyWeeklyReset)
+    ($historyQuotaTail | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $historyQuotaPath -Encoding UTF8
+    $historyQuotaDeadline = [DateTime]::UtcNow.AddSeconds(2)
+    while ([TokenRaderIndexer]::GetChangeRevision($historyQuotaRoot) -le [Int64]$historyQuotaBaseline.ChangeRevision -and
+        [DateTime]::UtcNow -lt $historyQuotaDeadline) { Start-Sleep -Milliseconds 10 }
+    $historyQuotaEnd = CaptureMeasurementEnd -Baseline $historyQuotaBaseline
+    $historyQuotaResult = Get-TokenRaderIndexedIntervalResult -Baseline $historyQuotaBaseline -PricingDocument $prices `
+        -EndOffsets $historyQuotaEnd.EndOffsets -EndRevision $historyQuotaEnd.EndRevision
+    Assert-Equal $true ([bool]$historyQuotaResult.QuotaEvidence.FiveHour.HistoryLookbackApplied) 'unchanged five-hour percentage did not query historical calibration snapshots'
+    Assert-Near 1.0 ([double]$historyQuotaResult.QuotaEvidence.FiveHour.EffectiveDeltaPercent) 0.0000001 'integer percentage history did not recover one complete step'
+    Assert-Near ([double]$historyQuotaResult.QuotaEvidence.FiveHour.TotalCost * 100.0) ([double]$historyQuotaResult.QuotaEvidence.FiveHour.EstimatedTotalUsd) 0.0000001 'historical one-percent API cost was not converted to dollar capacity'
+    Assert-Equal $true ([bool]$historyQuotaResult.QuotaEvidence.Weekly.HistoryLookbackApplied) 'unchanged weekly percentage did not query historical calibration snapshots'
+    Assert-Near 0.1 ([double]$historyQuotaResult.QuotaEvidence.Weekly.EffectiveDeltaPercent) 0.0000001 'historical calibration ignored the log-provided 0.1 percent step'
+    Assert-Near ([double]$historyQuotaResult.QuotaEvidence.Weekly.TotalCost * 1000.0) ([double]$historyQuotaResult.QuotaEvidence.Weekly.EstimatedTotalUsd) 0.0000001 'sub-percent historical API cost used a one-percent denominator'
+    $historyQuotaEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $historyQuotaResult.StartRateLimits `
+        -EndRateLimits $historyQuotaResult.EndRateLimits -IntervalCost ([double]$historyQuotaResult.TotalCost) `
+        -CostComplete ([bool]$historyQuotaResult.CostComplete) -QuotaEvidence $historyQuotaResult.QuotaEvidence
+    Assert-Equal $true ([bool]$historyQuotaEstimate.FiveHour.HistoryLookbackApplied) 'production quota estimate discarded historical calibration evidence'
+    Assert-Near ([double]$historyQuotaResult.QuotaEvidence.FiveHour.EstimatedTotalUsd) ([double]$historyQuotaEstimate.FiveHour.TotalUsd) 0.0000001 'production five-hour card did not use historical calibration dollars'
 
     # The compiled aggregator must remain numerically identical to the legacy
     # byte parser across multiple models, long-context pricing and an unknown
@@ -862,8 +899,8 @@ try {
     Assert-Near 20.0 $quota.FiveHour.UsedUsd 0.0000001 'five-hour used USD inference'
     Assert-Near 230.0 $quota.Weekly.RemainingUsd 0.0000001 'weekly remaining USD inference'
 
-    # Production quota inference uses direct/window token capacity evidence;
-    # the UI measurement's API-equivalent dollar cost remains independent.
+    # Production quota inference uses snapshot-aligned API cost divided by the
+    # actual percentage increase; token-capacity fields remain diagnostic only.
     $quotaEvidenceStartAt = [DateTimeOffset]::Parse('2026-07-14T06:00:00Z')
     $quotaEvidenceEndAt = [DateTimeOffset]::Parse('2026-07-14T07:00:00Z')
     foreach ($window in @($quotaStart.FiveHour, $quotaStart.Weekly)) {
@@ -873,17 +910,35 @@ try {
         Add-Member -InputObject $window -NotePropertyName ObservedAt -NotePropertyValue $quotaEvidenceEndAt -Force
     }
     $alignedEvidence = [pscustomobject]@{
-        FiveHour = [pscustomobject]@{ BoundaryValid = $true; PricingComplete = $true; TotalCost = 12.5; TotalTokens = 100000; UsedTokens = 8000; RemainingTokens = 92000; ObservedTokens = 8000; EstimateSource = 'snapshot_window_usd_estimate'; CapacitySource = 'snapshot_token_estimate'; AverageUsdPerToken = 0.0015625; EstimatedTotalUsd = 156.25; ObservedCostUsd = 12.5; EstimatedRemainingUsd = 143.75; IdentityComplete = $false; IdentitySources = @('turn_id'); UnidentifiedEvents = 1; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
-        Weekly = [pscustomobject]@{ BoundaryValid = $true; PricingComplete = $true; TotalCost = 25.0; TotalTokens = 200000; UsedTokens = 16000; RemainingTokens = 184000; ObservedTokens = 16000; EstimateSource = 'direct_limit_tokens_usd_estimate'; CapacitySource = 'direct_limit_tokens'; AverageUsdPerToken = 0.0015625; EstimatedTotalUsd = 312.5; ObservedCostUsd = 25.0; EstimatedRemainingUsd = 287.5; IdentityComplete = $true; IdentitySources = @('request_id'); UnidentifiedEvents = 0; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
+        FiveHour = [pscustomobject]@{ BoundaryValid = $true; PricingComplete = $true; TotalCost = 12.5; TotalTokens = 100000; UsedTokens = 8000; RemainingTokens = 92000; ObservedTokens = 8000; EstimateSource = 'snapshot_delta_usd_estimate'; CapacitySource = 'percent_delta_tokens'; AverageUsdPerToken = 0.0015625; EstimatedTotalUsd = 250.0; EstimatedUsedUsd = 20.0; ObservedCostUsd = 12.5; EstimatedRemainingUsd = 230.0; IdentityComplete = $false; IdentitySources = @('turn_id'); UnidentifiedEvents = 1; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; CurrentObservedAt = $quotaEvidenceEndAt; StartUsedPercent = 3.0; CalibrationEndUsedPercent = 8.0; EffectiveDeltaPercent = 5.0; PercentResolution = 1.0; HistoryLookbackApplied = $false; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
+        Weekly = [pscustomobject]@{ BoundaryValid = $true; PricingComplete = $true; TotalCost = 25.0; TotalTokens = 200000; UsedTokens = 16000; RemainingTokens = 184000; ObservedTokens = 16000; EstimateSource = 'snapshot_delta_usd_estimate'; CapacitySource = 'direct_limit_tokens'; AverageUsdPerToken = 0.0015625; EstimatedTotalUsd = 500.0; EstimatedUsedUsd = 40.0; ObservedCostUsd = 25.0; EstimatedRemainingUsd = 460.0; IdentityComplete = $true; IdentitySources = @('request_id'); UnidentifiedEvents = 0; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; CurrentObservedAt = $quotaEvidenceEndAt; StartUsedPercent = 3.0; CalibrationEndUsedPercent = 8.0; EffectiveDeltaPercent = 5.0; PercentResolution = 1.0; HistoryLookbackApplied = $false; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
     }
     $alignedQuota = Get-TokenRaderQuotaEstimate -StartRateLimits $quotaStart -EndRateLimits $quotaEnd `
         -IntervalCost 41.206022 -CostComplete $true -QuotaEvidence $alignedEvidence
     Assert-Equal 100000 ([Int64]$alignedQuota.FiveHour.TotalTokens) 'five-hour quota retains token-capacity evidence'
-    Assert-Equal 'snapshot_window_usd_estimate' ([string]$alignedQuota.FiveHour.EstimateSource) 'five-hour dollar estimate source'
-    Assert-Near 156.25 ([double]$alignedQuota.FiveHour.TotalUsd) 0.0000001 'five-hour dollars use full-window average API cost per token'
+    Assert-Equal 'snapshot_delta_usd_estimate' ([string]$alignedQuota.FiveHour.EstimateSource) 'five-hour dollar estimate source'
+    Assert-Near 250.0 ([double]$alignedQuota.FiveHour.TotalUsd) 0.0000001 'five-hour dollars use snapshot cost divided by the actual five-percent increase'
     Assert-Equal 200000 ([Int64]$alignedQuota.Weekly.TotalTokens) 'weekly direct token capacity evidence'
-    Assert-Equal 'direct_limit_tokens_usd_estimate' ([string]$alignedQuota.Weekly.EstimateSource) 'weekly direct-capacity dollar source'
-    Assert-Near 312.5 ([double]$alignedQuota.Weekly.TotalUsd) 0.0000001 'weekly direct token capacity is converted using observed average API price'
+    Assert-Equal 'snapshot_delta_usd_estimate' ([string]$alignedQuota.Weekly.EstimateSource) 'weekly snapshot-delta dollar source'
+    Assert-Near 500.0 ([double]$alignedQuota.Weekly.TotalUsd) 0.0000001 'weekly dollars are independent of token-capacity diagnostics'
+    $screenshotStart = New-TestQuotaRateLimits -FiveHourUsed 50 -WeeklyUsed 50 -FiveHourReset $quotaFiveReset -WeeklyReset $quotaWeeklyReset -PlanType 'pro'
+    $screenshotEnd = New-TestQuotaRateLimits -FiveHourUsed 51 -WeeklyUsed 51 -FiveHourReset $quotaFiveReset -WeeklyReset $quotaWeeklyReset -PlanType 'pro'
+    foreach ($window in @($screenshotStart.FiveHour, $screenshotStart.Weekly)) { Add-Member -InputObject $window -NotePropertyName ObservedAt -NotePropertyValue $quotaEvidenceStartAt -Force }
+    foreach ($window in @($screenshotEnd.FiveHour, $screenshotEnd.Weekly)) { Add-Member -InputObject $window -NotePropertyName ObservedAt -NotePropertyValue $quotaEvidenceEndAt -Force }
+    $screenshotEvidenceWindow = [pscustomobject]@{
+        BoundaryValid = $true; PricingComplete = $true; TotalCost = 0.5798; TotalTokens = 0L; UsedTokens = 0L; RemainingTokens = 0L; ObservedTokens = 1000L
+        EstimateSource = 'snapshot_delta_usd_estimate'; CapacitySource = 'percent_delta_tokens'; AverageUsdPerToken = 0.0005798
+        EstimatedTotalUsd = 57.98; EstimatedUsedUsd = 29.5698; ObservedCostUsd = 0.5798; EstimatedRemainingUsd = 28.4102
+        IdentityComplete = $false; IdentitySources = @('turn_id'); UnidentifiedEvents = 1L
+        StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; CurrentObservedAt = $quotaEvidenceEndAt
+        StartUsedPercent = 50.0; CalibrationEndUsedPercent = 51.0; EffectiveDeltaPercent = 1.0; PercentResolution = 1.0
+        HistoryLookbackApplied = $false; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt
+    }
+    $screenshotEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $screenshotStart -EndRateLimits $screenshotEnd `
+        -IntervalCost 0.5798 -CostComplete $true -QuotaEvidence ([pscustomobject]@{ FiveHour = $screenshotEvidenceWindow; Weekly = $screenshotEvidenceWindow })
+    Assert-Near 57.98 ([double]$screenshotEstimate.FiveHour.TotalUsd) 0.0000001 'screenshot regression: local interval cost must be divided by the one-percent delta'
+    Assert-Near 29.5698 ([double]$screenshotEstimate.FiveHour.UsedUsd) 0.0000001 'screenshot regression: used dollars must be current percentage of total capacity'
+    if ([Math]::Abs([double]$screenshotEstimate.FiveHour.TotalUsd - 1.1369) -lt 0.01) { throw 'ASSERT FAILED: screenshot regression reproduced partial cost divided by cumulative 51 percent' }
     $staleEvidence = [pscustomobject]@{
         FiveHour = [pscustomobject]@{ BoundaryValid = $false; PricingComplete = $true; TotalCost = 41.206022; TotalTokens = 100000; EstimateSource = 'snapshot_token_estimate'; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
         Weekly = [pscustomobject]@{ BoundaryValid = $false; PricingComplete = $true; TotalCost = 41.206022; TotalTokens = 100000; EstimateSource = 'snapshot_token_estimate'; StartObservedAt = $quotaEvidenceStartAt; EndObservedAt = $quotaEvidenceEndAt; FirstCountedAt = $quotaEvidenceStartAt.AddMinutes(1); LastCountedAt = $quotaEvidenceEndAt }
@@ -1857,15 +1912,20 @@ try {
         throw 'QUOTA CONTRACT FAILED: expired quota windows are not rejected and hidden'
     }
     if ($uiSource.Contains('待时间段校准') -or
-        $uiSource -notmatch '当前用量 \{0:0\.####\}% · 反推总额度≈\{1\}.*?来源：\{4\}') {
-        throw 'UI CONTRACT FAILED: quota cards must show full-window API-equivalent dollars and their source'
+        $uiSource -notmatch '当前用量 \{0:0\.####\}% · 反推总额度≈\{1\}.*?来源：\{6\}') {
+        throw 'UI CONTRACT FAILED: quota cards must show snapshot-delta API-equivalent dollars and their source'
     }
     if ($uiSource -match '按 1% 反推' -or $coreSource -match 'Max\(1\.0,\s*\$deltaPercent\)') {
         throw 'QUOTA CONTRACT FAILED: quota inference must use the exact positive precision provided by logs'
     }
-    if ($coreSource -notmatch 'snapshot_window_usd_estimate' -or $coreSource -notmatch 'direct_limit_tokens_usd_estimate' -or
-        $uiSource -notmatch '请求级去重不完整') {
-        throw 'QUOTA CONTRACT FAILED: quota capacity source or identity completeness is not surfaced'
+    if ($coreSource -notmatch 'snapshot_delta_usd_estimate' -or $coreSource -notmatch 'QueryQuotaCalibrationPairByOffsets' -or
+        $uiSource -notmatch '请求级去重不完整' -or $uiSource -notmatch '已回查本窗口历史完整步长') {
+        throw 'QUOTA CONTRACT FAILED: quota delta source, historical calibration or identity completeness is not surfaced'
+    }
+    if ($coreSource -match 'snapshot_window_usd_estimate' -or
+        $coreSource -match '\$observedTokens\s*\*\s*100\.0\s*/\s*\[double\]\$EndWindow\.UsedPercent' -or
+        $uiSource -match '完整窗口API成本/当前百分比') {
+        throw 'QUOTA CONTRACT FAILED: partial snapshot cost can still be divided by cumulative current usage'
     }
     if ($uiSource -notmatch 'previousEstimates' -or
         $uiSource -notmatch 'Test-TokenRaderQuotaEstimateMatchesWindow' -or

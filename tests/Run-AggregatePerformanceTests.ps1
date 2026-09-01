@@ -158,6 +158,21 @@ try {
     Assert-AggregateTest ($reverse.CountedEvents -eq 1 -and $reverse.DuplicateEventsDropped -eq 1) 'reverse-order lineage copy was not counted once'
     Assert-AggregateTest ($reverse.Buckets.Count -eq 1 -and $reverse.Buckets[0].Model -eq 'gpt-5.6-sol') 'reverse-order lineage copy did not select the ancestor model'
 
+    Add-TestAggregateRelationship $correctness 'multi-parent' 'multi-root' 'multi-root' 'synthetic://multi-parent'
+    Add-TestAggregateRelationship $correctness 'multi-child-a' 'multi-parent' 'multi-root' 'synthetic://multi-child-a'
+    Add-TestAggregateRelationship $correctness 'multi-child-b' 'multi-parent' 'multi-root' 'synthetic://multi-child-b'
+    Add-TestAggregateRow $correctness 'multi-child-a' '2026-08-28T00:00:30Z' 'gpt-5.6-luna' 950 95 95 950 95 95 'fp-multi' 'synthetic://multi-child-a' 10 'multi-root'
+    Add-TestAggregateRow $correctness 'multi-child-b' '2026-08-28T00:00:31Z' 'gpt-5.6-luna' 950 95 95 950 95 95 'fp-multi' 'synthetic://multi-child-b' 10 'multi-root'
+    Add-TestAggregateRow $correctness 'multi-parent' '2026-08-28T00:00:29Z' 'gpt-5.6-sol' 950 95 95 950 95 95 'fp-multi' 'synthetic://multi-parent' 10 'multi-root'
+    $multiReverse = [TokenRaderIndexer]::AggregateIntervalRecords(
+        $correctness, @{}, [ordered]@{
+            'synthetic://multi-child-a' = 10L
+            'synthetic://multi-child-b' = 10L
+            'synthetic://multi-parent' = 10L
+        }, $startedAt, $thresholds, $none, $null)
+    Assert-AggregateTest ($multiReverse.CountedEvents -eq 1 -and $multiReverse.DuplicateEventsDropped -eq 2) 'a parent arriving after multiple descendant copies did not replace all descendants'
+    Assert-AggregateTest ($multiReverse.Buckets.Count -eq 1 -and $multiReverse.Buckets[0].Model -eq 'gpt-5.6-sol') 'multi-descendant canonical event did not use the parent model'
+
     Add-TestAggregateRelationship $correctness 'turn-parent' 'turn-root' 'turn-root' 'synthetic://turn-parent'
     Add-TestAggregateRelationship $correctness 'turn-child' 'turn-parent' 'turn-root' 'synthetic://turn-child'
     Add-TestAggregateRow $correctness 'turn-parent' '2026-08-28T00:00:13Z' 'gpt-5.6-sol' 800 80 80 800 80 80 'fp-turns' 'synthetic://turn-parent' 10 'turn-root' 'turn-one' '' 'turn_id'
@@ -165,8 +180,8 @@ try {
     $differentTurns = [TokenRaderIndexer]::AggregateIntervalRecords(
         $correctness, @{}, @{ 'synthetic://turn-parent' = 10L; 'synthetic://turn-child' = 10L },
         $startedAt, $thresholds, $none, $null)
-    Assert-AggregateTest ($differentTurns.CountedEvents -eq 2) 'different turns in one lineage were collapsed by token fingerprint alone'
-    Assert-AggregateTest (-not $differentTurns.IdentityComplete -and $differentTurns.UnidentifiedEvents -eq 2) 'turn-level identity was incorrectly reported as request-complete'
+    Assert-AggregateTest ($differentTurns.CountedEvents -eq 1 -and $differentTurns.DuplicateEventsDropped -eq 1) 'parent/child copies with different turn ids were not deduplicated by token fingerprint'
+    Assert-AggregateTest (-not $differentTurns.IdentityComplete -and $differentTurns.UnidentifiedEvents -eq 1) 'turn-level canonical parent identity was incorrectly reported as request-complete'
 
     Add-TestAggregateRow $correctness 'request' '2026-08-28T00:00:15Z' 'gpt-5.6-sol' 100 10 10 100 10 10 'request-partial' 'synthetic://request' 10 'request-root' 'turn-request' 'request-one' 'request_id'
     Add-TestAggregateRow $correctness 'request' '2026-08-28T00:00:16Z' 'gpt-5.6-sol' 300 30 30 200 20 20 'request-final' 'synthetic://request' 20 'request-root' 'turn-request' 'request-one' 'request_id'
@@ -188,6 +203,20 @@ try {
     Assert-AggregateTest ($seeded.CountedEvents -eq 1) 'pre-start cumulative snapshot was billed again'
     Assert-AggregateTest ($seeded.DuplicateEventsDropped -eq 1) 'repeated cumulative snapshot was not diagnosed'
     Assert-AggregateTest ($seeded.TotalInput -eq 1000 -and $seeded.TotalOutput -eq 100) 'baseline-seeded interval usage changed'
+
+    # A child file created after measurement start may copy the latest parent
+    # event whose source file did not change. Seed only that ancestor boundary
+    # and ensure the inherited child record is not billed as new work.
+    Add-TestAggregateRelationship $correctness 'boundary-parent' 'boundary-root' 'boundary-root' 'synthetic://boundary-parent'
+    Add-TestAggregateRelationship $correctness 'boundary-child' 'boundary-parent' 'boundary-root' 'synthetic://boundary-child'
+    Add-TestAggregateRow $correctness 'boundary-parent' '2026-08-28T00:00:20Z' 'gpt-5.6-sol' 600 60 60 600 60 60 'boundary-copy' 'synthetic://boundary-parent' 10 'boundary-root' 'parent-turn' '' 'turn_id'
+    Add-TestAggregateRow $correctness 'boundary-child' '2026-08-28T00:00:21Z' 'gpt-5.6-luna' 600 60 60 600 60 60 'boundary-copy' 'synthetic://boundary-child' 10 'boundary-root' 'child-turn' '' 'turn_id'
+    $boundaryCopy = [TokenRaderIndexer]::AggregateIntervalRecords(
+        $correctness,
+        @{ 'synthetic://boundary-parent' = 10L },
+        @{ 'synthetic://boundary-parent' = 10L; 'synthetic://boundary-child' = 10L },
+        $startedAt, $thresholds, $none, $null)
+    Assert-AggregateTest ($boundaryCopy.CountedEvents -eq 0 -and $boundaryCopy.DuplicateEventsDropped -ge 1) 'a pre-start parent event copied into a new child file was billed again'
 
     $parentOnly = [TokenRaderIndexer]::AggregateIntervalRecords(
         $correctness, $starts, @{ 'synthetic://parent' = 20L }, $startedAt, $thresholds, $none, $null)

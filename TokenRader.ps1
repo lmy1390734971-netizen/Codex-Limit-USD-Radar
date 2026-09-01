@@ -1345,13 +1345,19 @@ function Set-QuotaWindowCard {
     $ResetText.Text = if ($null -ne $Window.ResetsAt) { ('重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt) } else { ('{0} 分钟窗口' -f $Window.WindowMinutes) }
     if ($null -ne $Estimate) {
         $currentPercent = [double]$Window.UsedPercent
-        $sourceLabel = if ([string]$Estimate.EstimateSource -eq 'direct_limit_tokens_usd_estimate') { '直接Token容量×窗口平均API价' } else { '完整窗口API成本/当前百分比' }
+        $sourceLabel = if ([string]$Estimate.EstimateSource -eq 'snapshot_delta_usd_estimate') { '快照区间API成本/实际用量增量' } else { '额度快照API成本/用量增量' }
         $identityLabel = if ([bool]$Estimate.IdentityComplete) { '' } else { ' · 请求级去重不完整' }
-        $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 已用≈{2} · 剩余≈{3} · 来源：{4}{5}' -f
+        $startLabel = if ($null -ne $Estimate.PSObject.Properties['StartUsedPercent']) {
+            ' · 从 {0:0.####}% 开始 · 校准增量 +{1:0.####}%' -f ([double]$Estimate.StartUsedPercent), ([double]$Estimate.EffectiveDeltaPercent)
+        } else { '' }
+        $historyLabel = if ($null -ne $Estimate.PSObject.Properties['HistoryLookbackApplied'] -and [bool]$Estimate.HistoryLookbackApplied) { ' · 已回查本窗口历史完整步长' } else { '' }
+        $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 已用≈{2} · 剩余≈{3}{4}{5} · 来源：{6}{7}' -f
             $currentPercent,
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
             (Format-TokenRaderUsd ([double]$Estimate.UsedUsd)),
             (Format-TokenRaderUsd ([double]$Estimate.RemainingUsd)),
+            $startLabel,
+            $historyLabel,
             $sourceLabel,
             $identityLabel)
     } else {
@@ -1400,6 +1406,9 @@ function Test-TokenRaderQuotaEstimateMatchesWindow {
         $windowReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$Window.WindowMinutes) -ResetsAt $Window.ResetsAt
         if ([string]::IsNullOrWhiteSpace($estimateReset) -or $estimateReset -ne $windowReset) { return $false }
     }
+    if ($null -ne $Estimate.PSObject.Properties['CurrentObservedAt'] -and $null -ne $Estimate.CurrentObservedAt -and
+        $null -ne $Window.PSObject.Properties['ObservedAt'] -and $null -ne $Window.ObservedAt -and
+        [DateTimeOffset]$Estimate.CurrentObservedAt -ne [DateTimeOffset]$Window.ObservedAt) { return $false }
     return $true
 }
 
@@ -1514,7 +1523,7 @@ function Update-QuotaEstimatesFromInterval {
     } elseif ([double]$Result.TotalCost -le 0) {
         '当前时间段尚无可计价消耗，点击“查看结果”会再次检查。'
     } else {
-        '当前额度窗口缺少可靠重置时间，本次不显示美金额度估算。'
+        '当前额度窗口缺少可靠的百分比增量或历史完整步长，本次不生成新的美金额度估算。'
     }
     Update-QuotaCards
 }

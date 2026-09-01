@@ -374,6 +374,22 @@ function Get-TokenRaderResetIdentity {
     } catch { return '' }
 }
 
+function Get-TokenRaderWindowPercentResolution {
+    param($Window)
+
+    if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['PercentResolution']) {
+        $declared = [double]$Window.PercentResolution
+        if ($declared -gt 0 -and $declared -le 100) { return $declared }
+    }
+    if ($null -eq $Window) { return 1.0 }
+    $text = ([double]$Window.UsedPercent).ToString('0.################', [Globalization.CultureInfo]::InvariantCulture)
+    $separator = $text.IndexOf('.')
+    if ($separator -lt 0) { return 1.0 }
+    $digits = $text.Length - $separator - 1
+    if ($digits -le 0) { return 1.0 }
+    return [Math]::Pow(10.0, -$digits)
+}
+
 function Get-TokenRaderRateWindowKind {
     param([int]$WindowMinutes)
 
@@ -430,7 +446,12 @@ function ConvertFrom-TokenRaderRateWindowTextFast {
     $used = [regex]::Match($InnerText, '"used_percent"\s*:\s*"?([0-9.]+)"?')
     $minutes = [regex]::Match($InnerText, '"window_minutes"\s*:\s*"?(\d+)"?')
     if (-not $used.Success -or -not $minutes.Success) { return $null }
-    $usedPercent = [Math]::Max(0.0, [Math]::Min(100.0, [double]$used.Groups[1].Value))
+    $usedText = [string]$used.Groups[1].Value
+    $usedPercent = [Math]::Max(0.0, [Math]::Min(100.0, [double]$usedText))
+    $usedDecimal = $usedText.IndexOf('.')
+    $percentResolution = if ($usedDecimal -ge 0 -and $usedDecimal -lt ($usedText.Length - 1)) {
+        [Math]::Pow(10.0, -($usedText.Length - $usedDecimal - 1))
+    } else { 1.0 }
     $windowMinutes = [int]$minutes.Groups[1].Value
     $resetsAt = $null
     $resetMatch = [regex]::Match($InnerText, '"(?:resets_at|reset_at)"\s*:\s*(?:"([^"]+)"|([-0-9.]+))')
@@ -455,6 +476,7 @@ function ConvertFrom-TokenRaderRateWindowTextFast {
         ObservedAt = $ObservedAt
         SourceFile = $SourceFile
         PlanType = $PlanType
+        PercentResolution = $percentResolution
         UsedTokens = if ($usedTokensMatch.Success) { ConvertTo-TokenRaderSafeInt64 $usedTokensMatch.Groups[1].Value } else { $null }
         RemainingTokens = if ($remainingTokensMatch.Success) { ConvertTo-TokenRaderSafeInt64 $remainingTokensMatch.Groups[1].Value } else { $null }
         LimitTokens = if ($limitTokensMatch.Success) { ConvertTo-TokenRaderSafeInt64 $limitTokensMatch.Groups[1].Value } else { $null }
@@ -1712,58 +1734,68 @@ function Get-TokenRaderQuotaEstimate {
     )
     $useQuotaEvidence = $PSBoundParameters.ContainsKey('QuotaEvidence')
 
-    function Get-WindowPercentResolution {
-        param($Window)
-        if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['PercentResolution']) {
-            $declared = [double]$Window.PercentResolution
-            if ($declared -gt 0 -and $declared -le 100) { return $declared }
-        }
-        if ($null -eq $Window) { return 1.0 }
-        $text = ([double]$Window.UsedPercent).ToString('0.################', [Globalization.CultureInfo]::InvariantCulture)
-        $separator = $text.IndexOf('.')
-        if ($separator -lt 0) { return 1.0 }
-        $digits = $text.Length - $separator - 1
-        if ($digits -le 0) { return 1.0 }
-        return [Math]::Pow(10.0, -$digits)
-    }
-
     function Get-WindowEstimate {
         param($StartWindow, $EndWindow, [string]$StartPlanType, [string]$EndPlanType, $Evidence)
         if ($null -eq $EndWindow) { return $null }
         if ($useQuotaEvidence) {
             if ($null -eq $Evidence -or $null -eq $Evidence.PSObject.Properties['BoundaryValid'] -or
-                -not [bool]$Evidence.BoundaryValid -or $null -eq $Evidence.PSObject.Properties['TotalTokens'] -or
-                [Int64]$Evidence.TotalTokens -le 0 -or $null -eq $Evidence.PSObject.Properties['EstimateSource'] -or
+                -not [bool]$Evidence.BoundaryValid -or $null -eq $Evidence.PSObject.Properties['EstimateSource'] -or
                 [string]::IsNullOrWhiteSpace([string]$Evidence.EstimateSource) -or
                 $null -eq $Evidence.PSObject.Properties['PricingComplete'] -or -not [bool]$Evidence.PricingComplete -or
-                $null -eq $Evidence.PSObject.Properties['EstimatedTotalUsd'] -or [double]$Evidence.EstimatedTotalUsd -le 0) { return $null }
-            if ($null -eq $Evidence.PSObject.Properties['EndObservedAt'] -or
-                [DateTimeOffset]$Evidence.EndObservedAt -ne [DateTimeOffset]$EndWindow.ObservedAt) { return $null }
+                $null -eq $Evidence.PSObject.Properties['EstimatedTotalUsd'] -or [double]$Evidence.EstimatedTotalUsd -le 0 -or
+                $null -eq $Evidence.PSObject.Properties['TotalCost'] -or [double]$Evidence.TotalCost -le 0 -or
+                $null -eq $Evidence.PSObject.Properties['EndObservedAt'] -or
+                $null -eq $Evidence.PSObject.Properties['EffectiveDeltaPercent'] -or
+                [double]$Evidence.EffectiveDeltaPercent -le 0) { return $null }
+            $evidenceCurrentAt = if ($null -ne $Evidence.PSObject.Properties['CurrentObservedAt']) {
+                [DateTimeOffset]$Evidence.CurrentObservedAt
+            } elseif ($null -ne $Evidence.PSObject.Properties['EndObservedAt']) {
+                [DateTimeOffset]$Evidence.EndObservedAt
+            } else { [DateTimeOffset]::MinValue }
+            if ($null -eq $EndWindow.PSObject.Properties['ObservedAt'] -or
+                $evidenceCurrentAt -ne [DateTimeOffset]$EndWindow.ObservedAt) { return $null }
+            if ($null -ne $Evidence.PSObject.Properties['WindowMinutes'] -and
+                [int]$Evidence.WindowMinutes -ne [int]$EndWindow.WindowMinutes) { return $null }
+            if ($null -ne $Evidence.PSObject.Properties['PlanType'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$Evidence.PlanType) -and
+                -not [string]::Equals([string]$Evidence.PlanType, [string]$EndPlanType, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+            if ($null -ne $Evidence.PSObject.Properties['ResetIdentity']) {
+                $windowResetIdentity = Get-TokenRaderResetIdentity -WindowMinutes ([int]$EndWindow.WindowMinutes) -ResetsAt $EndWindow.ResetsAt
+                if ([string]::IsNullOrWhiteSpace($windowResetIdentity) -or
+                    -not [string]::Equals([string]$Evidence.ResetIdentity, $windowResetIdentity, [StringComparison]::Ordinal)) { return $null }
+            }
+            if ($null -ne $EndReferenceAt -and $null -ne $EndWindow.ResetsAt -and
+                [DateTimeOffset]$EndWindow.ResetsAt -le [DateTimeOffset]$EndReferenceAt) { return $null }
             if ($null -ne $Evidence.LastCountedAt -and
-                [DateTimeOffset]$Evidence.LastCountedAt -gt [DateTimeOffset]$EndWindow.ObservedAt) { return $null }
+                [DateTimeOffset]$Evidence.LastCountedAt -gt [DateTimeOffset]$Evidence.EndObservedAt) { return $null }
+            [double]$currentUsedPercent = [double]$EndWindow.UsedPercent
+            [double]$totalUsd = [double]$Evidence.EstimatedTotalUsd
             return [pscustomobject]@{
-                StartUsedPercent = if ($null -ne $StartWindow) { [double]$StartWindow.UsedPercent } else { [double]$EndWindow.UsedPercent }
-                EndUsedPercent = [double]$EndWindow.UsedPercent
-                DeltaPercent = if ($null -ne $StartWindow) { [double]$EndWindow.UsedPercent - [double]$StartWindow.UsedPercent } else { 0.0 }
-                EffectiveDeltaPercent = 0.0
-                PercentResolution = [double](Get-WindowPercentResolution $EndWindow)
-                ResolutionAssumptionApplied = $false
-                TotalTokens = [Int64]$Evidence.TotalTokens
-                UsedTokens = [Int64]$Evidence.UsedTokens
-                RemainingTokens = [Int64]$Evidence.RemainingTokens
-                ObservedTokens = [Int64]$Evidence.ObservedTokens
+                StartUsedPercent = if ($null -ne $Evidence.PSObject.Properties['StartUsedPercent']) { [double]$Evidence.StartUsedPercent } elseif ($null -ne $StartWindow) { [double]$StartWindow.UsedPercent } else { $currentUsedPercent }
+                CalibrationEndUsedPercent = if ($null -ne $Evidence.PSObject.Properties['CalibrationEndUsedPercent']) { [double]$Evidence.CalibrationEndUsedPercent } else { $currentUsedPercent }
+                EndUsedPercent = $currentUsedPercent
+                DeltaPercent = [double]$Evidence.EffectiveDeltaPercent
+                EffectiveDeltaPercent = [double]$Evidence.EffectiveDeltaPercent
+                PercentResolution = if ($null -ne $Evidence.PSObject.Properties['PercentResolution']) { [double]$Evidence.PercentResolution } else { [double](Get-TokenRaderWindowPercentResolution $EndWindow) }
+                ResolutionAssumptionApplied = if ($null -ne $Evidence.PSObject.Properties['ResolutionAssumptionApplied']) { [bool]$Evidence.ResolutionAssumptionApplied } else { $false }
+                HistoryLookbackApplied = if ($null -ne $Evidence.PSObject.Properties['HistoryLookbackApplied']) { [bool]$Evidence.HistoryLookbackApplied } else { $false }
+                CurrentObservedAt = $evidenceCurrentAt
+                TotalTokens = if ($null -ne $Evidence.PSObject.Properties['TotalTokens']) { [Int64]$Evidence.TotalTokens } else { 0L }
+                UsedTokens = if ($null -ne $Evidence.PSObject.Properties['UsedTokens']) { [Int64]$Evidence.UsedTokens } else { 0L }
+                RemainingTokens = if ($null -ne $Evidence.PSObject.Properties['RemainingTokens']) { [Int64]$Evidence.RemainingTokens } else { 0L }
+                ObservedTokens = if ($null -ne $Evidence.PSObject.Properties['ObservedTokens']) { [Int64]$Evidence.ObservedTokens } else { 0L }
                 EstimateSource = [string]$Evidence.EstimateSource
                 CapacitySource = [string]$Evidence.CapacitySource
-                IdentityComplete = [bool]$Evidence.IdentityComplete
-                IdentitySources = @($Evidence.IdentitySources)
-                UnidentifiedEvents = [Int64]$Evidence.UnidentifiedEvents
+                IdentityComplete = if ($null -ne $Evidence.PSObject.Properties['IdentityComplete']) { [bool]$Evidence.IdentityComplete } else { $false }
+                IdentitySources = if ($null -ne $Evidence.PSObject.Properties['IdentitySources']) { @($Evidence.IdentitySources) } else { @() }
+                UnidentifiedEvents = if ($null -ne $Evidence.PSObject.Properties['UnidentifiedEvents']) { [Int64]$Evidence.UnidentifiedEvents } else { 0L }
                 EvidenceCost = [double]$Evidence.TotalCost
                 EvidenceFirstCountedAt = $Evidence.FirstCountedAt
                 EvidenceLastCountedAt = $Evidence.LastCountedAt
-                AverageUsdPerToken = [double]$Evidence.AverageUsdPerToken
-                TotalUsd = [double]$Evidence.EstimatedTotalUsd
-                UsedUsd = [double]$Evidence.ObservedCostUsd
-                RemainingUsd = [double]$Evidence.EstimatedRemainingUsd
+                AverageUsdPerToken = if ($null -ne $Evidence.PSObject.Properties['AverageUsdPerToken']) { [double]$Evidence.AverageUsdPerToken } else { 0.0 }
+                TotalUsd = $totalUsd
+                UsedUsd = if ($null -ne $Evidence.PSObject.Properties['EstimatedUsedUsd']) { [double]$Evidence.EstimatedUsedUsd } else { $totalUsd * ($currentUsedPercent / 100.0) }
+                RemainingUsd = if ($null -ne $Evidence.PSObject.Properties['EstimatedRemainingUsd']) { [double]$Evidence.EstimatedRemainingUsd } else { $totalUsd * ([Math]::Max(0.0, 100.0 - $currentUsedPercent) / 100.0) }
                 WindowMinutes = [int]$EndWindow.WindowMinutes
                 ResetsAt = $EndWindow.ResetsAt
                 PlanType = $EndPlanType
@@ -1791,8 +1823,8 @@ function Get-TokenRaderQuotaEstimate {
         if ($deltaPercent -lt -0.000000001) { return $null }
         if ([Math]::Abs($deltaPercent) -lt 0.000000001) { $deltaPercent = 0.0 }
         $percentResolution = [Math]::Min(
-            [double](Get-WindowPercentResolution $StartWindow),
-            [double](Get-WindowPercentResolution $EndWindow))
+            [double](Get-TokenRaderWindowPercentResolution $StartWindow),
+            [double](Get-TokenRaderWindowPercentResolution $EndWindow))
         $effectiveDeltaPercent = if ($deltaPercent -gt 0) { $deltaPercent } else { $percentResolution }
         if ($effectiveDeltaPercent -le 0) { return $null }
         $totalUsd = $effectiveCost / ($effectiveDeltaPercent / 100.0)
@@ -2683,6 +2715,8 @@ function ConvertFrom-TokenRaderIndexRecord {
             ObservedAt = $timestamp
             SourceFile = $sourceFile
             PlanType = $planType
+            LimitId = if ($Row.Table.Columns.Contains('rate_limit_id')) { [string]$Row['rate_limit_id'] } else { '' }
+            LimitName = if ($Row.Table.Columns.Contains('rate_limit_name')) { [string]$Row['rate_limit_name'] } else { '' }
             UsedTokens = & $readNullableInt64 'five_hour_used_tokens'
             RemainingTokens = & $readNullableInt64 'five_hour_remaining_tokens'
             LimitTokens = & $readNullableInt64 'five_hour_limit_tokens'
@@ -2700,6 +2734,8 @@ function ConvertFrom-TokenRaderIndexRecord {
             ObservedAt = $timestamp
             SourceFile = $sourceFile
             PlanType = $planType
+            LimitId = if ($Row.Table.Columns.Contains('rate_limit_id')) { [string]$Row['rate_limit_id'] } else { '' }
+            LimitName = if ($Row.Table.Columns.Contains('rate_limit_name')) { [string]$Row['rate_limit_name'] } else { '' }
             UsedTokens = & $readNullableInt64 'weekly_used_tokens'
             RemainingTokens = & $readNullableInt64 'weekly_remaining_tokens'
             LimitTokens = & $readNullableInt64 'weekly_limit_tokens'
@@ -3206,6 +3242,8 @@ function Get-TokenRaderQuotaWindowEvidence {
         $StartWindow,
         $EndWindow,
         $MainLastCountedAt,
+        [Parameter(Mandatory = $true)][ValidateSet('FiveHour', 'Weekly')][string]$WindowKind,
+        [string]$RateLimitId = '',
         [Parameter(Mandatory = $true)]$Connection,
         [Parameter(Mandatory = $true)]$EndOffsets,
         [Parameter(Mandatory = $true)]$Thresholds,
@@ -3214,69 +3252,84 @@ function Get-TokenRaderQuotaWindowEvidence {
         [hashtable]$ProgressState,
         [hashtable]$Cache
     )
-    # Quota evidence is bounded by the two observed snapshots, not by the
-    # beginning of the provider's rolling window.  Using
-    # reset_at-window_minutes here would include every call since the quota
-    # window opened and is the primary way an estimate can be inflated by an
-    # order of magnitude.  Both endpoints must carry reliable identity data so
-    # a reset or account/plan switch cannot be mistaken for usage in one span.
-    if ($null -eq $StartWindow -or $null -eq $EndWindow -or
-        $null -eq $StartWindow.PSObject.Properties['ObservedAt'] -or
-        $null -eq $EndWindow.PSObject.Properties['ObservedAt'] -or
-        $null -eq $StartWindow.ResetsAt -or $null -eq $EndWindow.ResetsAt -or
-        [int]$StartWindow.WindowMinutes -le 0 -or [int]$EndWindow.WindowMinutes -le 0) { return $null }
-    $startObservedAt = [DateTimeOffset]$StartWindow.ObservedAt
-    $endObservedAt = [DateTimeOffset]$EndWindow.ObservedAt
-    $windowStartAt = $startObservedAt
-    $sameWindow = [int]$StartWindow.WindowMinutes -eq [int]$EndWindow.WindowMinutes
-    $samePlan = [string]::Equals([string]$StartWindow.PlanType, [string]$EndWindow.PlanType, [StringComparison]::OrdinalIgnoreCase)
-    $startReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$StartWindow.WindowMinutes) -ResetsAt $StartWindow.ResetsAt
+    # Dollar capacity is calibrated from the API-equivalent cost that occurred
+    # between two quota snapshots and the *actual percentage increase* between
+    # those same snapshots. It must never divide a partial interval cost by the
+    # account's cumulative current percentage.
+    if ($null -eq $EndWindow -or $null -eq $EndWindow.PSObject.Properties['ObservedAt'] -or
+        $null -eq $EndWindow.ResetsAt -or [int]$EndWindow.WindowMinutes -le 0 -or
+        [string]::IsNullOrWhiteSpace([string]$EndWindow.PlanType)) { return $null }
+    [DateTimeOffset]$currentObservedAt = [DateTimeOffset]$EndWindow.ObservedAt
+    [double]$currentUsedPercent = [double]$EndWindow.UsedPercent
     $endReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$EndWindow.WindowMinutes) -ResetsAt $EndWindow.ResetsAt
-    $sameReset = -not [string]::IsNullOrWhiteSpace($startReset) -and [string]::Equals($startReset, $endReset, [StringComparison]::Ordinal)
-    # BoundaryValid describes the quota evidence's own immutable interval.
-    # A token-only child/descendant record can legitimately be written after
-    # the latest record that carries rate_limits.  That means the evidence no
-    # longer covers the newest main-interval call, but it is still a strictly
-    # aligned (StartObservedAt, EndObservedAt] calibration and must remain
-    # usable.  Mixing the newer main-interval cost into it is still forbidden.
-    $boundaryValid = $sameWindow -and $samePlan -and $sameReset -and $endObservedAt -gt $startObservedAt
-    $coverageComplete = $boundaryValid -and ($null -eq $MainLastCountedAt -or
-        $endObservedAt -ge [DateTimeOffset]$MainLastCountedAt)
-    if (-not $boundaryValid) {
-        return [pscustomobject]@{
-            BoundaryValid = $false
-            CoverageComplete = $false
-            StartObservedAt = $startObservedAt
-            EndObservedAt = $endObservedAt
-            Usage = New-TokenRaderUsage
-            InputCost = [double]0
-            CachedCost = [double]0
-            OutputCost = [double]0
-            TotalCost = [double]0
-            PricingComplete = $false
-            CostComplete = $false
-            UnknownModels = @()
-            CountedEvents = [Int64]0
-            FirstCountedAt = $null
-            LastCountedAt = $null
-            ProcessingMilliseconds = [double]0
-            ObservedTokens = [Int64]0
-            TotalTokens = [Int64]0
-            UsedTokens = [Int64]0
-            RemainingTokens = [Int64]0
-            EstimateSource = ''
-            CapacitySource = ''
-            UsdEstimateSource = ''
-            AverageUsdPerToken = [double]0
-            EstimatedTotalUsd = [double]0
-            ObservedCostUsd = [double]0
-            EstimatedRemainingUsd = [double]0
-            IdentityComplete = $false
-            IdentitySources = @()
+    if ([string]::IsNullOrWhiteSpace($endReset)) { return $null }
+
+    $calibrationStart = $null
+    $calibrationEnd = $null
+    $historyLookbackApplied = $false
+    if ($null -ne $StartWindow) {
+        if ($null -eq $StartWindow.PSObject.Properties['ObservedAt'] -or $null -eq $StartWindow.ResetsAt -or
+            [int]$StartWindow.WindowMinutes -ne [int]$EndWindow.WindowMinutes -or
+            -not [string]::Equals([string]$StartWindow.PlanType, [string]$EndWindow.PlanType, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        $startReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$StartWindow.WindowMinutes) -ResetsAt $StartWindow.ResetsAt
+        if ([string]::IsNullOrWhiteSpace($startReset) -or $startReset -ne $endReset) { return $null }
+        if ($null -ne $StartWindow.PSObject.Properties['LimitId'] -and $null -ne $EndWindow.PSObject.Properties['LimitId'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$StartWindow.LimitId) -and
+            -not [string]::IsNullOrWhiteSpace([string]$EndWindow.LimitId) -and
+            -not [string]::Equals([string]$StartWindow.LimitId, [string]$EndWindow.LimitId, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        [double]$directDelta = [double]$EndWindow.UsedPercent - [double]$StartWindow.UsedPercent
+        if ($directDelta -lt -0.000000001) { return $null }
+        if ($directDelta -gt 0.000000001 -and [DateTimeOffset]$EndWindow.ObservedAt -gt [DateTimeOffset]$StartWindow.ObservedAt) {
+            $calibrationStart = $StartWindow
+            $calibrationEnd = $EndWindow
         }
     }
 
-    $cacheKey = '{0}|{1}' -f $windowStartAt.UtcDateTime.Ticks, $endObservedAt.UtcDateTime.Ticks
+    # When a short measurement remains inside the same displayed percentage,
+    # recover the latest completed percentage step from this exact account /
+    # plan / reset cycle. If the log exposes tenths or hundredths, the greatest
+    # previous value naturally makes the calibration use that finer real step.
+    if ($null -eq $calibrationStart) {
+        # A split 5h/weekly record can carry different metadata timestamps. Use
+        # the id attached to this exact window row when available, including an
+        # explicitly empty id; only legacy window objects fall back to the
+        # top-level value supplied by the caller.
+        $effectiveLimitId = if ($null -ne $EndWindow.PSObject.Properties['LimitId']) { [string]$EndWindow.LimitId } else { $RateLimitId }
+        $historyRows = [TokenRaderIndexer]::QueryQuotaCalibrationPairByOffsets(
+            $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
+            ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
+            [string]$EndWindow.PlanType, [string]$effectiveLimitId, $currentUsedPercent,
+            $currentObservedAt, $CancellationToken)
+        if ($null -eq $historyRows -or $historyRows.Rows.Count -ne 2) { return $null }
+        $historyStartRecord = ConvertFrom-TokenRaderIndexRecord -Row $historyRows.Rows[0]
+        $historyEndRecord = ConvertFrom-TokenRaderIndexRecord -Row $historyRows.Rows[1]
+        if ($WindowKind -eq 'FiveHour') {
+            $calibrationStart = $historyStartRecord.RateLimits.FiveHour
+            $calibrationEnd = $historyEndRecord.RateLimits.FiveHour
+        } else {
+            $calibrationStart = $historyStartRecord.RateLimits.Weekly
+            $calibrationEnd = $historyEndRecord.RateLimits.Weekly
+        }
+        $historyLookbackApplied = $true
+    }
+    if ($null -eq $calibrationStart -or $null -eq $calibrationEnd) { return $null }
+
+    [DateTimeOffset]$startObservedAt = [DateTimeOffset]$calibrationStart.ObservedAt
+    [DateTimeOffset]$endObservedAt = [DateTimeOffset]$calibrationEnd.ObservedAt
+    [double]$deltaPercent = [double]$calibrationEnd.UsedPercent - [double]$calibrationStart.UsedPercent
+    $sameWindow = [int]$calibrationStart.WindowMinutes -eq [int]$calibrationEnd.WindowMinutes -and
+        [int]$calibrationEnd.WindowMinutes -eq [int]$EndWindow.WindowMinutes
+    $samePlan = [string]::Equals([string]$calibrationStart.PlanType, [string]$calibrationEnd.PlanType, [StringComparison]::OrdinalIgnoreCase) -and
+        [string]::Equals([string]$calibrationEnd.PlanType, [string]$EndWindow.PlanType, [StringComparison]::OrdinalIgnoreCase)
+    $calibrationStartReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$calibrationStart.WindowMinutes) -ResetsAt $calibrationStart.ResetsAt
+    $calibrationEndReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$calibrationEnd.WindowMinutes) -ResetsAt $calibrationEnd.ResetsAt
+    $boundaryValid = $sameWindow -and $samePlan -and $calibrationStartReset -eq $endReset -and
+        $calibrationEndReset -eq $endReset -and $endObservedAt -gt $startObservedAt -and $deltaPercent -gt 0.000000001
+    if (-not $boundaryValid) { return $null }
+    $coverageComplete = $currentObservedAt -ge $endObservedAt -and ($null -eq $MainLastCountedAt -or
+        $currentObservedAt -ge [DateTimeOffset]$MainLastCountedAt)
+
+    $cacheKey = '{0}|{1}' -f $startObservedAt.UtcDateTime.Ticks, $endObservedAt.UtcDateTime.Ticks
     $aggregate = if ($null -ne $Cache -and $Cache.ContainsKey($cacheKey)) {
         $Cache[$cacheKey]
     } else {
@@ -3297,36 +3350,52 @@ function Get-TokenRaderQuotaWindowEvidence {
     [Int64]$totalTokens = 0
     [Int64]$usedTokens = 0
     [Int64]$remainingTokens = 0
-    $estimateSource = ''
+    $capacitySource = ''
     if ($null -ne $directLimit -and [Int64]$directLimit -gt 0) {
         $totalTokens = [Int64]$directLimit
-        $usedTokens = if ($null -ne $directUsed) { [Int64]$directUsed } else { [Int64][Math]::Round($totalTokens * ([double]$EndWindow.UsedPercent / 100.0)) }
-        $remainingTokens = if ($null -ne $directRemaining) { [Int64]$directRemaining } else { [Math]::Max([Int64]0, $totalTokens - $usedTokens) }
-        $estimateSource = 'direct_limit_tokens'
-    } elseif ($observedTokens -gt 0 -and [double]$EndWindow.UsedPercent -gt 0) {
-        $totalTokens = [Int64][Math]::Round($observedTokens * 100.0 / [double]$EndWindow.UsedPercent)
+        $usedTokens = [Int64][Math]::Round($totalTokens * ($currentUsedPercent / 100.0))
+        $remainingTokens = [Math]::Max([Int64]0, $totalTokens - $usedTokens)
+        $capacitySource = 'direct_limit_tokens'
+    } elseif ($observedTokens -gt 0 -and $deltaPercent -gt 0) {
+        $totalTokens = [Int64][Math]::Round($observedTokens * 100.0 / $deltaPercent)
         if ($totalTokens -lt $observedTokens) { $totalTokens = $observedTokens }
-        $usedTokens = $observedTokens
-        $remainingTokens = [Math]::Max([Int64]0, $totalTokens - $observedTokens)
-        $estimateSource = 'snapshot_token_estimate'
+        $usedTokens = [Int64][Math]::Round($totalTokens * ($currentUsedPercent / 100.0))
+        $remainingTokens = [Math]::Max([Int64]0, $totalTokens - $usedTokens)
+        $capacitySource = 'percent_delta_tokens'
     }
     [double]$averageUsdPerToken = 0
     [double]$estimatedTotalUsd = 0
     [double]$estimatedRemainingUsd = 0
     $usdEstimateSource = ''
-    if ([bool]$priced.PricingComplete -and $observedTokens -gt 0 -and $totalTokens -gt 0 -and [double]$priced.TotalCost -gt 0) {
-        $averageUsdPerToken = [double]$priced.TotalCost / [double]$observedTokens
-        $estimatedTotalUsd = $averageUsdPerToken * [double]$totalTokens
-        $estimatedRemainingUsd = [Math]::Max(0.0, $estimatedTotalUsd - [double]$priced.TotalCost)
-        $usdEstimateSource = if ($estimateSource -eq 'direct_limit_tokens') {
-            'direct_limit_tokens_usd_estimate'
-        } else { 'snapshot_window_usd_estimate' }
+    [double]$estimatedUsedUsd = 0
+    if ([bool]$priced.PricingComplete -and [double]$priced.TotalCost -gt 0 -and $deltaPercent -gt 0) {
+        if ($observedTokens -gt 0) { $averageUsdPerToken = [double]$priced.TotalCost / [double]$observedTokens }
+        $estimatedTotalUsd = [double]$priced.TotalCost / ($deltaPercent / 100.0)
+        $estimatedUsedUsd = $estimatedTotalUsd * ($currentUsedPercent / 100.0)
+        $estimatedRemainingUsd = $estimatedTotalUsd * ([Math]::Max(0.0, 100.0 - $currentUsedPercent) / 100.0)
+        $usdEstimateSource = 'snapshot_delta_usd_estimate'
     }
+    $percentResolution = [Math]::Min(
+        [double](Get-TokenRaderWindowPercentResolution $calibrationStart),
+        [double](Get-TokenRaderWindowPercentResolution $calibrationEnd))
     [pscustomobject]@{
         BoundaryValid = $true
         CoverageComplete = [bool]$coverageComplete
         StartObservedAt = $startObservedAt
         EndObservedAt = $endObservedAt
+        CurrentObservedAt = $currentObservedAt
+        StartUsedPercent = [double]$calibrationStart.UsedPercent
+        CalibrationEndUsedPercent = [double]$calibrationEnd.UsedPercent
+        CurrentUsedPercent = $currentUsedPercent
+        DeltaPercent = $deltaPercent
+        EffectiveDeltaPercent = $deltaPercent
+        PercentResolution = $percentResolution
+        ResolutionAssumptionApplied = $false
+        HistoryLookbackApplied = $historyLookbackApplied
+        WindowMinutes = [int]$EndWindow.WindowMinutes
+        ResetsAt = $EndWindow.ResetsAt
+        ResetIdentity = $endReset
+        PlanType = [string]$EndWindow.PlanType
         Usage = $priced.Usage
         InputCost = [double]$priced.InputCost
         CachedCost = [double]$priced.CachedCost
@@ -3353,10 +3422,11 @@ function Get-TokenRaderQuotaWindowEvidence {
         UsedTokens = $usedTokens
         RemainingTokens = $remainingTokens
         EstimateSource = $usdEstimateSource
-        CapacitySource = $estimateSource
+        CapacitySource = $capacitySource
         UsdEstimateSource = $usdEstimateSource
         AverageUsdPerToken = $averageUsdPerToken
         EstimatedTotalUsd = $estimatedTotalUsd
+        EstimatedUsedUsd = $estimatedUsedUsd
         ObservedCostUsd = [double]$priced.TotalCost
         EstimatedRemainingUsd = $estimatedRemainingUsd
         IdentityComplete = [bool]$aggregate.IdentityComplete
@@ -3420,6 +3490,8 @@ function Get-TokenRaderIndexedIntervalResult {
                 -StartWindow $(if ($null -ne $startRateLimits) { $startRateLimits.FiveHour } else { $null }) `
                 -EndWindow $endRateLimits.FiveHour `
                 -MainLastCountedAt $aggregate.LastCountedAt `
+                -WindowKind 'FiveHour' `
+                -RateLimitId $(if ($null -ne $endRateLimits.PSObject.Properties['LimitId']) { [string]$endRateLimits.LimitId } else { '' }) `
                 -Connection $index.Connection `
                 -EndOffsets $ends `
                 -Thresholds $thresholds `
@@ -3431,6 +3503,8 @@ function Get-TokenRaderIndexedIntervalResult {
                 -StartWindow $(if ($null -ne $startRateLimits) { $startRateLimits.Weekly } else { $null }) `
                 -EndWindow $endRateLimits.Weekly `
                 -MainLastCountedAt $aggregate.LastCountedAt `
+                -WindowKind 'Weekly' `
+                -RateLimitId $(if ($null -ne $endRateLimits.PSObject.Properties['LimitId']) { [string]$endRateLimits.LimitId } else { '' }) `
                 -Connection $index.Connection `
                 -EndOffsets $ends `
                 -Thresholds $thresholds `
