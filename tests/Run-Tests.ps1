@@ -189,7 +189,10 @@ function Select-TestIndexRows {
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $projectRoot 'TokenRader.Core.psm1') -Force
-$prices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.json')
+    $prices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.json')
+    if ($null -eq (Get-Command Get-TokenRaderResetIdentity -ErrorAction SilentlyContinue)) {
+        throw 'MODULE CONTRACT FAILED: the UI quota-window matcher cannot call Get-TokenRaderResetIdentity'
+    }
 Assert-Equal 'USD' ([string]$prices.currency) 'pricing currency metadata'
 Assert-Equal 1000000 ([Int64]$prices.unitTokens) 'pricing unit metadata'
 Assert-Equal 'OpenAI API Standard processing' ([string]$prices.priceType) 'pricing type metadata'
@@ -1832,6 +1835,13 @@ try {
     # compute path must not fall back to invoking the parser on the UI thread.
     $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
     $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
+    $quotaMatcherMatch = [regex]::Match($uiSource, '(?s)function Test-TokenRaderQuotaEstimateMatchesWindow\b.*?(?=\r?\nfunction |\z)')
+    if (-not $quotaMatcherMatch.Success) { throw 'UI CONTRACT FAILED: quota-window matcher was not found' }
+    Invoke-Expression $quotaMatcherMatch.Value
+    $matcherReset = [DateTimeOffset]::Now.AddHours(2)
+    $matcherEstimate = [pscustomobject]@{ WindowMinutes = 300; ResetsAt = $matcherReset; PlanType = 'pro' }
+    $matcherWindow = [pscustomobject]@{ WindowMinutes = 300; ResetsAt = $matcherReset; PlanType = 'pro' }
+    Assert-Equal $true (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $matcherEstimate -Window $matcherWindow) 'UI quota-window matcher cannot call the exported reset-identity helper'
     $combinedUiSource = $xamlSource + "`n" + $uiSource
     foreach ($forbiddenUiText in @('估算，不是账单', '存在未收录价格的模型', '存在未知模型价格', '存在未收录官方价格的模型')) {
         if ($combinedUiSource.Contains($forbiddenUiText)) { throw ('UI CONTRACT FAILED: forbidden pricing warning remains: ' + $forbiddenUiText) }
