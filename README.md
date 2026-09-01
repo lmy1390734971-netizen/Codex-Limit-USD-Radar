@@ -126,7 +126,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
 | `turn_context.payload.model` | 识别每次调用使用的模型 |
 | `token_count.info.total_token_usage` | 显示会话累计 token |
 | `token_count.info.last_token_usage` | 逐调用、逐模型计价 |
+| `token_count.info.model_context_window` | 记录日志提供的最大上下文窗口（例如 1,050,000） |
 | `cached_input_tokens` | 计算缓存输入和缓存命中率 |
+| `cache_creation_tokens`、`cache_write_tokens` | 读取可观察的缓存写入 token；字段缺失时不猜测写入量 |
 | `rate_limits.primary`、`rate_limits.secondary` | 识别 5 小时与周额度窗口 |
 | `window_minutes`、`used_percent` | 读取窗口长度和已用百分比 |
 | `reset_at`、`resets_at`、`resets_in_seconds` | 规范化绝对或相对重置时间；支持 Unix 秒、Unix 毫秒和 ISO 时间表示 |
@@ -180,6 +182,8 @@ SQLite 保存轻量文件游标；只把变化文件的新增完整 JSONL 行写
 ```
 
 `output_tokens` 已包含推理输出明细，因此不会再次加上 `reasoning_output_tokens`。
+
+若日志提供 `cache_creation_tokens` 或 `cache_write_tokens`，这些 token 属于未缓存输入，但会从普通未缓存输入中扣出，按输入价的 1.25 倍单独计价；字段缺失时只能计算可观察到的 token。
 
 成本公式：
 
@@ -306,7 +310,7 @@ ALL_TESTS_PASSED
 
 模型名称取决于本机最新日志。如果没有日志，`-Live` 检查会明确失败；这不影响普通合成回归测试。
 
-### 3. 重新构建启动器
+### 5. 重新构建启动器
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
@@ -314,7 +318,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
 
 预期生成项目根目录下的 `TokenRader.exe`。
 
-### 4. 重新生成合成预览图（可选）
+### 6. 重新生成合成预览图（可选）
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Render-Preview.ps1
@@ -392,7 +396,7 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 
 ## 官方价格与计价边界
 
-`pricing.json` 保存标准 API 处理价格，最近核对日期为 **2026-08-28**：
+`pricing.json` 保存标准 API 处理价格，最近核对日期为 **2026-09-01**：
 
 | 模型 | 输入 | 缓存输入 | 输出 |
 |---|---:|---:|---:|
@@ -416,7 +420,7 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 - [GPT-5-Codex](https://developers.openai.com/api/docs/models/gpt-5-codex)
 - [GPT-5](https://developers.openai.com/api/docs/models/gpt-5)
 
-金额是标准 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单，也不能用来推断一个官方固定的 Pro 周美元池。Pro 5x 的百分比不需要再乘 5。估算不包含工具调用费、Fast mode、图片生成、其他共享客户端消耗、区域处理加价和 Priority/Batch/Flex 差异。GPT-5.6 缓存写入按未缓存输入价格的 1.25 倍计费，但 Codex JSONL 无法区分缓存写入 token，因此本地估算不含该项；这些不可观测消耗也会降低额度反推的准确性。
+金额是标准 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单，也不能用来推断一个官方固定的 Pro 周美元池。Pro 5x 的百分比不需要再乘 5。对价格表中明确配置长上下文规则的模型，单次 `input_tokens > 272,000` 时整次请求按输入 2×、输出 1.5×计价；这些模型的 `contextWindow=1,050,000` 只表示最大上下文窗口，不会让所有请求自动套用长上下文价格。当前实现将 JSONL 中可观察到的缓存写入 token 按未缓存输入价格的 1.25 倍计价（GPT-5.6 官方规则采用该倍率）；若 JSONL 提供 `cache_creation_tokens`/`cache_write_tokens`，程序会从普通未缓存输入中扣出并单独计入该项，否则将结果标记为仅可观察 Token，绝不猜测缓存写入量。估算仍不包含工具调用费、Fast mode、图片生成、其他共享客户端消耗、区域处理加价和 Priority/Batch/Flex 差异，这些不可观测消耗会使本地结果低于实际账单。
 
 ## 项目目录结构
 
@@ -459,7 +463,7 @@ Codex-Limit-USD-Radar/
 - 跨项目派生任务缺少父日志时，继承历史的项目归属可能不完整。
 - 派生/子任务累计量包含父历史，因此不直接显示累计美元。
 - 价格表为人工核对的静态快照；官方调价后需要更新 `pricing.json`。
-- API 等价美元不等于套餐账单或官方固定美元池。Fast/Priority、缓存写入、图片/工具、失败请求和其他客户端仍可能使完整窗口API成本及额度估算偏少。
+- API 等价美元不等于套餐账单或官方固定美元池。Fast/Priority、日志未提供的缓存写入、图片/工具、失败请求和其他客户端仍可能使完整窗口 API 成本及额度估算偏少。
 - 当前真实JSONL没有服务端`limit_tokens`，先以本机窗口Token/百分比估算Token容量，再按窗口平均API价换算美元；其他客户端或不可观察消耗会影响该估算。
 - 当前真实`token_count`没有request/response ID，只能按事件顺序继承`turn_id`。程序会标记请求级去重不完整；该标记不会阻止Token容量估算。
 - 开始/结束测量状态和冻结快照只保存在内存中；程序关闭后不能恢复未完成测量。

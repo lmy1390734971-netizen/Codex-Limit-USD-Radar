@@ -127,12 +127,50 @@ function New-TokenRaderUsage {
 function ConvertTo-TokenRaderUsage {
     param([Parameter(Mandatory = $true)]$RawUsage)
 
-    $reasoning = if ($null -ne $RawUsage.PSObject.Properties['reasoning_output_tokens']) { [Int64]$RawUsage.reasoning_output_tokens } else { 0 }
+    $reasoning = if ($null -ne $RawUsage.PSObject.Properties['reasoning_output_tokens']) { ConvertTo-TokenRaderSafeInt64 $RawUsage.reasoning_output_tokens } else { 0L }
+    # Codex has used several names for the cache-read portion over time.  The
+    # canonical cached_input_tokens field wins, then the equivalent
+    # cache_read_tokens/cached_tokens aliases.  Missing cache fields mean zero,
+    # not a malformed usage record.
+    $cachedRaw = $null
+    foreach ($name in @('cached_input_tokens', 'cache_read_tokens', 'cached_tokens')) {
+        if ($null -ne $RawUsage.PSObject.Properties[$name]) {
+            $cachedRaw = $RawUsage.PSObject.Properties[$name].Value
+            break
+        }
+    }
     New-TokenRaderUsage `
-        -InputTokens ([Int64]$RawUsage.input_tokens) `
-        -CachedTokens ([Int64]$RawUsage.cached_input_tokens) `
-        -OutputTokens ([Int64]$RawUsage.output_tokens) `
+        -InputTokens (ConvertTo-TokenRaderSafeInt64 $RawUsage.input_tokens) `
+        -CachedTokens $(if ($null -eq $cachedRaw) { 0L } else { ConvertTo-TokenRaderSafeInt64 $cachedRaw }) `
+        -OutputTokens (ConvertTo-TokenRaderSafeInt64 $RawUsage.output_tokens) `
         -ReasoningOutputTokens $reasoning
+}
+
+# JSON produced by different Codex builds may encode numeric metadata as a
+# number, a numeric string, null, or an unexpected value.  Metadata must never
+# abort an otherwise valid token record, so keep conversion tolerant and
+# return the caller-provided default when the value is not a finite Int64.
+function ConvertTo-TokenRaderSafeInt64 {
+    param(
+        $Value,
+        [Int64]$Default = 0
+    )
+    if ($null -eq $Value -or $Value -is [DBNull]) { return $Default }
+    try {
+        if ($Value -is [string]) {
+            $text = $Value.Trim()
+            if ([string]::IsNullOrWhiteSpace($text)) { return $Default }
+            [Int64]$parsed = 0
+            if ([Int64]::TryParse($text, [Globalization.NumberStyles]::Integer,
+                    [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+                return $parsed
+            }
+            return $Default
+        }
+        return [Convert]::ToInt64($Value, [Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        return $Default
+    }
 }
 
 function Get-TokenRaderSessionIdFromPath {
@@ -269,14 +307,14 @@ function ConvertFrom-TokenRaderUsageTextFast {
     # Builds the same usage object as New-TokenRaderUsage without the
     # function-call and [Math]::* overhead. Regex-extracted values are already
     # non-negative, so the original clamping rules reduce to a single check.
-    $inputMatch = [regex]::Match($InnerText, '"input_tokens"\s*:\s*(\d+)')
-    $cachedMatch = [regex]::Match($InnerText, '"cached_input_tokens"\s*:\s*(\d+)')
-    $outputMatch = [regex]::Match($InnerText, '"output_tokens"\s*:\s*(\d+)')
-    if (-not $inputMatch.Success -or -not $cachedMatch.Success -or -not $outputMatch.Success) { return $null }
-    $reasoningMatch = [regex]::Match($InnerText, '"reasoning_output_tokens"\s*:\s*(\d+)')
+    $inputMatch = [regex]::Match($InnerText, '"input_tokens"\s*:\s*"?(\d+)"?')
+    $cachedMatch = [regex]::Match($InnerText, '"(?:cached_input_tokens|cache_read_tokens|cached_tokens)"\s*:\s*"?(\d+)"?')
+    $outputMatch = [regex]::Match($InnerText, '"output_tokens"\s*:\s*"?(\d+)"?')
+    if (-not $inputMatch.Success -or -not $outputMatch.Success) { return $null }
+    $reasoningMatch = [regex]::Match($InnerText, '"reasoning_output_tokens"\s*:\s*"?(\d+)"?')
 
     $inputTokens = [Int64]$inputMatch.Groups[1].Value
-    $cachedTokens = [Int64]$cachedMatch.Groups[1].Value
+    $cachedTokens = if ($cachedMatch.Success) { [Int64]$cachedMatch.Groups[1].Value } else { 0L }
     $outputTokens = [Int64]$outputMatch.Groups[1].Value
     $reasoningTokens = if ($reasoningMatch.Success) { [Int64]$reasoningMatch.Groups[1].Value } else { 0 }
     if ($cachedTokens -gt $inputTokens) { $cachedTokens = $inputTokens }
@@ -417,9 +455,9 @@ function ConvertFrom-TokenRaderRateWindowTextFast {
         ObservedAt = $ObservedAt
         SourceFile = $SourceFile
         PlanType = $PlanType
-        UsedTokens = if ($usedTokensMatch.Success) { [Int64]$usedTokensMatch.Groups[1].Value } else { $null }
-        RemainingTokens = if ($remainingTokensMatch.Success) { [Int64]$remainingTokensMatch.Groups[1].Value } else { $null }
-        LimitTokens = if ($limitTokensMatch.Success) { [Int64]$limitTokensMatch.Groups[1].Value } else { $null }
+        UsedTokens = if ($usedTokensMatch.Success) { ConvertTo-TokenRaderSafeInt64 $usedTokensMatch.Groups[1].Value } else { $null }
+        RemainingTokens = if ($remainingTokensMatch.Success) { ConvertTo-TokenRaderSafeInt64 $remainingTokensMatch.Groups[1].Value } else { $null }
+        LimitTokens = if ($limitTokensMatch.Success) { ConvertTo-TokenRaderSafeInt64 $limitTokensMatch.Groups[1].Value } else { $null }
     }
 }
 
@@ -444,6 +482,8 @@ function ConvertFrom-TokenRaderTokenLineFast {
     $totalUsage = ConvertFrom-TokenRaderUsageTextFast -InnerText $totalMatch.Groups[1].Value
     $callUsage = ConvertFrom-TokenRaderUsageTextFast -InnerText $lastMatch.Groups[1].Value
     if ($null -eq $totalUsage -or $null -eq $callUsage) { return $null }
+    $contextMatch = [regex]::Match($LineText, '"model_context_window"\s*:\s*"?(\d+)"?')
+    $cacheCreationMatch = [regex]::Match($lastMatch.Groups[1].Value, '"(?:cache_creation_tokens|cache_write_tokens)"\s*:\s*"?(\d+)"?')
 
     $timestamp = [DateTimeOffset]::Now
     try { $timestamp = [DateTimeOffset]::Parse($structure.Groups[1].Value).ToLocalTime() } catch { }
@@ -493,6 +533,9 @@ function ConvertFrom-TokenRaderTokenLineFast {
         Fingerprint = $fingerprint
         UsageFingerprint = $usageFingerprint
         RateLimits = $rateLimits
+        ModelContextWindow = if ($contextMatch.Success) { ConvertTo-TokenRaderSafeInt64 $contextMatch.Groups[1].Value } else { 0L }
+        CacheCreationTokens = if ($cacheCreationMatch.Success) { ConvertTo-TokenRaderSafeInt64 $cacheCreationMatch.Groups[1].Value } else { 0L }
+        CacheWriteObservable = $cacheCreationMatch.Success
     }
 }
 
@@ -551,6 +594,9 @@ function Add-TokenRaderLineEvent {
     $timestamp = [DateTimeOffset]::Now
     try { $timestamp = [DateTimeOffset]::Parse([string]$record.timestamp).ToLocalTime() } catch { }
     $rateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $(if ($null -ne $record.payload.PSObject.Properties['rate_limits']) { $record.payload.rate_limits } else { $null }) -ObservedAt $timestamp -SourceFile ([string]$State.SourceFile)
+    $contextWindow = if ($null -ne $info.PSObject.Properties['model_context_window']) { ConvertTo-TokenRaderSafeInt64 $info.model_context_window } else { 0L }
+    $cacheCreationTokens = if ($null -ne $info.last_token_usage.PSObject.Properties['cache_creation_tokens']) { ConvertTo-TokenRaderSafeInt64 $info.last_token_usage.cache_creation_tokens } elseif ($null -ne $info.last_token_usage.PSObject.Properties['cache_write_tokens']) { ConvertTo-TokenRaderSafeInt64 $info.last_token_usage.cache_write_tokens } else { 0L }
+    $cacheWriteObservable = $null -ne $info.last_token_usage.PSObject.Properties['cache_creation_tokens'] -or $null -ne $info.last_token_usage.PSObject.Properties['cache_write_tokens']
     $fingerprint = New-TokenRaderEventFingerprint -Timestamp $timestamp -Model ([string]$State.Model) -TotalUsage $totalUsage -CallUsage $callUsage
     $usageFingerprint = New-TokenRaderUsageFingerprint -TotalUsage $totalUsage -CallUsage $callUsage
     [void]$Events.Add([pscustomobject]@{
@@ -561,6 +607,9 @@ function Add-TokenRaderLineEvent {
         Fingerprint = $fingerprint
         UsageFingerprint = $usageFingerprint
         RateLimits = $rateLimits
+        ModelContextWindow = $contextWindow
+        CacheCreationTokens = $cacheCreationTokens
+        CacheWriteObservable = $cacheWriteObservable
     })
 }
 
@@ -838,6 +887,22 @@ function Get-TokenRaderUsageSnapshot {
     try { $timestamp = [DateTimeOffset]::Parse([string]$tokenRecord.timestamp).ToLocalTime() } catch { $timestamp = [DateTimeOffset]::Now }
     $snapshotRateLimits = if ($null -ne $latestRateLimits) { $latestRateLimits } else { $latestRateLimitsFallback }
     $planType = if ($null -ne $snapshotRateLimits) { [string]$snapshotRateLimits.PlanType } else { '' }
+    # Older or synthetic token_count records may omit the model context
+    # window. Keep that metadata explicitly unknown instead of dereferencing
+    # an uninitialised variable under StrictMode.
+    [Int64]$contextWindow = 0L
+    if ($null -ne $info.PSObject.Properties['model_context_window']) {
+        $contextWindow = ConvertTo-TokenRaderSafeInt64 $info.model_context_window
+    }
+    $cacheCreationTokens = 0L
+    $cacheWriteObservable = $false
+    foreach ($name in @('cache_creation_tokens', 'cache_write_tokens')) {
+        if ($null -ne $info.last_token_usage.PSObject.Properties[$name]) {
+            $cacheCreationTokens = [Math]::Max(0L, (ConvertTo-TokenRaderSafeInt64 $info.last_token_usage.PSObject.Properties[$name].Value))
+            $cacheWriteObservable = $true
+            break
+        }
+    }
 
     [pscustomobject]@{
         FilePath = $FilePath
@@ -847,7 +912,10 @@ function Get-TokenRaderUsageSnapshot {
         RateLimits = $snapshotRateLimits
         Task = ConvertTo-TokenRaderUsage $info.total_token_usage
         Call = ConvertTo-TokenRaderUsage $info.last_token_usage
-        ContextWindow = [Int64]$info.model_context_window
+        ContextWindow = $contextWindow
+        ModelContextWindow = $contextWindow
+        CacheCreationTokens = $cacheCreationTokens
+        CacheWriteObservable = $cacheWriteObservable
         TailLinesRead = $lines.Count
         TokenRecordIndex = $tokenIndex
     }
@@ -955,12 +1023,40 @@ function Resolve-TokenRaderPrice {
     return $null
 }
 
+function Resolve-TokenRaderLongContextPricing {
+    param(
+        [Parameter(Mandatory = $true)]$Price,
+        [Parameter(Mandatory = $true)]$Usage,
+        [ValidateSet('task', 'call')][string]$Scope = 'task',
+        [Int64]$ModelContextWindow = 0,
+        [Int64]$LongContextThreshold = 0,
+        [Nullable[bool]]$LongContextApplied = $null
+    )
+    $threshold = if ($LongContextThreshold -gt 0) { $LongContextThreshold } elseif ($null -ne $Price.PSObject.Properties['longContextThreshold']) { [Int64]$Price.longContextThreshold } else { 0L }
+    $applied = if ($null -ne $LongContextApplied) { [bool]$LongContextApplied } else {
+        $Scope -eq 'call' -and $threshold -gt 0L -and [Int64]$Usage.Input -gt $threshold
+    }
+    [pscustomobject]@{
+        Applied = $applied
+        Threshold = if ($threshold -gt 0L) { $threshold } else { $null }
+        ContextWindow = if ($ModelContextWindow -gt 0L) { $ModelContextWindow } else { $null }
+        Source = if ($threshold -gt 0L) { 'pricing_threshold' } else { 'no_threshold' }
+        InputMultiplier = if ($applied) { if ($null -ne $Price.PSObject.Properties['longContextInputMultiplier']) { [double]$Price.longContextInputMultiplier } else { 2.0 } } else { 1.0 }
+        OutputMultiplier = if ($applied) { if ($null -ne $Price.PSObject.Properties['longContextOutputMultiplier']) { [double]$Price.longContextOutputMultiplier } else { 1.5 } } else { 1.0 }
+    }
+}
+
 function Get-TokenRaderCost {
     param(
         [Parameter(Mandatory = $true)]$Usage,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Model,
         [Parameter(Mandatory = $true)]$PricingDocument,
-        [ValidateSet('task', 'call')][string]$Scope = 'task'
+        [ValidateSet('task', 'call')][string]$Scope = 'task',
+        [Int64]$ModelContextWindow = 0,
+        [Int64]$LongContextThreshold = 0,
+        [Nullable[bool]]$LongContextApplied = $null,
+        [Int64]$CacheCreationTokens = 0,
+        [Nullable[bool]]$CacheWriteObservable = $null
     )
 
     $price = Resolve-TokenRaderPrice -Model $Model -PricingDocument $PricingDocument
@@ -973,26 +1069,33 @@ function Get-TokenRaderCost {
             CachedCost = $null
             OutputCost = $null
             TotalCost = $null
+            CacheCreationCost = [double]0
+            CacheWriteObservable = $false
+            CostCoverage = 'observable_tokens_only'
             LongContextApplied = $false
             InputMultiplier = 1.0
             OutputMultiplier = 1.0
+            ModelContextWindow = if ($ModelContextWindow -gt 0) { $ModelContextWindow } else { $null }
+            LongContextThreshold = if ($LongContextThreshold -gt 0) { $LongContextThreshold } else { $null }
+            LongContextSource = 'unknown_model'
         }
     }
 
-    $inputMultiplier = 1.0
-    $outputMultiplier = 1.0
-    $longContextApplied = $false
-    $threshold = if ($null -ne $price.PSObject.Properties['longContextThreshold']) { [Int64]$price.longContextThreshold } else { 0 }
-    if ($Scope -eq 'call' -and $threshold -gt 0 -and [Int64]$Usage.Input -gt $threshold) {
-        $inputMultiplier = if ($null -ne $price.PSObject.Properties['longContextInputMultiplier']) { [double]$price.longContextInputMultiplier } else { 2.0 }
-        $outputMultiplier = if ($null -ne $price.PSObject.Properties['longContextOutputMultiplier']) { [double]$price.longContextOutputMultiplier } else { 1.5 }
-        $longContextApplied = $true
-    }
+    $longContext = Resolve-TokenRaderLongContextPricing -Price $price -Usage $Usage -Scope $Scope -ModelContextWindow $ModelContextWindow -LongContextThreshold $LongContextThreshold -LongContextApplied $LongContextApplied
+    $inputMultiplier = [double]$longContext.InputMultiplier
+    $outputMultiplier = [double]$longContext.OutputMultiplier
 
     $unitTokens = if ($null -ne $PricingDocument.PSObject.Properties['unitTokens'] -and [double]$PricingDocument.unitTokens -gt 0) {
         [double]$PricingDocument.unitTokens
     } else { 1000000.0 }
-    $inputCost = ([double]$Usage.Uncached / $unitTokens) * [double]$price.input * $inputMultiplier
+    # Cache creation/write tokens are a subset of uncached input. Price them
+    # once at the official 1.25x write rate, then price only the remainder at
+    # the normal input rate. This keeps task, call, interval, project and
+    # history paths on the same formula.
+    [Int64]$cacheCreation = [Math]::Min([Math]::Max([Int64]0, $CacheCreationTokens), [Math]::Max([Int64]0, [Int64]$Usage.Uncached))
+    [Int64]$ordinaryUncached = [Math]::Max([Int64]0, [Int64]$Usage.Uncached - $cacheCreation)
+    $cacheCreationCost = ([double]$cacheCreation / $unitTokens) * [double]$price.input * 1.25 * $inputMultiplier
+    $inputCost = ([double]$ordinaryUncached / $unitTokens) * [double]$price.input * $inputMultiplier + $cacheCreationCost
     $cachedCost = ([double]$Usage.Cached / $unitTokens) * [double]$price.cachedInput * $inputMultiplier
     $outputCost = ([double]$Usage.Output / $unitTokens) * [double]$price.output * $outputMultiplier
 
@@ -1004,9 +1107,15 @@ function Get-TokenRaderCost {
         CachedCost = $cachedCost
         OutputCost = $outputCost
         TotalCost = $inputCost + $cachedCost + $outputCost
-        LongContextApplied = $longContextApplied
+        CacheCreationCost = $cacheCreationCost
+        CacheWriteObservable = if ($null -ne $CacheWriteObservable) { [bool]$CacheWriteObservable } else { $false }
+        CostCoverage = if ($null -ne $CacheWriteObservable -and [bool]$CacheWriteObservable) { 'observable_tokens_and_cache_write' } else { 'observable_tokens_only' }
+        LongContextApplied = [bool]$longContext.Applied
         InputMultiplier = $inputMultiplier
         OutputMultiplier = $outputMultiplier
+        ModelContextWindow = $longContext.ContextWindow
+        LongContextThreshold = $longContext.Threshold
+        LongContextSource = $longContext.Source
     }
 }
 
@@ -1226,10 +1335,20 @@ function Get-TokenRaderIntervalResult {
     [double]$inputCost = 0
     [double]$cachedCost = 0
     [double]$outputCost = 0
+    [double]$cacheCreationCost = 0
+    [Int64]$standardContextEvents = 0
+    [Int64]$longContextEvents = 0
+    [Int64]$standardContextInput = 0
+    [Int64]$longContextInput = 0
+    [Int64]$longContextOutput = 0
+    [double]$longContextExtraCost = 0
+    $cacheWriteObservable = $true
     [Int64]$rawEventCount = 0
     [Int64]$countedEventCount = 0
     [Int64]$duplicateEventCount = 0
     [Int64]$inheritedEventCount = 0
+    $firstCountedAt = $null
+    $lastCountedAt = $null
     [Int64]$bytesRead = 0
     $seenEvents = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
     $rootHistoryEvents = @{}
@@ -1308,7 +1427,11 @@ function Get-TokenRaderIntervalResult {
                 continue
             }
             [void]$rootHistory.Add($usageFingerprint)
-            $eventKey = ([string]$change.RootId) + '|' + ([string]$event.Fingerprint)
+            # Fingerprints produced by the parser include timestamp/model for
+            # display/debugging. Lineage identity must use token usage only so
+            # a copied parent/child call remains deduplicated across model
+            # attribution and serialization-time differences.
+            $eventKey = ([string]$change.RootId) + '|' + $usageFingerprint
             if (-not $seenEvents.Add($eventKey)) {
                 $duplicateEventCount++
                 continue
@@ -1316,6 +1439,8 @@ function Get-TokenRaderIntervalResult {
             $call = $event.Call
             if ([Int64]$call.Input -le 0 -and [Int64]$call.Output -le 0) { continue }
             $countedEventCount++
+            if ($null -eq $firstCountedAt -or $event.Timestamp -lt $firstCountedAt) { $firstCountedAt = $event.Timestamp }
+            if ($null -eq $lastCountedAt -or $event.Timestamp -gt $lastCountedAt) { $lastCountedAt = $event.Timestamp }
             $aggregateInput += [Int64]$call.Input
             $cached += [Int64]$call.Cached
             $output += [Int64]$call.Output
@@ -1331,6 +1456,15 @@ function Get-TokenRaderIntervalResult {
             if ($null -ne $price -and $null -ne $price.PSObject.Properties['longContextThreshold']) {
                 $longContext = ([Int64]$price.longContextThreshold -gt 0 -and [Int64]$call.Input -gt [Int64]$price.longContextThreshold)
             }
+            if ($null -ne $event.PSObject.Properties['CacheWriteObservable'] -and -not [bool]$event.CacheWriteObservable) { $cacheWriteObservable = $false }
+            if ($longContext) {
+                $longContextEvents++
+                $longContextInput += [Int64]$call.Input
+                $longContextOutput += [Int64]$call.Output
+            } else {
+                $standardContextEvents++
+                $standardContextInput += [Int64]$call.Input
+            }
             $bucketKey = $model.ToLowerInvariant() + '|' + $(if ($longContext) { 'long' } else { 'standard' })
             if (-not $costBuckets.ContainsKey($bucketKey)) {
                 $costBuckets[$bucketKey] = [pscustomobject]@{
@@ -1340,6 +1474,8 @@ function Get-TokenRaderIntervalResult {
                     Cached = [Int64]0
                     Output = [Int64]0
                     Reasoning = [Int64]0
+                    CacheCreationTokens = [Int64]0
+                    CacheWriteObservable = $true
                     Events = [Int64]0
                 }
             }
@@ -1348,6 +1484,13 @@ function Get-TokenRaderIntervalResult {
             $bucket.Cached += [Int64]$call.Cached
             $bucket.Output += [Int64]$call.Output
             $bucket.Reasoning += [Int64]$call.ReasoningOutput
+            if ($null -ne $event.PSObject.Properties['CacheCreationTokens']) {
+                $bucket.CacheCreationTokens += [Int64]$event.CacheCreationTokens
+            }
+            if ($null -eq $event.PSObject.Properties['CacheWriteObservable'] -or
+                -not [bool]$event.CacheWriteObservable) {
+                $bucket.CacheWriteObservable = $false
+            }
             $bucket.Events++
         }
     }
@@ -1355,22 +1498,25 @@ function Get-TokenRaderIntervalResult {
     $items = New-Object System.Collections.ArrayList
     foreach ($bucket in @($costBuckets.Values)) {
         $bucketUsage = New-TokenRaderUsage -InputTokens $bucket.Input -CachedTokens $bucket.Cached -OutputTokens $bucket.Output -ReasoningOutputTokens $bucket.Reasoning
-        $cost = Get-TokenRaderCost -Usage $bucketUsage -Model ([string]$bucket.Model) -PricingDocument $PricingDocument -Scope task
+        $cost = Get-TokenRaderCost -Usage $bucketUsage -Model ([string]$bucket.Model) -PricingDocument $PricingDocument `
+            -Scope call -LongContextApplied ([bool]$bucket.LongContext) `
+            -CacheCreationTokens ([Int64]$bucket.CacheCreationTokens) `
+            -CacheWriteObservable ([bool]$bucket.CacheWriteObservable)
         if ($cost.Known) {
             $bucketInputCost = [double]$cost.InputCost
             $bucketCachedCost = [double]$cost.CachedCost
             $bucketOutputCost = [double]$cost.OutputCost
-            if ([bool]$bucket.LongContext) {
-                $price = $cost.Price
-                $inputMultiplier = if ($null -ne $price.PSObject.Properties['longContextInputMultiplier']) { [double]$price.longContextInputMultiplier } else { 2.0 }
-                $outputMultiplier = if ($null -ne $price.PSObject.Properties['longContextOutputMultiplier']) { [double]$price.longContextOutputMultiplier } else { 1.5 }
-                $bucketInputCost *= $inputMultiplier
-                $bucketCachedCost *= $inputMultiplier
-                $bucketOutputCost *= $outputMultiplier
-            }
+            $cacheCreationCost += [double]$cost.CacheCreationCost
             $inputCost += $bucketInputCost
             $cachedCost += $bucketCachedCost
             $outputCost += $bucketOutputCost
+            if ([bool]$bucket.LongContext) {
+                [double]$standardInputCost = if ([double]$cost.InputMultiplier -gt 0) { $bucketInputCost / [double]$cost.InputMultiplier } else { $bucketInputCost }
+                [double]$standardCachedCost = if ([double]$cost.InputMultiplier -gt 0) { $bucketCachedCost / [double]$cost.InputMultiplier } else { $bucketCachedCost }
+                [double]$standardOutputCost = if ([double]$cost.OutputMultiplier -gt 0) { $bucketOutputCost / [double]$cost.OutputMultiplier } else { $bucketOutputCost }
+                $longContextExtraCost += ($bucketInputCost + $bucketCachedCost + $bucketOutputCost) -
+                    ($standardInputCost + $standardCachedCost + $standardOutputCost)
+            }
         } else {
             $unknownLabel = if ([string]::IsNullOrWhiteSpace([string]$bucket.Model)) { '未知模型' } else { [string]$bucket.Model }
             [void]$unknownModels.Add($unknownLabel)
@@ -1417,6 +1563,7 @@ function Get-TokenRaderIntervalResult {
         CachedCost = $cachedCost
         OutputCost = $outputCost
         TotalCost = $inputCost + $cachedCost + $outputCost
+        CacheCreationCost = $cacheCreationCost
         PricingComplete = $pricingComplete
         CostComplete = $pricingComplete
         UnknownModels = @($unknownModels | Sort-Object)
@@ -1430,6 +1577,16 @@ function Get-TokenRaderIntervalResult {
         BytesRead = $bytesRead
         Signature = ConvertTo-TokenRaderSignature -Parts $signatureParts
         BaselineSnapshots = if ($null -ne $BaselineSnapshots) { $BaselineSnapshots } else { @{} }
+        FirstCountedAt = $firstCountedAt
+        LastCountedAt = $lastCountedAt
+        StandardContextEvents = $standardContextEvents
+        LongContextEvents = $longContextEvents
+        StandardContextInput = $standardContextInput
+        LongContextInput = $longContextInput
+        LongContextOutput = $longContextOutput
+        LongContextExtraCost = $longContextExtraCost
+        CacheWriteObservable = $cacheWriteObservable
+        CostCoverage = if ($cacheWriteObservable) { 'observable_tokens_and_cache_write' } else { 'observable_tokens_only' }
     }
 }
 
@@ -1479,6 +1636,15 @@ function Get-TokenRaderProjectResult {
                 CachedCost = [double]$priced.CachedCost
                 OutputCost = [double]$priced.OutputCost
                 TotalCost = [double]$priced.TotalCost
+                CacheCreationCost = [double]$priced.CacheCreationCost
+                StandardContextEvents = [Int64]$priced.StandardContextEvents
+                LongContextEvents = [Int64]$priced.LongContextEvents
+                StandardContextInput = [Int64]$priced.StandardContextInput
+                LongContextInput = [Int64]$priced.LongContextInput
+                LongContextOutput = [Int64]$priced.LongContextOutput
+                LongContextExtraCost = [double]$priced.LongContextExtraCost
+                CacheWriteObservable = [bool]$priced.CacheWriteObservable
+                CostCoverage = [string]$priced.CostCoverage
                 PricingComplete = [bool]$priced.PricingComplete
                 CostComplete = [bool]$priced.CostComplete
                 UnknownModels = @($priced.UnknownModels)
@@ -2557,10 +2723,20 @@ function ConvertFrom-TokenRaderIndexRecord {
         Weekly = $weekly
     }
 
+    $recordModel = [string]$Row['model']
+    [Int64]$recordLongThreshold = if ($Row.Table.Columns.Contains('long_context_threshold') -and -not [DBNull]::Value.Equals($Row['long_context_threshold'])) { [Int64]$Row['long_context_threshold'] } else { 0L }
+    $recordLongSource = if ($Row.Table.Columns.Contains('long_context_source')) { [string]$Row['long_context_source'] } else { '' }
+    if (@('pricing_threshold', 'no_threshold', 'unknown_model', 'missing_input') -notcontains $recordLongSource) {
+        $recordLongSource = if ($callInput -le 0L) { 'missing_input' }
+                            elseif ([string]::IsNullOrWhiteSpace($recordModel)) { 'unknown_model' }
+                            elseif ($recordLongThreshold -gt 0L) { 'pricing_threshold' }
+                            else { 'no_threshold' }
+    }
+
     [pscustomobject]@{
         FilePath = $FilePath
         Timestamp = $timestamp
-        Model = [string]$Row['model']
+        Model = $recordModel
         ModelSource = if ($Row.Table.Columns.Contains('model_source')) { [string]$Row['model_source'] } else { '' }
         TurnId = if ($Row.Table.Columns.Contains('turn_id')) { [string]$Row['turn_id'] } else { '' }
         RequestId = if ($Row.Table.Columns.Contains('request_id')) { [string]$Row['request_id'] } else { '' }
@@ -2568,6 +2744,12 @@ function ConvertFrom-TokenRaderIndexRecord {
         IdentitySource = if ($Row.Table.Columns.Contains('identity_source')) { [string]$Row['identity_source'] } else { '' }
         ServiceTier = if ($Row.Table.Columns.Contains('service_tier')) { [string]$Row['service_tier'] } else { '' }
         ReasoningEffort = if ($Row.Table.Columns.Contains('reasoning_effort')) { [string]$Row['reasoning_effort'] } else { '' }
+        ModelContextWindow = if ($Row.Table.Columns.Contains('model_context_window') -and -not [DBNull]::Value.Equals($Row['model_context_window'])) { [Int64]$Row['model_context_window'] } else { $null }
+        LongContextThreshold = if ($recordLongThreshold -gt 0L) { $recordLongThreshold } else { $null }
+        LongContextApplied = if ($Row.Table.Columns.Contains('long_context_applied')) { [bool]([int]$Row['long_context_applied']) } else { $false }
+        LongContextSource = $recordLongSource
+        CacheCreationTokens = if ($Row.Table.Columns.Contains('cache_creation_tokens')) { [Int64]$Row['cache_creation_tokens'] } else { 0L }
+        CacheWriteObservable = if ($Row.Table.Columns.Contains('cache_write_observable')) { [bool]([int]$Row['cache_write_observable']) } else { $false }
         PlanType = [string]$Row['plan_type']
         RateLimits = $rateLimits
         Task = [pscustomobject]@{
@@ -2588,7 +2770,7 @@ function ConvertFrom-TokenRaderIndexRecord {
             Total = $callTotal
             CacheHitRate = $callHitRate
         }
-        ContextWindow = [Int64]0
+        ContextWindow = if ($Row.Table.Columns.Contains('model_context_window') -and -not [DBNull]::Value.Equals($Row['model_context_window'])) { [Int64]$Row['model_context_window'] } else { [Int64]0 }
         TailLinesRead = 0
         TokenRecordIndex = 0
         RecordId = if ($Row.Table.Columns.Contains('id')) { [Int64]$Row['id'] } else { 0L }
@@ -2912,11 +3094,20 @@ function ConvertFrom-TokenRaderPricedAggregate {
     [double]$inputCost = 0
     [double]$cachedCost = 0
     [double]$outputCost = 0
+    [double]$cacheCreationCost = 0
+    [double]$longContextExtraCost = 0
+    [Int64]$standardContextEvents = 0
+    [Int64]$longContextEvents = 0
+    [Int64]$standardContextInput = 0
+    [Int64]$longContextInput = 0
+    [Int64]$longContextOutput = 0
+    $cacheWriteObservable = $true
     $priceCache = @{}
     $unitTokens = if ($null -ne $PricingDocument.PSObject.Properties['unitTokens'] -and [double]$PricingDocument.unitTokens -gt 0) {
         [double]$PricingDocument.unitTokens
     } else { 1000000.0 }
     $items = foreach ($bucket in @($Aggregate.Buckets)) {
+        if ($null -eq $bucket.PSObject.Properties['CacheWriteObservable'] -or -not [bool]$bucket.CacheWriteObservable) { $cacheWriteObservable = $false }
         $bucketUsage = New-TokenRaderUsage -InputTokens $bucket.Input -CachedTokens $bucket.Cached -OutputTokens $bucket.Output -ReasoningOutputTokens $bucket.Reasoning
         $model = [string]$bucket.Model
         if (-not $priceCache.ContainsKey($model)) { $priceCache[$model] = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument }
@@ -2925,6 +3116,7 @@ function ConvertFrom-TokenRaderPricedAggregate {
         [double]$bucketInputCost = 0
         [double]$bucketCachedCost = 0
         [double]$bucketOutputCost = 0
+        [double]$bucketCacheCreationCost = 0
         [double]$inputMultiplier = 1.0
         [double]$outputMultiplier = 1.0
         if ($known) {
@@ -2932,12 +3124,29 @@ function ConvertFrom-TokenRaderPricedAggregate {
                 $inputMultiplier = if ($null -ne $price.PSObject.Properties['longContextInputMultiplier']) { [double]$price.longContextInputMultiplier } else { 2.0 }
                 $outputMultiplier = if ($null -ne $price.PSObject.Properties['longContextOutputMultiplier']) { [double]$price.longContextOutputMultiplier } else { 1.5 }
             }
-            $bucketInputCost = ([double]$bucketUsage.Uncached / $unitTokens) * [double]$price.input * $inputMultiplier
+            [Int64]$bucketCacheCreationTokens = if ($null -ne $bucket.PSObject.Properties['CacheCreationTokens']) { [Math]::Min([Int64]$bucket.CacheCreationTokens, [Int64]$bucketUsage.Uncached) } else { 0L }
+            [Int64]$ordinaryUncached = [Math]::Max([Int64]0, [Int64]$bucketUsage.Uncached - $bucketCacheCreationTokens)
+            $bucketInputCost = ([double]$ordinaryUncached / $unitTokens) * [double]$price.input * $inputMultiplier
+            $bucketCacheCreationCost = ([double]$bucketCacheCreationTokens / $unitTokens) * [double]$price.input * 1.25 * $inputMultiplier
+            $bucketInputCost += $bucketCacheCreationCost
             $bucketCachedCost = ([double]$bucketUsage.Cached / $unitTokens) * [double]$price.cachedInput * $inputMultiplier
             $bucketOutputCost = ([double]$bucketUsage.Output / $unitTokens) * [double]$price.output * $outputMultiplier
             $inputCost += $bucketInputCost
+            $cacheCreationCost += $bucketCacheCreationCost
             $cachedCost += $bucketCachedCost
             $outputCost += $bucketOutputCost
+            if ([bool]$bucket.LongContext) {
+                $longContextEvents += [Int64]$bucket.Events
+                $longContextInput += [Int64]$bucketUsage.Input
+                $longContextOutput += [Int64]$bucketUsage.Output
+                $standardInputCost = ([double]$ordinaryUncached / $unitTokens) * [double]$price.input + ([double]$bucketCacheCreationTokens / $unitTokens) * [double]$price.input * 1.25
+                $standardCachedCost = ([double]$bucketUsage.Cached / $unitTokens) * [double]$price.cachedInput
+                $standardOutputCost = ([double]$bucketUsage.Output / $unitTokens) * [double]$price.output
+                $longContextExtraCost += ([double]$bucketInputCost + [double]$bucketCachedCost + [double]$bucketOutputCost) - ($standardInputCost + $standardCachedCost + $standardOutputCost)
+            } else {
+                $standardContextEvents += [Int64]$bucket.Events
+                $standardContextInput += [Int64]$bucketUsage.Input
+            }
         } else {
             [void]$unknownModels.Add($(if ([string]::IsNullOrWhiteSpace($model)) { '未知模型' } else { $model }))
         }
@@ -2946,13 +3155,23 @@ function ConvertFrom-TokenRaderPricedAggregate {
             LongContext = [bool]$bucket.LongContext
             Usage = $bucketUsage
             Events = [Int64]$bucket.Events
+            ModelContextWindow = if ($null -ne $bucket.PSObject.Properties['ModelContextWindow']) { [Int64]$bucket.ModelContextWindow } else { 0L }
+            LongContextThreshold = if ($null -ne $bucket.PSObject.Properties['LongContextThreshold']) { [Int64]$bucket.LongContextThreshold } else { 0L }
+            LongContextSource = if ($null -ne $bucket.PSObject.Properties['LongContextSource']) { [string]$bucket.LongContextSource } else { '' }
+            CacheWriteObservable = if ($null -ne $bucket.PSObject.Properties['CacheWriteObservable']) { [bool]$bucket.CacheWriteObservable } else { $false }
             Cost = [pscustomobject]@{
                 Known = $known; Model = $model; Price = $price
                 InputCost = $bucketInputCost; CachedCost = $bucketCachedCost; OutputCost = $bucketOutputCost
                 TotalCost = $bucketInputCost + $bucketCachedCost + $bucketOutputCost
+                CacheCreationCost = $bucketCacheCreationCost
                 LongContextApplied = [bool]$bucket.LongContext
                 InputMultiplier = $inputMultiplier
                 OutputMultiplier = $outputMultiplier
+                ModelContextWindow = if ($null -ne $bucket.PSObject.Properties['ModelContextWindow']) { [Int64]$bucket.ModelContextWindow } else { $null }
+                LongContextThreshold = if ($null -ne $bucket.PSObject.Properties['LongContextThreshold']) { [Int64]$bucket.LongContextThreshold } else { $null }
+                LongContextSource = if ($null -ne $bucket.PSObject.Properties['LongContextSource']) { [string]$bucket.LongContextSource } else { '' }
+                CacheWriteObservable = if ($null -ne $bucket.PSObject.Properties['CacheWriteObservable']) { [bool]$bucket.CacheWriteObservable } else { $false }
+                CostCoverage = if ($null -ne $bucket.PSObject.Properties['CacheWriteObservable'] -and [bool]$bucket.CacheWriteObservable) { 'observable_tokens_and_cache_write' } else { 'observable_tokens_only' }
             }
         }
     }
@@ -2966,10 +3185,19 @@ function ConvertFrom-TokenRaderPricedAggregate {
         InputCost = $inputCost
         CachedCost = $cachedCost
         OutputCost = $outputCost
+        CacheCreationCost = $cacheCreationCost
         TotalCost = $inputCost + $cachedCost + $outputCost
         PricingComplete = $unknownModels.Count -eq 0
         CostComplete = $unknownModels.Count -eq 0
         UnknownModels = @($unknownModels | Sort-Object)
+        StandardContextEvents = $standardContextEvents
+        LongContextEvents = $longContextEvents
+        StandardContextInput = $standardContextInput
+        LongContextInput = $longContextInput
+        LongContextOutput = $longContextOutput
+        LongContextExtraCost = $longContextExtraCost
+        CacheWriteObservable = $cacheWriteObservable
+        CostCoverage = if ($cacheWriteObservable) { 'observable_tokens_and_cache_write' } else { 'observable_tokens_only' }
     }
 }
 
@@ -2986,11 +3214,26 @@ function Get-TokenRaderQuotaWindowEvidence {
         [hashtable]$ProgressState,
         [hashtable]$Cache
     )
-    if ($null -eq $EndWindow -or $null -eq $EndWindow.PSObject.Properties['ObservedAt'] -or
-        $null -eq $EndWindow.ResetsAt -or [int]$EndWindow.WindowMinutes -le 0) { return $null }
+    # Quota evidence is bounded by the two observed snapshots, not by the
+    # beginning of the provider's rolling window.  Using
+    # reset_at-window_minutes here would include every call since the quota
+    # window opened and is the primary way an estimate can be inflated by an
+    # order of magnitude.  Both endpoints must carry reliable identity data so
+    # a reset or account/plan switch cannot be mistaken for usage in one span.
+    if ($null -eq $StartWindow -or $null -eq $EndWindow -or
+        $null -eq $StartWindow.PSObject.Properties['ObservedAt'] -or
+        $null -eq $EndWindow.PSObject.Properties['ObservedAt'] -or
+        $null -eq $StartWindow.ResetsAt -or $null -eq $EndWindow.ResetsAt -or
+        [int]$StartWindow.WindowMinutes -le 0 -or [int]$EndWindow.WindowMinutes -le 0) { return $null }
+    $startObservedAt = [DateTimeOffset]$StartWindow.ObservedAt
     $endObservedAt = [DateTimeOffset]$EndWindow.ObservedAt
-    $windowStartAt = ([DateTimeOffset]$EndWindow.ResetsAt).AddMinutes(-[int]$EndWindow.WindowMinutes)
-    $boundaryValid = $endObservedAt -gt $windowStartAt
+    $windowStartAt = $startObservedAt
+    $sameWindow = [int]$StartWindow.WindowMinutes -eq [int]$EndWindow.WindowMinutes
+    $samePlan = [string]::Equals([string]$StartWindow.PlanType, [string]$EndWindow.PlanType, [StringComparison]::OrdinalIgnoreCase)
+    $startReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$StartWindow.WindowMinutes) -ResetsAt $StartWindow.ResetsAt
+    $endReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$EndWindow.WindowMinutes) -ResetsAt $EndWindow.ResetsAt
+    $sameReset = -not [string]::IsNullOrWhiteSpace($startReset) -and [string]::Equals($startReset, $endReset, [StringComparison]::Ordinal)
+    $boundaryValid = $sameWindow -and $samePlan -and $sameReset -and $endObservedAt -gt $startObservedAt
     if ($boundaryValid -and $null -ne $MainLastCountedAt) {
         $boundaryValid = $endObservedAt -ge [DateTimeOffset]$MainLastCountedAt
     }
@@ -2998,7 +3241,7 @@ function Get-TokenRaderQuotaWindowEvidence {
         return [pscustomobject]@{
             BoundaryValid = $false
             CoverageComplete = $false
-            StartObservedAt = $windowStartAt
+            StartObservedAt = $startObservedAt
             EndObservedAt = $endObservedAt
             Usage = New-TokenRaderUsage
             InputCost = [double]0
@@ -3033,7 +3276,7 @@ function Get-TokenRaderQuotaWindowEvidence {
         $Cache[$cacheKey]
     } else {
         $value = [TokenRaderIndexer]::AggregateTimeRangeRecordsAtOffsets(
-            $Connection, $EndOffsets, $windowStartAt, $endObservedAt,
+            $Connection, $EndOffsets, $startObservedAt, $endObservedAt,
             $Thresholds, $CancellationToken, $ProgressState)
         if ($null -ne $Cache) { $Cache[$cacheKey] = $value }
         $value
@@ -3077,19 +3320,28 @@ function Get-TokenRaderQuotaWindowEvidence {
     [pscustomobject]@{
         BoundaryValid = $true
         CoverageComplete = $true
-        StartObservedAt = $windowStartAt
+        StartObservedAt = $startObservedAt
         EndObservedAt = $endObservedAt
         Usage = $priced.Usage
         InputCost = [double]$priced.InputCost
         CachedCost = [double]$priced.CachedCost
         OutputCost = [double]$priced.OutputCost
         TotalCost = [double]$priced.TotalCost
+        CacheCreationCost = [double]$priced.CacheCreationCost
         PricingComplete = [bool]$priced.PricingComplete
         CostComplete = [bool]$priced.CostComplete
         UnknownModels = @($priced.UnknownModels)
         CountedEvents = [Int64]$aggregate.CountedEvents
         FirstCountedAt = $aggregate.FirstCountedAt
         LastCountedAt = $aggregate.LastCountedAt
+        StandardContextEvents = [Int64]$priced.StandardContextEvents
+        LongContextEvents = [Int64]$priced.LongContextEvents
+        StandardContextInput = [Int64]$priced.StandardContextInput
+        LongContextInput = [Int64]$priced.LongContextInput
+        LongContextOutput = [Int64]$priced.LongContextOutput
+        LongContextExtraCost = [double]$priced.LongContextExtraCost
+        CacheWriteObservable = [bool]$priced.CacheWriteObservable
+        CostCoverage = [string]$priced.CostCoverage
         ProcessingMilliseconds = [double]$aggregate.ProcessingMilliseconds
         ObservedTokens = $observedTokens
         TotalTokens = $totalTokens
@@ -3213,6 +3465,14 @@ function Get-TokenRaderIndexedIntervalResult {
         ProcessingMilliseconds = [double]$aggregate.ProcessingMilliseconds
         FirstCountedAt = $aggregate.FirstCountedAt
         LastCountedAt = $aggregate.LastCountedAt
+        StandardContextEvents = [Int64]$priced.StandardContextEvents
+        LongContextEvents = [Int64]$priced.LongContextEvents
+        StandardContextInput = [Int64]$priced.StandardContextInput
+        LongContextInput = [Int64]$priced.LongContextInput
+        LongContextOutput = [Int64]$priced.LongContextOutput
+        LongContextExtraCost = [double]$priced.LongContextExtraCost
+        CacheWriteObservable = [bool]$priced.CacheWriteObservable
+        CostCoverage = [string]$priced.CostCoverage
         IndexRevision = if ($null -ne $EndRevision) { [Int64]$EndRevision } else { [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) }
         ChangeRevision = if ($null -ne $ending) { [Int64]$ending.ChangeRevision } else { [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot) }
         Signature = 'index:' + $(if ($null -ne $EndRevision) { [string][Int64]$EndRevision } else { [string][Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) })
@@ -3235,12 +3495,13 @@ function Get-TokenRaderPricingCacheKey {
             [string]$entry.input,
             [string]$entry.cachedInput,
             [string]$entry.output,
+            $(if ($null -ne $entry.PSObject.Properties['contextWindow']) { [string]$entry.contextWindow } else { '' }),
             $(if ($null -ne $entry.PSObject.Properties['longContextThreshold']) { [string]$entry.longContextThreshold } else { '' }),
             $(if ($null -ne $entry.PSObject.Properties['longContextInputMultiplier']) { [string]$entry.longContextInputMultiplier } else { '' }),
             $(if ($null -ne $entry.PSObject.Properties['longContextOutputMultiplier']) { [string]$entry.longContextOutputMultiplier } else { '' })
         ) -join ':'
     }
-    return (@('usage-history-v4', [string]$PricingDocument.verifiedAt, [string]$PricingDocument.unitTokens, ($modelParts -join ';')) -join '|')
+    return (@('usage-history-v5', [string]$PricingDocument.verifiedAt, [string]$PricingDocument.unitTokens, ($modelParts -join ';')) -join '|')
 }
 
 function ConvertFrom-TokenRaderUsageHistorySnapshot {
@@ -3278,6 +3539,14 @@ function ConvertFrom-TokenRaderUsageHistorySnapshot {
             PricingComplete = [bool]$modelSnapshot.PricingComplete
             CostComplete = [bool]$modelSnapshot.PricingComplete
             Events = [Int64]$modelSnapshot.Events
+            CacheCreationTokens = [Int64]$modelSnapshot.CacheCreationTokens
+            CacheWriteObservable = [bool]$modelSnapshot.CacheWriteObservable
+            StandardContextEvents = [Int64]$modelSnapshot.StandardContextEvents
+            LongContextEvents = [Int64]$modelSnapshot.LongContextEvents
+            StandardContextInput = [Int64]$modelSnapshot.StandardContextInput
+            LongContextInput = [Int64]$modelSnapshot.LongContextInput
+            LongContextOutput = [Int64]$modelSnapshot.LongContextOutput
+            CostCoverage = if ([bool]$modelSnapshot.CacheWriteObservable) { 'observable_tokens_and_cache_write' } else { 'observable_tokens_only' }
         }
     }
     [pscustomobject]@{
@@ -3300,6 +3569,15 @@ function ConvertFrom-TokenRaderUsageHistorySnapshot {
         DuplicateEventsDropped = [Int64]$Snapshot.DuplicateEventsDropped
         InheritedEventsDropped = [Int64]$Snapshot.InheritedEventsDropped
         ProcessedRows = [Int64]$Snapshot.ProcessedRows
+        CacheCreationTokens = [Int64]$Snapshot.CacheCreationTokens
+        CacheWriteObservable = [bool]$Snapshot.CacheWriteObservable
+        CostCoverage = if ([bool]$Snapshot.CacheWriteObservable) { 'observable_tokens_and_cache_write' } else { 'observable_tokens_only' }
+        StandardContextEvents = [Int64]$Snapshot.StandardContextEvents
+        LongContextEvents = [Int64]$Snapshot.LongContextEvents
+        StandardContextInput = [Int64]$Snapshot.StandardContextInput
+        LongContextInput = [Int64]$Snapshot.LongContextInput
+        LongContextOutput = [Int64]$Snapshot.LongContextOutput
+        LongContextExtraCost = [double]$Snapshot.LongContextExtraCost
         FromCache = $FromCache
     }
 }
@@ -3390,11 +3668,9 @@ function Get-TokenRaderUsageHistoryWindow {
         [double]$inputCost = 0
         [double]$cachedCost = 0
         [double]$outputCost = 0
-        $priceCache = @{}
+        [double]$cacheCreationCost = 0
+        [double]$longContextExtraCost = 0
         $modelTotals = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
-        $unitTokens = if ($null -ne $PricingDocument.PSObject.Properties['unitTokens'] -and [double]$PricingDocument.unitTokens -gt 0) {
-            [double]$PricingDocument.unitTokens
-        } else { 1000000.0 }
         foreach ($bucket in @($aggregate.Buckets)) {
             $bucketUsage = New-TokenRaderUsage -InputTokens $bucket.Input -CachedTokens $bucket.Cached -OutputTokens $bucket.Output -ReasoningOutputTokens $bucket.Reasoning
             $model = [string]$bucket.Model
@@ -3410,6 +3686,13 @@ function Get-TokenRaderUsageHistoryWindow {
                     OutputCost = [double]0
                     PricingComplete = $true
                     Events = [Int64]0
+                    CacheCreationTokens = [Int64]0
+                    CacheWriteObservable = $true
+                    StandardContextEvents = [Int64]0
+                    LongContextEvents = [Int64]0
+                    StandardContextInput = [Int64]0
+                    LongContextInput = [Int64]0
+                    LongContextOutput = [Int64]0
                 }
             }
             $modelTotal = $modelTotals[$model]
@@ -3418,25 +3701,43 @@ function Get-TokenRaderUsageHistoryWindow {
             $modelTotal.TotalOutput += [Int64]$bucket.Output
             $modelTotal.TotalReasoning += [Int64]$bucket.Reasoning
             $modelTotal.Events += [Int64]$bucket.Events
-            if (-not $priceCache.ContainsKey($model)) { $priceCache[$model] = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument }
-            $price = $priceCache[$model]
-            if ($null -eq $price) {
+            $modelTotal.CacheCreationTokens += [Int64]$bucket.CacheCreationTokens
+            if (-not [bool]$bucket.CacheWriteObservable) { $modelTotal.CacheWriteObservable = $false }
+            if ([bool]$bucket.LongContext) {
+                $modelTotal.LongContextEvents += [Int64]$bucket.Events
+                $modelTotal.LongContextInput += [Int64]$bucket.Input
+                $modelTotal.LongContextOutput += [Int64]$bucket.Output
+            } else {
+                $modelTotal.StandardContextEvents += [Int64]$bucket.Events
+                $modelTotal.StandardContextInput += [Int64]$bucket.Input
+            }
+            # Keep history on the same per-call/bucket pricing path as the
+            # interval and quota views.  In particular, cache creation tokens
+            # are charged once at 1.25x and a >272K bucket receives the input
+            # and output long-context multipliers exactly once.
+            $cost = Get-TokenRaderCost -Usage $bucketUsage -Model $model -PricingDocument $PricingDocument `
+                -Scope call -LongContextApplied ([bool]$bucket.LongContext) `
+                -CacheCreationTokens ([Int64]$bucket.CacheCreationTokens) `
+                -CacheWriteObservable ([bool]$bucket.CacheWriteObservable)
+            if (-not [bool]$cost.Known) {
                 [void]$unknownModels.Add($(if ([string]::IsNullOrWhiteSpace($model)) { '未知模型' } else { $model }))
                 $modelTotal.PricingComplete = $false
                 continue
             }
-            [double]$inputMultiplier = 1.0
-            [double]$outputMultiplier = 1.0
-            if ([bool]$bucket.LongContext) {
-                $inputMultiplier = if ($null -ne $price.PSObject.Properties['longContextInputMultiplier']) { [double]$price.longContextInputMultiplier } else { 2.0 }
-                $outputMultiplier = if ($null -ne $price.PSObject.Properties['longContextOutputMultiplier']) { [double]$price.longContextOutputMultiplier } else { 1.5 }
-            }
-            $bucketInputCost = ([double]$bucketUsage.Uncached / $unitTokens) * [double]$price.input * $inputMultiplier
-            $bucketCachedCost = ([double]$bucketUsage.Cached / $unitTokens) * [double]$price.cachedInput * $inputMultiplier
-            $bucketOutputCost = ([double]$bucketUsage.Output / $unitTokens) * [double]$price.output * $outputMultiplier
+            $bucketInputCost = [double]$cost.InputCost
+            $bucketCachedCost = [double]$cost.CachedCost
+            $bucketOutputCost = [double]$cost.OutputCost
+            $cacheCreationCost += [double]$cost.CacheCreationCost
             $inputCost += $bucketInputCost
             $cachedCost += $bucketCachedCost
             $outputCost += $bucketOutputCost
+            if ([bool]$bucket.LongContext) {
+                [double]$standardInputCost = if ([double]$cost.InputMultiplier -gt 0) { $bucketInputCost / [double]$cost.InputMultiplier } else { $bucketInputCost }
+                [double]$standardCachedCost = if ([double]$cost.InputMultiplier -gt 0) { $bucketCachedCost / [double]$cost.InputMultiplier } else { $bucketCachedCost }
+                [double]$standardOutputCost = if ([double]$cost.OutputMultiplier -gt 0) { $bucketOutputCost / [double]$cost.OutputMultiplier } else { $bucketOutputCost }
+                $longContextExtraCost += ($bucketInputCost + $bucketCachedCost + $bucketOutputCost) -
+                    ($standardInputCost + $standardCachedCost + $standardOutputCost)
+            }
             $modelTotal.InputCost += $bucketInputCost
             $modelTotal.CachedCost += $bucketCachedCost
             $modelTotal.OutputCost += $bucketOutputCost
@@ -3464,6 +3765,14 @@ function Get-TokenRaderUsageHistoryWindow {
         $snapshot.DuplicateEventsDropped = [Int64]$aggregate.DuplicateEventsDropped
         $snapshot.InheritedEventsDropped = [Int64]$aggregate.InheritedEventsDropped
         $snapshot.ProcessedRows = [Int64]$aggregate.ProcessedRows
+        $snapshot.CacheCreationTokens = [Int64]$aggregate.CacheCreationTokens
+        $snapshot.CacheWriteObservable = [bool]$aggregate.CacheWriteObservable
+        $snapshot.StandardContextEvents = [Int64]$aggregate.StandardContextEvents
+        $snapshot.LongContextEvents = [Int64]$aggregate.LongContextEvents
+        $snapshot.StandardContextInput = [Int64]$aggregate.StandardContextInput
+        $snapshot.LongContextInput = [Int64]$aggregate.LongContextInput
+        $snapshot.LongContextOutput = [Int64]$aggregate.LongContextOutput
+        $snapshot.LongContextExtraCost = $longContextExtraCost
         $modelSnapshots = foreach ($modelTotal in @($modelTotals.Values | Sort-Object Model)) {
             $modelSnapshot = New-Object TokenRaderUsageHistoryModelSnapshot
             $modelSnapshot.Model = [string]$modelTotal.Model
@@ -3476,6 +3785,13 @@ function Get-TokenRaderUsageHistoryWindow {
             $modelSnapshot.OutputCost = [double]$modelTotal.OutputCost
             $modelSnapshot.PricingComplete = [bool]$modelTotal.PricingComplete
             $modelSnapshot.Events = [Int64]$modelTotal.Events
+            $modelSnapshot.CacheCreationTokens = [Int64]$modelTotal.CacheCreationTokens
+            $modelSnapshot.CacheWriteObservable = [bool]$modelTotal.CacheWriteObservable
+            $modelSnapshot.StandardContextEvents = [Int64]$modelTotal.StandardContextEvents
+            $modelSnapshot.LongContextEvents = [Int64]$modelTotal.LongContextEvents
+            $modelSnapshot.StandardContextInput = [Int64]$modelTotal.StandardContextInput
+            $modelSnapshot.LongContextInput = [Int64]$modelTotal.LongContextInput
+            $modelSnapshot.LongContextOutput = [Int64]$modelTotal.LongContextOutput
             $modelSnapshot
         }
         $snapshot.ModelBreakdown = [TokenRaderUsageHistoryModelSnapshot[]]@($modelSnapshots)

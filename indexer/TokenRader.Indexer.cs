@@ -20,6 +20,10 @@ internal sealed class TokenRaderJsonUsage
     [DataMember(Name = "cached_input_tokens", EmitDefaultValue = false)] public object CachedInputTokens { get; set; }
     [DataMember(Name = "output_tokens", EmitDefaultValue = false)] public object OutputTokens { get; set; }
     [DataMember(Name = "reasoning_output_tokens", EmitDefaultValue = false)] public object ReasoningOutputTokens { get; set; }
+    [DataMember(Name = "cache_read_tokens", EmitDefaultValue = false)] public object CacheReadTokens { get; set; }
+    [DataMember(Name = "cached_tokens", EmitDefaultValue = false)] public object CachedTokens { get; set; }
+    [DataMember(Name = "cache_creation_tokens", EmitDefaultValue = false)] public object CacheCreationTokens { get; set; }
+    [DataMember(Name = "cache_write_tokens", EmitDefaultValue = false)] public object CacheWriteTokens { get; set; }
 }
 
 [DataContract]
@@ -27,6 +31,7 @@ internal sealed class TokenRaderJsonInfo
 {
     [DataMember(Name = "total_token_usage", EmitDefaultValue = false)] public TokenRaderJsonUsage TotalTokenUsage { get; set; }
     [DataMember(Name = "last_token_usage", EmitDefaultValue = false)] public TokenRaderJsonUsage LastTokenUsage { get; set; }
+    [DataMember(Name = "model_context_window", EmitDefaultValue = false)] public object ModelContextWindow { get; set; }
 }
 
 [DataContract]
@@ -97,10 +102,16 @@ public sealed class TokenRaderIntervalAggregateBucket
     public long Output { get; set; }
     public long Reasoning { get; set; }
     public long Events { get; set; }
+    public long CacheCreationTokens { get; set; }
+    public long ModelContextWindow { get; set; }
+    public long LongContextThreshold { get; set; }
+    public string LongContextSource { get; set; }
+    public bool CacheWriteObservable { get; set; }
 
     public TokenRaderIntervalAggregateBucket()
     {
         Model = "";
+        LongContextSource = "";
     }
 }
 
@@ -124,6 +135,14 @@ public sealed class TokenRaderIntervalAggregateResult
     public DateTimeOffset? FirstCountedAt { get; set; }
     public DateTimeOffset? LastCountedAt { get; set; }
     public bool IdentityComplete { get; set; }
+    public long StandardContextEvents { get; set; }
+    public long LongContextEvents { get; set; }
+    public long StandardContextInput { get; set; }
+    public long LongContextInput { get; set; }
+    public long LongContextOutput { get; set; }
+    public double LongContextExtraCost { get; set; }
+    public bool CacheWriteObservable { get; set; }
+    public long CacheCreationTokens { get; set; }
     public long UnidentifiedEvents { get; set; }
     public string[] IdentitySources { get; set; }
     public int ChangedSessions { get; set; }
@@ -153,6 +172,16 @@ public sealed class TokenRaderUsageHistoryModelSnapshot
     public double OutputCost { get; set; }
     public bool PricingComplete { get; set; }
     public long Events { get; set; }
+    // Diagnostics are persisted with the seven-day rolling history so the UI
+    // can explain long-context and cache-write coverage even when a result is
+    // loaded from disk rather than recomputed in memory.
+    public long CacheCreationTokens { get; set; }
+    public bool CacheWriteObservable { get; set; }
+    public long StandardContextEvents { get; set; }
+    public long LongContextEvents { get; set; }
+    public long StandardContextInput { get; set; }
+    public long LongContextInput { get; set; }
+    public long LongContextOutput { get; set; }
 
     public TokenRaderUsageHistoryModelSnapshot()
     {
@@ -187,6 +216,14 @@ public sealed class TokenRaderUsageHistorySnapshot
     public long DuplicateEventsDropped { get; set; }
     public long InheritedEventsDropped { get; set; }
     public long ProcessedRows { get; set; }
+    public long CacheCreationTokens { get; set; }
+    public bool CacheWriteObservable { get; set; }
+    public long StandardContextEvents { get; set; }
+    public long LongContextEvents { get; set; }
+    public long StandardContextInput { get; set; }
+    public long LongContextInput { get; set; }
+    public long LongContextOutput { get; set; }
+    public double LongContextExtraCost { get; set; }
     public TokenRaderUsageHistoryModelSnapshot[] ModelBreakdown { get; set; }
 
     public TokenRaderUsageHistorySnapshot()
@@ -280,6 +317,12 @@ public static class TokenRaderIndexer
         public string RequestId = "";
         public string ResponseId = "";
         public string IdentitySource = "";
+        public long ModelContextWindow;
+        public long LongContextThreshold;
+        public bool LongContextApplied;
+        public string LongContextSource = "";
+        public long CacheCreationTokens;
+        public bool CacheWriteObservable;
         public long CallInput;
         public long CallCached;
         public long CallOutput;
@@ -525,7 +568,7 @@ public static class TokenRaderIndexer
             EnsureFileMetadataColumn(db, "content_retained", "INTEGER NOT NULL DEFAULT 1");
             EnsureFileMetadataColumn(db, "root_session_id", "TEXT NOT NULL DEFAULT ''");
 
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', response_id TEXT NOT NULL DEFAULT '', identity_source TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', rate_limit_id TEXT NOT NULL DEFAULT '', rate_limit_name TEXT NOT NULL DEFAULT '', credits_balance REAL, credits_has INTEGER, credits_unlimited INTEGER, five_hour_used_tokens INTEGER, five_hour_remaining_tokens INTEGER, five_hour_limit_tokens INTEGER, weekly_used_tokens INTEGER, weekly_remaining_tokens INTEGER, weekly_limit_tokens INTEGER, rate_limit_individual INTEGER, rate_limit_reached_type TEXT NOT NULL DEFAULT '', spend_control_reached INTEGER)";
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', response_id TEXT NOT NULL DEFAULT '', identity_source TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', rate_limit_id TEXT NOT NULL DEFAULT '', rate_limit_name TEXT NOT NULL DEFAULT '', credits_balance REAL, credits_has INTEGER, credits_unlimited INTEGER, five_hour_used_tokens INTEGER, five_hour_remaining_tokens INTEGER, five_hour_limit_tokens INTEGER, weekly_used_tokens INTEGER, weekly_remaining_tokens INTEGER, weekly_limit_tokens INTEGER, rate_limit_individual INTEGER, rate_limit_reached_type TEXT NOT NULL DEFAULT '', spend_control_reached INTEGER, model_context_window INTEGER, long_context_threshold INTEGER, long_context_applied INTEGER NOT NULL DEFAULT 0, long_context_source TEXT NOT NULL DEFAULT '', cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_write_observable INTEGER NOT NULL DEFAULT 0)";
             cmd.ExecuteNonQuery();
 
             // New columns are additive so databases created by older builds
@@ -556,6 +599,12 @@ public static class TokenRaderIndexer
             EnsureTokenRecordColumn(db, "rate_limit_individual", "INTEGER");
             EnsureTokenRecordColumn(db, "rate_limit_reached_type", "TEXT NOT NULL DEFAULT ''");
             EnsureTokenRecordColumn(db, "spend_control_reached", "INTEGER");
+            EnsureTokenRecordColumn(db, "model_context_window", "INTEGER");
+            EnsureTokenRecordColumn(db, "long_context_threshold", "INTEGER");
+            EnsureTokenRecordColumn(db, "long_context_applied", "INTEGER NOT NULL DEFAULT 0");
+            EnsureTokenRecordColumn(db, "long_context_source", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0");
+            EnsureTokenRecordColumn(db, "cache_write_observable", "INTEGER NOT NULL DEFAULT 0");
 
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_records_session ON token_records(session_id)";
             cmd.ExecuteNonQuery();
@@ -591,10 +640,25 @@ public static class TokenRaderIndexer
 
             cmd.CommandText = "CREATE TABLE IF NOT EXISTS usage_history (window_start_ticks INTEGER NOT NULL, window_end_ticks INTEGER NOT NULL, computed_at_ticks INTEGER NOT NULL, index_revision INTEGER NOT NULL, pricing_key TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL DEFAULT 0, total_cached INTEGER NOT NULL DEFAULT 0, total_output INTEGER NOT NULL DEFAULT 0, total_reasoning INTEGER NOT NULL DEFAULT 0, input_cost REAL NOT NULL DEFAULT 0, cached_cost REAL NOT NULL DEFAULT 0, output_cost REAL NOT NULL DEFAULT 0, pricing_complete INTEGER NOT NULL DEFAULT 1, model_display TEXT NOT NULL DEFAULT '', models TEXT NOT NULL DEFAULT '', raw_events INTEGER NOT NULL DEFAULT 0, counted_events INTEGER NOT NULL DEFAULT 0, duplicate_events_dropped INTEGER NOT NULL DEFAULT 0, inherited_events_dropped INTEGER NOT NULL DEFAULT 0, processed_rows INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(window_start_ticks,window_end_ticks))";
             cmd.ExecuteNonQuery();
+            EnsureUsageHistoryColumn(db, "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryColumn(db, "cache_write_observable", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryColumn(db, "standard_context_events", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryColumn(db, "long_context_events", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryColumn(db, "standard_context_input", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryColumn(db, "long_context_input", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryColumn(db, "long_context_output", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryColumn(db, "long_context_extra_cost", "REAL NOT NULL DEFAULT 0");
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_usage_history_end ON usage_history(window_end_ticks)";
             cmd.ExecuteNonQuery();
             cmd.CommandText = "CREATE TABLE IF NOT EXISTS usage_history_models (window_start_ticks INTEGER NOT NULL, window_end_ticks INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL DEFAULT 0, total_cached INTEGER NOT NULL DEFAULT 0, total_output INTEGER NOT NULL DEFAULT 0, total_reasoning INTEGER NOT NULL DEFAULT 0, input_cost REAL NOT NULL DEFAULT 0, cached_cost REAL NOT NULL DEFAULT 0, output_cost REAL NOT NULL DEFAULT 0, pricing_complete INTEGER NOT NULL DEFAULT 1, events INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(window_start_ticks,window_end_ticks,model))";
             cmd.ExecuteNonQuery();
+            EnsureUsageHistoryModelColumn(db, "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryModelColumn(db, "cache_write_observable", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryModelColumn(db, "standard_context_events", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryModelColumn(db, "long_context_events", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryModelColumn(db, "standard_context_input", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryModelColumn(db, "long_context_input", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryModelColumn(db, "long_context_output", "INTEGER NOT NULL DEFAULT 0");
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_usage_history_models_end ON usage_history_models(window_end_ticks)";
             cmd.ExecuteNonQuery();
         }
@@ -615,7 +679,8 @@ public static class TokenRaderIndexer
                 "SELECT window_start_ticks,window_end_ticks,computed_at_ticks,index_revision,pricing_key," +
                 "total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost," +
                 "pricing_complete,model_display,models,raw_events,counted_events,duplicate_events_dropped," +
-                "inherited_events_dropped,processed_rows FROM usage_history " +
+                "inherited_events_dropped,processed_rows,cache_creation_tokens,cache_write_observable," +
+                "standard_context_events,long_context_events,standard_context_input,long_context_input,long_context_output,long_context_extra_cost FROM usage_history " +
                 "WHERE window_start_ticks=@start AND window_end_ticks=@end AND index_revision=@revision AND pricing_key=@pricing LIMIT 1";
             cmd.Parameters.AddWithValue("@start", windowStartTicks);
             cmd.Parameters.AddWithValue("@end", windowEndTicks);
@@ -645,9 +710,11 @@ public static class TokenRaderIndexer
                     "(window_start_ticks,window_end_ticks,computed_at_ticks,index_revision,pricing_key," +
                     "total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost," +
                     "pricing_complete,model_display,models,raw_events,counted_events,duplicate_events_dropped," +
-                    "inherited_events_dropped,processed_rows) VALUES " +
+                    "inherited_events_dropped,processed_rows,cache_creation_tokens,cache_write_observable," +
+                    "standard_context_events,long_context_events,standard_context_input,long_context_input,long_context_output,long_context_extra_cost) VALUES " +
                     "(@start,@end,@computed,@revision,@pricing,@input,@cached,@output,@reasoning,@input_cost," +
-                    "@cached_cost,@output_cost,@complete,@model_display,@models,@raw,@counted,@duplicate,@inherited,@processed)";
+                    "@cached_cost,@output_cost,@complete,@model_display,@models,@raw,@counted,@duplicate,@inherited,@processed," +
+                    "@cache_creation,@cache_write,@standard_events,@long_events,@standard_input,@long_input,@long_output,@long_extra_cost)";
                 cmd.Parameters.AddWithValue("@start", snapshot.WindowStartTicks);
                 cmd.Parameters.AddWithValue("@end", snapshot.WindowEndTicks);
                 cmd.Parameters.AddWithValue("@computed", snapshot.ComputedAtTicks);
@@ -668,6 +735,14 @@ public static class TokenRaderIndexer
                 cmd.Parameters.AddWithValue("@duplicate", snapshot.DuplicateEventsDropped);
                 cmd.Parameters.AddWithValue("@inherited", snapshot.InheritedEventsDropped);
                 cmd.Parameters.AddWithValue("@processed", snapshot.ProcessedRows);
+                cmd.Parameters.AddWithValue("@cache_creation", snapshot.CacheCreationTokens);
+                cmd.Parameters.AddWithValue("@cache_write", snapshot.CacheWriteObservable ? 1 : 0);
+                cmd.Parameters.AddWithValue("@standard_events", snapshot.StandardContextEvents);
+                cmd.Parameters.AddWithValue("@long_events", snapshot.LongContextEvents);
+                cmd.Parameters.AddWithValue("@standard_input", snapshot.StandardContextInput);
+                cmd.Parameters.AddWithValue("@long_input", snapshot.LongContextInput);
+                cmd.Parameters.AddWithValue("@long_output", snapshot.LongContextOutput);
+                cmd.Parameters.AddWithValue("@long_extra_cost", snapshot.LongContextExtraCost);
                 cmd.ExecuteNonQuery();
             }
             using (var deleteModels = db.CreateCommand())
@@ -685,8 +760,10 @@ public static class TokenRaderIndexer
                 {
                     modelCmd.Transaction = tx;
                     modelCmd.CommandText =
-                        "INSERT INTO usage_history_models (window_start_ticks,window_end_ticks,model,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events) " +
-                        "VALUES (@start,@end,@model,@input,@cached,@output,@reasoning,@input_cost,@cached_cost,@output_cost,@complete,@events)";
+                        "INSERT INTO usage_history_models (window_start_ticks,window_end_ticks,model,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events," +
+                        "cache_creation_tokens,cache_write_observable,standard_context_events,long_context_events,standard_context_input,long_context_input,long_context_output) " +
+                        "VALUES (@start,@end,@model,@input,@cached,@output,@reasoning,@input_cost,@cached_cost,@output_cost,@complete,@events,@cache_creation,@cache_write," +
+                        "@standard_events,@long_events,@standard_input,@long_input,@long_output)";
                     modelCmd.Parameters.AddWithValue("@start", snapshot.WindowStartTicks);
                     modelCmd.Parameters.AddWithValue("@end", snapshot.WindowEndTicks);
                     modelCmd.Parameters.AddWithValue("@model", model.Model ?? "");
@@ -699,6 +776,13 @@ public static class TokenRaderIndexer
                     modelCmd.Parameters.AddWithValue("@output_cost", model.OutputCost);
                     modelCmd.Parameters.AddWithValue("@complete", model.PricingComplete ? 1 : 0);
                     modelCmd.Parameters.AddWithValue("@events", model.Events);
+                    modelCmd.Parameters.AddWithValue("@cache_creation", model.CacheCreationTokens);
+                    modelCmd.Parameters.AddWithValue("@cache_write", model.CacheWriteObservable ? 1 : 0);
+                    modelCmd.Parameters.AddWithValue("@standard_events", model.StandardContextEvents);
+                    modelCmd.Parameters.AddWithValue("@long_events", model.LongContextEvents);
+                    modelCmd.Parameters.AddWithValue("@standard_input", model.StandardContextInput);
+                    modelCmd.Parameters.AddWithValue("@long_input", model.LongContextInput);
+                    modelCmd.Parameters.AddWithValue("@long_output", model.LongContextOutput);
                     modelCmd.ExecuteNonQuery();
                 }
             }
@@ -770,7 +854,15 @@ public static class TokenRaderIndexer
             CountedEvents = ReadReaderInt64(reader, 16),
             DuplicateEventsDropped = ReadReaderInt64(reader, 17),
             InheritedEventsDropped = ReadReaderInt64(reader, 18),
-            ProcessedRows = ReadReaderInt64(reader, 19)
+            ProcessedRows = ReadReaderInt64(reader, 19),
+            CacheCreationTokens = ReadReaderInt64(reader, 20),
+            CacheWriteObservable = !reader.IsDBNull(21) && Convert.ToInt32(reader.GetValue(21), CultureInfo.InvariantCulture) != 0,
+            StandardContextEvents = ReadReaderInt64(reader, 22),
+            LongContextEvents = ReadReaderInt64(reader, 23),
+            StandardContextInput = ReadReaderInt64(reader, 24),
+            LongContextInput = ReadReaderInt64(reader, 25),
+            LongContextOutput = ReadReaderInt64(reader, 26),
+            LongContextExtraCost = reader.IsDBNull(27) ? 0.0 : Convert.ToDouble(reader.GetValue(27), CultureInfo.InvariantCulture)
         };
     }
 
@@ -781,7 +873,8 @@ public static class TokenRaderIndexer
         using (var cmd = db.CreateCommand())
         {
             cmd.CommandText =
-                "SELECT model,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events " +
+                "SELECT model,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events," +
+                "cache_creation_tokens,cache_write_observable,standard_context_events,long_context_events,standard_context_input,long_context_input,long_context_output " +
                 "FROM usage_history_models WHERE window_start_ticks=@start AND window_end_ticks=@end ORDER BY model ASC";
             cmd.Parameters.AddWithValue("@start", windowStartTicks);
             cmd.Parameters.AddWithValue("@end", windowEndTicks);
@@ -799,7 +892,14 @@ public static class TokenRaderIndexer
                         CachedCost = reader.IsDBNull(6) ? 0.0 : Convert.ToDouble(reader.GetValue(6), CultureInfo.InvariantCulture),
                         OutputCost = reader.IsDBNull(7) ? 0.0 : Convert.ToDouble(reader.GetValue(7), CultureInfo.InvariantCulture),
                         PricingComplete = !reader.IsDBNull(8) && Convert.ToInt32(reader.GetValue(8), CultureInfo.InvariantCulture) != 0,
-                        Events = ReadReaderInt64(reader, 9)
+                        Events = ReadReaderInt64(reader, 9),
+                        CacheCreationTokens = ReadReaderInt64(reader, 10),
+                        CacheWriteObservable = !reader.IsDBNull(11) && Convert.ToInt32(reader.GetValue(11), CultureInfo.InvariantCulture) != 0,
+                        StandardContextEvents = ReadReaderInt64(reader, 12),
+                        LongContextEvents = ReadReaderInt64(reader, 13),
+                        StandardContextInput = ReadReaderInt64(reader, 14),
+                        LongContextInput = ReadReaderInt64(reader, 15),
+                        LongContextOutput = ReadReaderInt64(reader, 16)
                     });
                 }
             }
@@ -911,8 +1011,8 @@ public static class TokenRaderIndexer
         using (var cmd = db.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision, model_source, turn_id, request_id, response_id, identity_source, service_tier, reasoning_effort, rate_limit_id, rate_limit_name, credits_balance, credits_has, credits_unlimited, five_hour_used_tokens, five_hour_remaining_tokens, five_hour_limit_tokens, weekly_used_tokens, weekly_remaining_tokens, weekly_limit_tokens, rate_limit_individual, rate_limit_reached_type, spend_control_reached) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23,@p24,@p25,@p26,@p27,@p28,@p29,@p30,@p31,@p32,@p33,@p34,@p35,@p36,@p37,@p38,@p39,@p40,@p41,@p42,@p43,@p44)";
-            var p = new SQLiteParameter[44];
+            cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision, model_source, turn_id, request_id, response_id, identity_source, service_tier, reasoning_effort, rate_limit_id, rate_limit_name, credits_balance, credits_has, credits_unlimited, five_hour_used_tokens, five_hour_remaining_tokens, five_hour_limit_tokens, weekly_used_tokens, weekly_remaining_tokens, weekly_limit_tokens, rate_limit_individual, rate_limit_reached_type, spend_control_reached, model_context_window, long_context_threshold, long_context_applied, long_context_source, cache_creation_tokens, cache_write_observable) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23,@p24,@p25,@p26,@p27,@p28,@p29,@p30,@p31,@p32,@p33,@p34,@p35,@p36,@p37,@p38,@p39,@p40,@p41,@p42,@p43,@p44,@p45,@p46,@p47,@p48,@p49,@p50)";
+            var p = new SQLiteParameter[50];
             for (int i = 0; i < p.Length; i++)
             {
                 var prm = new SQLiteParameter("@p" + (i + 1));
@@ -1029,13 +1129,17 @@ public static class TokenRaderIndexer
                             if (total == null || last == null) continue;
 
                             long totalInput = GetInt64Value(total.InputTokens);
-                            long totalCached = GetInt64Value(total.CachedInputTokens);
+                            long totalCached = GetCachedTokenValue(total);
                             long totalOutput = GetInt64Value(total.OutputTokens);
                             long totalReasoning = GetInt64Value(total.ReasoningOutputTokens);
                             long callInput = GetInt64Value(last.InputTokens);
-                            long callCached = GetInt64Value(last.CachedInputTokens);
+                            long callCached = GetCachedTokenValue(last);
                             long callOutput = GetInt64Value(last.OutputTokens);
                             long callReasoning = GetInt64Value(last.ReasoningOutputTokens);
+                            long modelContextWindow = GetInt64Value(info.ModelContextWindow);
+                            long cacheCreationTokens = GetInt64Value(last.CacheCreationTokens);
+                            if (cacheCreationTokens <= 0L) cacheCreationTokens = GetInt64Value(last.CacheWriteTokens);
+                            bool cacheWriteObservable = last.CacheCreationTokens != null || last.CacheWriteTokens != null;
                             if (totalCached > totalInput) totalCached = totalInput;
                             if (callCached > callInput) callCached = callInput;
 
@@ -1052,6 +1156,21 @@ public static class TokenRaderIndexer
                             int? rateLimitIndividual = null; int? spendControlReached = null;
                             string rateLimitReachedType = "";
                             double? creditsBalance = null; int? creditsHas = null; int? creditsUnlimited = null;
+                            long longContextThreshold = 0L;
+                            bool longContextApplied = false;
+                            string longContextSource = "missing_input";
+                            if (callInput > 0L && !string.IsNullOrWhiteSpace(currentModel) && IsKnownLongContextModel(currentModel))
+                            {
+                                longContextThreshold = 272000L;
+                                // The source records which rule was available;
+                                // LongContextApplied separately records whether
+                                // this particular call crossed the threshold.
+                                longContextSource = "pricing_threshold";
+                                longContextApplied = callInput > longContextThreshold;
+                            }
+                            else if (callInput <= 0L) longContextSource = "missing_input";
+                            else if (string.IsNullOrWhiteSpace(currentModel)) longContextSource = "unknown_model";
+                            else longContextSource = "no_threshold";
                             var rateLimits = payload.RateLimits;
                             if (rateLimits != null)
                             {
@@ -1148,6 +1267,12 @@ public static class TokenRaderIndexer
                             p[41].Value = (object)rateLimitIndividual ?? DBNull.Value;
                             p[42].Value = rateLimitReachedType;
                             p[43].Value = (object)spendControlReached ?? DBNull.Value;
+                            p[44].Value = (object)(modelContextWindow > 0L ? (long?)modelContextWindow : null) ?? DBNull.Value;
+                            p[45].Value = (object)(longContextThreshold > 0L ? (long?)longContextThreshold : null) ?? DBNull.Value;
+                            p[46].Value = longContextApplied ? 1 : 0;
+                            p[47].Value = longContextSource;
+                            p[48].Value = cacheCreationTokens;
+                            p[49].Value = cacheWriteObservable ? 1 : 0;
                             cmd.ExecuteNonQuery();
                             if (string.IsNullOrWhiteSpace(currentModel)) insertedUnresolvedModel = true;
                             count++;
@@ -1918,7 +2043,7 @@ public static class TokenRaderIndexer
                 cmd.CommandText =
                     "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                     "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                    "turn_id,request_id,response_id,identity_source " +
+                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
                     "FROM token_records WHERE source_path=@path AND source_offset_end>@start AND source_offset_end<=@end " +
                     "ORDER BY source_offset_end ASC";
                 cmd.Parameters.AddWithValue("@path", range.Path);
@@ -1955,6 +2080,12 @@ public static class TokenRaderIndexer
                         string requestId = ReadReaderString(reader, 16);
                         string responseId = ReadReaderString(reader, 17);
                         string identitySource = ReadReaderString(reader, 18);
+                        long modelContextWindow = ReadReaderInt64(reader, 19);
+                        long longContextThreshold = ReadReaderInt64(reader, 20);
+                        bool longContextApplied = ReadReaderInt64(reader, 21) != 0L;
+                        string longContextSource = ReadReaderString(reader, 22);
+                        long cacheCreationTokens = ReadReaderInt64(reader, 23);
+                        bool cacheWriteObservable = ReadReaderInt64(reader, 24) != 0L;
 
                         if (callInput <= 0L && callOutput <= 0L) continue;
 
@@ -1997,6 +2128,12 @@ public static class TokenRaderIndexer
                                 RequestId = requestId,
                                 ResponseId = responseId,
                                 IdentitySource = identitySource,
+                                ModelContextWindow = modelContextWindow,
+                                LongContextThreshold = longContextThreshold,
+                                LongContextApplied = longContextApplied,
+                                LongContextSource = longContextSource,
+                                CacheCreationTokens = cacheCreationTokens,
+                                CacheWriteObservable = cacheWriteObservable,
                                 CallInput = callInput,
                                 CallCached = callCached,
                                 CallOutput = callOutput,
@@ -2059,7 +2196,7 @@ public static class TokenRaderIndexer
             cmd.CommandText =
                 "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                 "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                "turn_id,request_id,response_id,identity_source " +
+                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
                 "FROM token_records WHERE source_offset_end>0 AND timestamp>=@broad_start AND timestamp<@broad_end " +
                 "ORDER BY timestamp ASC,source_path ASC,source_offset_end ASC";
             cmd.Parameters.AddWithValue("@broad_start", broadStart);
@@ -2093,6 +2230,12 @@ public static class TokenRaderIndexer
                     string requestId = ReadReaderString(reader, 16);
                     string responseId = ReadReaderString(reader, 17);
                     string identitySource = ReadReaderString(reader, 18);
+                    long modelContextWindow = ReadReaderInt64(reader, 19);
+                    long longContextThreshold = ReadReaderInt64(reader, 20);
+                    bool longContextApplied = ReadReaderInt64(reader, 21) != 0L;
+                    string longContextSource = ReadReaderString(reader, 22);
+                    long cacheCreationTokens = ReadReaderInt64(reader, 23);
+                    bool cacheWriteObservable = ReadReaderInt64(reader, 24) != 0L;
 
                     DateTimeOffset eventAt;
                     if (!TryParseTimestamp(timestampText, out eventAt) || eventAt < startedAt || eventAt >= endedAt) continue;
@@ -2125,6 +2268,12 @@ public static class TokenRaderIndexer
                             RequestId = requestId,
                             ResponseId = responseId,
                             IdentitySource = identitySource,
+                            ModelContextWindow = modelContextWindow,
+                            LongContextThreshold = longContextThreshold,
+                            LongContextApplied = longContextApplied,
+                            LongContextSource = longContextSource,
+                            CacheCreationTokens = cacheCreationTokens,
+                            CacheWriteObservable = cacheWriteObservable,
                             CallInput = callInput,
                             CallCached = callCached,
                             CallOutput = callOutput,
@@ -2187,7 +2336,7 @@ public static class TokenRaderIndexer
                 cmd.CommandText =
                     "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                     "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                    "turn_id,request_id,response_id,identity_source " +
+                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
                     "FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<=@end " +
                     "AND timestamp>=@broad_start AND timestamp<@broad_end ORDER BY source_offset_end ASC";
                 cmd.Parameters.AddWithValue("@path", range.Path);
@@ -2226,6 +2375,12 @@ public static class TokenRaderIndexer
                         string requestId = ReadReaderString(reader, 16);
                         string responseId = ReadReaderString(reader, 17);
                         string identitySource = ReadReaderString(reader, 18);
+                        long modelContextWindow = ReadReaderInt64(reader, 19);
+                        long longContextThreshold = ReadReaderInt64(reader, 20);
+                        bool longContextApplied = ReadReaderInt64(reader, 21) != 0L;
+                        string longContextSource = ReadReaderString(reader, 22);
+                        long cacheCreationTokens = ReadReaderInt64(reader, 23);
+                        bool cacheWriteObservable = ReadReaderInt64(reader, 24) != 0L;
                         if (callInput <= 0L && callOutput <= 0L) continue;
 
                         string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
@@ -2253,6 +2408,12 @@ public static class TokenRaderIndexer
                                 RequestId = requestId,
                                 ResponseId = responseId,
                                 IdentitySource = identitySource,
+                                ModelContextWindow = modelContextWindow,
+                                LongContextThreshold = longContextThreshold,
+                                LongContextApplied = longContextApplied,
+                                LongContextSource = longContextSource,
+                                CacheCreationTokens = cacheCreationTokens,
+                                CacheWriteObservable = cacheWriteObservable,
                                 CallInput = callInput,
                                 CallCached = callCached,
                                 CallOutput = callOutput,
@@ -2406,19 +2567,25 @@ public static class TokenRaderIndexer
         for (int i = 0; i < representatives.Count; i++)
         {
             AggregateEventCandidate existing = representatives[i];
-            string candidateStableId = !string.IsNullOrWhiteSpace(candidate.RequestId)
-                ? "request:" + candidate.RequestId
-                : (!string.IsNullOrWhiteSpace(candidate.ResponseId) ? "response:" + candidate.ResponseId : "");
-            string existingStableId = !string.IsNullOrWhiteSpace(existing.RequestId)
-                ? "request:" + existing.RequestId
-                : (!string.IsNullOrWhiteSpace(existing.ResponseId) ? "response:" + existing.ResponseId : "");
-            if (!string.IsNullOrWhiteSpace(candidateStableId) && !string.IsNullOrWhiteSpace(existingStableId) &&
-                !string.Equals(candidateStableId, existingStableId, StringComparison.OrdinalIgnoreCase)) continue;
-            if (string.IsNullOrWhiteSpace(candidateStableId) && string.IsNullOrWhiteSpace(existingStableId) &&
-                !string.IsNullOrWhiteSpace(candidate.TurnId) && !string.IsNullOrWhiteSpace(existing.TurnId) &&
-                !string.Equals(candidate.TurnId, existing.TurnId, StringComparison.OrdinalIgnoreCase)) continue;
+            // Token usage is the first-line identity for a lineage copy. A
+            // parent and child can receive different request/response/turn
+            // identifiers while serialising the same call, and those IDs can
+            // also be absent from older index rows. Do not let an auxiliary
+            // identifier prevent a canonical token fingerprint from being
+            // compared. Sibling sessions are still kept separate below by
+            // the explicit same-session/ancestor relationship check.
             bool sameSession = string.Equals(candidate.SessionId, existing.SessionId,
                 StringComparison.OrdinalIgnoreCase);
+            // Distinct turn IDs on the same model are evidence of two real
+            // calls whose cumulative counters happen to coincide. Keep both.
+            // When model attribution differs, token identity remains the
+            // stronger signal because inherited child copies commonly switch
+            // model labels after a child turn_context is observed.
+            if (!string.IsNullOrWhiteSpace(candidate.TurnId) &&
+                !string.IsNullOrWhiteSpace(existing.TurnId) &&
+                !string.Equals(candidate.TurnId, existing.TurnId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(candidate.Model, existing.Model, StringComparison.OrdinalIgnoreCase))
+                continue;
             bool candidateIsRoot = !string.IsNullOrWhiteSpace(candidate.RootSessionId) &&
                 string.Equals(candidate.SessionId, candidate.RootSessionId, StringComparison.OrdinalIgnoreCase);
             bool existingIsRoot = !string.IsNullOrWhiteSpace(existing.RootSessionId) &&
@@ -2434,9 +2601,8 @@ public static class TokenRaderIndexer
             // and token usage. Replacing a previously seen descendant makes
             // aggregation independent of file enumeration order.
             if (candidateAncestor && !existingAncestor) representatives[i] = candidate;
-            else if (sameSession && !string.IsNullOrWhiteSpace(candidateStableId) &&
-                string.Equals(candidateStableId, existingStableId, StringComparison.OrdinalIgnoreCase) &&
-                candidate.HasTimestamp && (!existing.HasTimestamp || candidate.EventAt >= existing.EventAt))
+            else if (sameSession && candidate.HasTimestamp &&
+                (!existing.HasTimestamp || candidate.EventAt >= existing.EventAt))
                 representatives[i] = candidate;
             return;
         }
@@ -2453,6 +2619,7 @@ public static class TokenRaderIndexer
         var buckets = new Dictionary<string, TokenRaderIntervalAggregateBucket>(StringComparer.OrdinalIgnoreCase);
         var resolvedThresholds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         var identitySources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        result.CacheWriteObservable = true;
         DateTimeOffset? firstCountedAt = null;
         DateTimeOffset? lastCountedAt = null;
 
@@ -2466,6 +2633,7 @@ public static class TokenRaderIndexer
                 result.TotalCached += candidate.CallCached;
                 result.TotalOutput += candidate.CallOutput;
                 result.TotalReasoning += candidate.CallReasoning;
+                result.CacheCreationTokens += candidate.CacheCreationTokens;
                 if (!string.IsNullOrWhiteSpace(candidate.SourcePath)) activeFiles.Add(candidate.SourcePath);
                 if (!string.IsNullOrWhiteSpace(candidate.Model)) models.Add(candidate.Model);
                 string identitySource = candidate.IdentitySource;
@@ -2494,6 +2662,17 @@ public static class TokenRaderIndexer
                     resolvedThresholds[candidate.Model] = threshold;
                 }
                 bool longContext = threshold > 0L && candidate.CallInput > threshold;
+                if (longContext) {
+                    result.LongContextEvents++;
+                    result.LongContextInput += candidate.CallInput;
+                    result.LongContextOutput += candidate.CallOutput;
+                } else {
+                    result.StandardContextEvents++;
+                    result.StandardContextInput += candidate.CallInput;
+                }
+                if (!candidate.CacheWriteObservable) result.CacheWriteObservable = false;
+                string normalizedLongContextSource = NormalizeLongContextSource(
+                    candidate.LongContextSource, candidate.Model, candidate.CallInput, threshold);
                 string bucketKey = candidate.Model.ToLowerInvariant() + "|" +
                     (longContext ? "long" : "standard");
                 TokenRaderIntervalAggregateBucket bucket;
@@ -2501,7 +2680,11 @@ public static class TokenRaderIndexer
                 {
                     bucket = new TokenRaderIntervalAggregateBucket {
                         Model = candidate.Model,
-                        LongContext = longContext
+                        LongContext = longContext,
+                        ModelContextWindow = candidate.ModelContextWindow,
+                        LongContextThreshold = threshold,
+                        LongContextSource = normalizedLongContextSource,
+                        CacheWriteObservable = candidate.CacheWriteObservable
                     };
                     buckets.Add(bucketKey, bucket);
                 }
@@ -2509,7 +2692,10 @@ public static class TokenRaderIndexer
                 bucket.Cached += candidate.CallCached;
                 bucket.Output += candidate.CallOutput;
                 bucket.Reasoning += candidate.CallReasoning;
+                bucket.CacheCreationTokens += candidate.CacheCreationTokens;
                 bucket.Events++;
+                if (candidate.ModelContextWindow > bucket.ModelContextWindow) bucket.ModelContextWindow = candidate.ModelContextWindow;
+                bucket.CacheWriteObservable = bucket.CacheWriteObservable && candidate.CacheWriteObservable;
             }
         }
 
@@ -2530,6 +2716,18 @@ public static class TokenRaderIndexer
             return left.LongContext.CompareTo(right.LongContext);
         });
         result.Buckets = sortedBuckets.ToArray();
+    }
+
+    private static string NormalizeLongContextSource(string source, string model, long callInput, long threshold)
+    {
+        if (string.Equals(source, "pricing_threshold", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(source, "no_threshold", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(source, "unknown_model", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(source, "missing_input", StringComparison.OrdinalIgnoreCase))
+            return source.ToLowerInvariant();
+        if (callInput <= 0L) return "missing_input";
+        if (string.IsNullOrWhiteSpace(model)) return "unknown_model";
+        return threshold > 0L ? "pricing_threshold" : "no_threshold";
     }
 
     private static bool IsAggregateAncestor(
@@ -2687,14 +2885,16 @@ public static class TokenRaderIndexer
         long callReasoning,
         string fingerprint)
     {
-        // New rows already store this exact fingerprint. Reconstructing it
-        // when absent keeps old indexes safe while ensuring cumulative and
-        // per-call usage are always part of the de-duplication identity.
-        string usage = string.IsNullOrWhiteSpace(fingerprint)
-            ? string.Format(CultureInfo.InvariantCulture, "{0}:{1}:{2}:{3}:{4}:{5}:{6}:{7}",
-                totalInput, totalCached, totalOutput, totalReasoning,
-                callInput, callCached, callOutput, callReasoning)
-            : fingerprint;
+        // Always rebuild the lineage fingerprint from cumulative and
+        // per-call usage. The persisted parser fingerprint in current
+        // indexes also contains timestamp and model; using it here would make
+        // a copied parent/child call fail to deduplicate when either value
+        // differs. Keeping the unused parameter preserves the ABI for older
+        // callers and synthetic indexes.
+        string usage = string.Format(CultureInfo.InvariantCulture,
+            "{0}:{1}:{2}:{3}:{4}:{5}:{6}:{7}",
+            totalInput, totalCached, totalOutput, totalReasoning,
+            callInput, callCached, callOutput, callReasoning);
         // A parent and its descendant can serialize the same inherited call at
         // different times. Timestamp is therefore deliberately excluded from
         // the lineage identity. The caller still requires an actual ancestor-
@@ -3024,12 +3224,17 @@ public static class TokenRaderIndexer
     private static int UpdateMissingModelAtOffset(SQLiteConnection db, string sourcePath, long offset,
         string model, string modelSource, long indexRevision)
     {
+        long threshold = !string.IsNullOrWhiteSpace(model) && IsKnownLongContextModel(model) ? 272000L : 0L;
+        string longSource = string.IsNullOrWhiteSpace(model) ? "unknown_model" :
+            (threshold > 0L ? "pricing_threshold" : "no_threshold");
         using (var cmd = db.CreateCommand())
         {
-            cmd.CommandText = "UPDATE token_records SET model=@model,model_source=@source,index_revision=@revision WHERE source_path=@path AND source_offset_end=@offset AND (model IS NULL OR model='')";
+            cmd.CommandText = "UPDATE token_records SET model=@model,model_source=@source,index_revision=@revision,long_context_threshold=@threshold,long_context_applied=CASE WHEN @threshold>0 AND call_input>@threshold THEN 1 ELSE 0 END,long_context_source=@long_source WHERE source_path=@path AND source_offset_end=@offset AND (model IS NULL OR model='')";
             cmd.Parameters.AddWithValue("@model", model ?? "");
             cmd.Parameters.AddWithValue("@source", string.IsNullOrWhiteSpace(model) ? "unresolved" : (modelSource ?? "unresolved"));
             cmd.Parameters.AddWithValue("@revision", indexRevision);
+            cmd.Parameters.AddWithValue("@threshold", threshold > 0L ? (object)threshold : DBNull.Value);
+            cmd.Parameters.AddWithValue("@long_source", longSource);
             cmd.Parameters.AddWithValue("@path", sourcePath ?? "");
             cmd.Parameters.AddWithValue("@offset", offset);
             return cmd.ExecuteNonQuery();
@@ -3039,12 +3244,17 @@ public static class TokenRaderIndexer
     private static int UpdateMissingModelsForSource(SQLiteConnection db, string sourcePath,
         string model, string modelSource, long indexRevision)
     {
+        long threshold = !string.IsNullOrWhiteSpace(model) && IsKnownLongContextModel(model) ? 272000L : 0L;
+        string longSource = string.IsNullOrWhiteSpace(model) ? "unknown_model" :
+            (threshold > 0L ? "pricing_threshold" : "no_threshold");
         using (var cmd = db.CreateCommand())
         {
-            cmd.CommandText = "UPDATE token_records SET model=@model,model_source=@source,index_revision=@revision WHERE source_path=@path AND (model IS NULL OR model='')";
+            cmd.CommandText = "UPDATE token_records SET model=@model,model_source=@source,index_revision=@revision,long_context_threshold=@threshold,long_context_applied=CASE WHEN @threshold>0 AND call_input>@threshold THEN 1 ELSE 0 END,long_context_source=@long_source WHERE source_path=@path AND (model IS NULL OR model='')";
             cmd.Parameters.AddWithValue("@model", model ?? "");
             cmd.Parameters.AddWithValue("@source", string.IsNullOrWhiteSpace(model) ? "unresolved" : (modelSource ?? "unresolved"));
             cmd.Parameters.AddWithValue("@revision", indexRevision);
+            cmd.Parameters.AddWithValue("@threshold", threshold > 0L ? (object)threshold : DBNull.Value);
+            cmd.Parameters.AddWithValue("@long_source", longSource);
             cmd.Parameters.AddWithValue("@path", sourcePath ?? "");
             return cmd.ExecuteNonQuery();
         }
@@ -3722,6 +3932,60 @@ public static class TokenRaderIndexer
         }
     }
 
+    private static void EnsureUsageHistoryModelColumn(SQLiteConnection db, string columnName, string columnDefinition)
+    {
+        bool exists = false;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(usage_history_models)";
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string existingName = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                    if (string.Equals(existingName, columnName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (exists) return;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "ALTER TABLE usage_history_models ADD COLUMN " + columnName + " " + columnDefinition;
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    private static void EnsureUsageHistoryColumn(SQLiteConnection db, string columnName, string columnDefinition)
+    {
+        bool exists = false;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(usage_history)";
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string existingName = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                    if (string.Equals(existingName, columnName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (exists) return;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "ALTER TABLE usage_history ADD COLUMN " + columnName + " " + columnDefinition;
+            cmd.ExecuteNonQuery();
+        }
+    }
+
     private static string GetLatestSessionModel(SQLiteConnection db, string sessionId)
     {
         if (string.IsNullOrWhiteSpace(sessionId)) return "";
@@ -4032,6 +4296,28 @@ public static class TokenRaderIndexer
             catch (OverflowException) { }
         }
         return 0L;
+    }
+
+    private static long GetCachedTokenValue(TokenRaderJsonUsage usage)
+    {
+        if (usage == null) return 0L;
+        // cached_input_tokens is the current spelling.  Older/newer Codex
+        // emitters have also used cache_read_tokens or cached_tokens for the
+        // same read portion; use the first field that is actually present.
+        object raw = usage.CachedInputTokens;
+        if (raw == null) raw = usage.CacheReadTokens;
+        if (raw == null) raw = usage.CachedTokens;
+        return GetInt64Value(raw);
+    }
+
+    private static bool IsKnownLongContextModel(string model)
+    {
+        string normalized = (model ?? "").Trim().ToLowerInvariant();
+        foreach (string id in new[] { "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4" })
+        {
+            if (normalized == id || normalized.StartsWith(id + "-20", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
     }
 
     private static double GetDoubleValueOrZero(object raw)

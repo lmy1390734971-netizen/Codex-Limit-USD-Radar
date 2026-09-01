@@ -208,7 +208,7 @@ $aliasPricingEntry = @($aliasPricingDocument.models | Where-Object { [string]$_.
 $aliasPricingEntry.aliases = @('synthetic-gpt-5.5-alias')
 $aliasPricingCacheKey = & $coreModule { param($document) Get-TokenRaderPricingCacheKey -PricingDocument $document } $aliasPricingDocument
 Assert-Equal $false ($basePricingCacheKey -eq $aliasPricingCacheKey) 'usage-history pricing cache invalidates when model aliases change'
-if (-not $basePricingCacheKey.StartsWith('usage-history-v4|', [StringComparison]::Ordinal)) {
+if (-not $basePricingCacheKey.StartsWith('usage-history-v5|', [StringComparison]::Ordinal)) {
     throw 'ASSERT FAILED: usage-history pricing cache key is missing its algorithm version'
 }
 
@@ -279,7 +279,7 @@ try {
     Assert-Equal 'gpt-5.4-mini' $snapshotPrice.id 'snapshot model price resolution'
     $aliasPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6' -PricingDocument $prices
     Assert-Equal 'gpt-5.6-sol' $aliasPrice.id 'model alias price resolution'
-    Assert-Equal '2026-08-28' ([string]$prices.verifiedAt) 'pricing verification date'
+    Assert-Equal '2026-09-01' ([string]$prices.verifiedAt) 'pricing verification date'
     Assert-Equal 'Promotional' ([string]$aliasPrice.pricingStatus) 'Sol promotional price status'
     Assert-Equal '2026-11-21' ([string]$aliasPrice.promotionalPriceValidThroughAtLeast) 'Sol promotional price minimum validity'
     $terraPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6-terra' -PricingDocument $prices
@@ -1436,6 +1436,10 @@ try {
         Assert-Equal 3000 ([Int64]$historyResult.Usage.Input) 'rolling 24-hour history input total'
         Assert-Equal 300 ([Int64]$historyResult.Usage.Cached) 'rolling 24-hour history cached total'
         Assert-Equal 300 ([Int64]$historyResult.Usage.Output) 'rolling 24-hour history output total'
+        Assert-Equal 3 ([Int64]$historyResult.StandardContextEvents) 'rolling history standard-context event diagnostic'
+        Assert-Equal 0 ([Int64]$historyResult.LongContextEvents) 'rolling history long-context event diagnostic'
+        Assert-Equal $false ([bool]$historyResult.CacheWriteObservable) 'rolling history records missing cache-write observability'
+        Assert-Equal 'observable_tokens_only' ([string]$historyResult.CostCoverage) 'rolling history cost coverage diagnostic'
         Assert-Equal 2 @($historyResult.ModelBreakdown).Count 'rolling 24-hour history model breakdown count'
         $history55 = @($historyResult.ModelBreakdown | Where-Object { [string]$_.Model -eq 'gpt-5.5' })[0]
         $history56 = @($historyResult.ModelBreakdown | Where-Object { [string]$_.Model -eq 'gpt-5.6-sol' })[0]
@@ -1452,6 +1456,8 @@ try {
         Assert-Equal $true ([bool]$historyCached.FromCache) 'rolling history was not reloaded from its disk snapshot'
         Assert-Equal 2 @($historyCached.ModelBreakdown).Count 'rolling history cached model breakdown count'
         Assert-Near ([double]$historyResult.TotalCost) ([double]$historyCached.TotalCost) 0.0000001 'rolling history cached API cost'
+        Assert-Equal ([Int64]$historyResult.StandardContextEvents) ([Int64]$historyCached.StandardContextEvents) 'rolling history cached context diagnostics'
+        Assert-Equal ([bool]$historyResult.CacheWriteObservable) ([bool]$historyCached.CacheWriteObservable) 'rolling history cached write observability'
 
         # Append another completed call, then deliberately consume its watcher
         # notification before querying history. The history query itself must

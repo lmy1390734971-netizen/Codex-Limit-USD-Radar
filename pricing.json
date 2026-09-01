@@ -1,7 +1,7 @@
 {
   "currency": "USD",
   "unitTokens": 1000000,
-  "verifiedAt": "2026-08-28",
+  "verifiedAt": "2026-09-01",
   "priceType": "OpenAI API Standard processing",
   "models": [
     {
@@ -11,6 +11,7 @@
       "input": 4.00,
       "cachedInput": 0.40,
       "output": 20.00,
+      "contextWindow": 1050000,
       "pricingStatus": "Promotional",
       "promotionalPriceValidThroughAtLeast": "2026-11-21",
       "longContextThreshold": 272000,
@@ -25,6 +26,7 @@
       "input": 2.00,
       "cachedInput": 0.20,
       "output": 12.00,
+      "contextWindow": 1050000,
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
@@ -37,6 +39,7 @@
       "input": 0.20,
       "cachedInput": 0.02,
       "output": 1.20,
+      "contextWindow": 1050000,
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
@@ -49,6 +52,7 @@
       "input": 5.00,
       "cachedInput": 0.50,
       "output": 30.00,
+      "contextWindow": 1050000,
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
@@ -71,6 +75,7 @@
       "input": 2.50,
       "cachedInput": 0.25,
       "output": 15.00,
+      "contextWindow": 1050000,
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
