@@ -20,7 +20,8 @@ foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Invoke-TokenRad
         'Complete-TokenRaderMeasurementBaseline', 'New-TokenRaderFinalRetryState',
         'Start-TokenRaderPendingIntervalCompute', 'Fail-TokenRaderIntervalComputeJob',
         'Complete-TokenRaderIntervalStopJob', 'Complete-TokenRaderIntervalComputeJob',
-        'Complete-TokenRaderIntervalCompute')) {
+        'Complete-TokenRaderIntervalCompute', 'ConvertTo-TokenRaderOffsetHashtable',
+        'Update-IntervalView')) {
     $match = [regex]::Match($uiSource, ('(?s)function ' + [regex]::Escape($helperName) + '\b.*?(?=\r?\nfunction |\z)'))
     Assert-UiTest $match.Success ('production helper not found: ' + $helperName)
     Invoke-Expression $match.Value
@@ -45,6 +46,9 @@ try {
     # launch baseline capture; the baseline completion must enter Measuring.
     function Merge-LatestRateLimits { param($Candidate) }
     function Refresh-Application { $script:LifecycleRefreshCalled = $true }
+    function Update-TokenRaderToolBackfillButton { }
+    function Start-TokenRaderUsageHistoryRefresh { param([switch]$PurgeExpired, [switch]$ForceRefresh) }
+    function Retain-TokenRaderQuotaEstimatesForCurrentWindow { param($RateLimits, [string]$AccountIdentity) }
     $script:StatusText = [pscustomobject]@{ Text = '' }
     function Set-TokenRaderUiState {
         param([string]$NewState, [string]$StatusMessage = '')
@@ -55,7 +59,14 @@ try {
         param([Int64]$Generation, [Int64]$RequestId)
         $script:LifecycleBaselineRequest = $RequestId
     }
-    function Start-TokenRaderIntervalComputeAsync { param($Baseline, [Int64]$Generation); $script:LifecycleIntervalStarted = $true }
+    function Start-TokenRaderIntervalComputeAsync {
+        param($Baseline, $EndOffsets, $EndRevision, $EndedAt, [bool]$Final, [bool]$ScanRateLimits, [Int64]$Generation)
+        $script:LifecycleIntervalStarted = $true
+        $script:LifecycleIntervalParameters = [pscustomobject]@{
+            EndOffsets = $EndOffsets; EndRevision = $EndRevision; EndedAt = $EndedAt
+            Final = $Final; ScanRateLimits = $ScanRateLimits; Generation = $Generation
+        }
+    }
     function Show-EmptyIntervalMeasurement { param($Baseline); $script:LifecycleEmptyMeasurementShown = $true }
     $script:LifecycleRefreshCalled = $false
     $script:LifecycleBaselineRequest = 0L
@@ -65,7 +76,7 @@ try {
         BackgroundJobs = @{}; IndexSyncing = $true; IndexSyncRequestId = 77L; IndexReady = $false
         IndexCatalogAvailable = $false; ProjectCache = @{}; RateLimitSnapshotCache = @{}
         PendingMeasurementStart = $true; UiState = 'Starting'; BaselineRequestId = 88L
-        MeasurementGeneration = 3L; IntervalResult = $null; IntervalCache = $null
+        MeasurementGeneration = 3L; IntervalResult = $null; IntervalCache = $null; AccountIdentity = ''
     }
     Complete-TokenRaderIndexSyncJob ([pscustomobject]@{ LatestRateLimits = $null }) 0L 77L 'IndexSync' @{ Startup = $true; ColdStart = $false }
     Assert-UiTest (-not [bool]$script:State.IndexSyncing) 'index completion did not clear IndexSyncing'
@@ -87,8 +98,23 @@ try {
     # the estimate produced by the last manual refresh. A manual preview is
     # explicitly allowed to recalibrate (or clear) it from synchronized limits.
     $script:QuotaUpdateCalls = 0
-    function Update-QuotaEstimatesFromInterval { param($Result, [bool]$Final); $script:QuotaUpdateCalls++ }
-    function Show-IntervalResult { param($Result, [bool]$Running) }
+    $script:ExpectQuotaBeforeResult = $false
+    $script:QuotaUpdatedBeforeResult = $false
+    function Update-QuotaEstimatesFromInterval {
+        param($Result, [bool]$Final)
+        $script:QuotaUpdateCalls++
+        $script:State.QuotaEstimates = [pscustomobject]@{
+            FiveHour = [pscustomobject]@{ TotalUsd = 250.0 }
+            Weekly = [pscustomobject]@{ TotalUsd = 500.0 }
+        }
+        $script:QuotaUpdatedBeforeResult = $true
+    }
+    function Show-IntervalResult {
+        param($Result, [bool]$Running)
+        if ($script:ExpectQuotaBeforeResult -and -not $script:QuotaUpdatedBeforeResult) {
+            throw 'result rendered before the 5h and weekly dollar estimates were updated'
+        }
+    }
     $preservedEstimate = [pscustomobject]@{ Marker = 'keep' }
     $intervalResult = [pscustomobject]@{
         StartedAt = $baseline.StartedAt; EndedAt = [DateTimeOffset]::Now
@@ -112,10 +138,16 @@ try {
 
     $script:State.IntervalComputeRequestId = 90L
     $script:State.IntervalComputing = $true
+    $script:ExpectQuotaBeforeResult = $true
+    $script:QuotaUpdatedBeforeResult = $false
     Complete-TokenRaderIntervalComputeJob $intervalPayload 3L 90L 'IntervalCompute' @{
         BaselineStartedAt = $baseline.StartedAt; Final = $false; ScanRateLimits = $true
     }
     Assert-UiTest ($script:QuotaUpdateCalls -eq 1) 'manual preview did not request quota recalibration'
+    Assert-UiTest $script:QuotaUpdatedBeforeResult 'manual preview did not update quota before rendering the result'
+    Assert-UiTest ($null -ne $script:State.QuotaEstimates.FiveHour) 'manual preview omitted the 5-hour dollar estimate'
+    Assert-UiTest ($null -ne $script:State.QuotaEstimates.Weekly) 'manual preview omitted the weekly dollar estimate'
+    $script:ExpectQuotaBeforeResult = $false
 
     # A live preview timeout is recoverable: it must retain the baseline and
     # last result instead of invalidating the whole measurement.
@@ -165,6 +197,27 @@ try {
     Assert-UiTest ($null -ne $script:State.IntervalFinalRetry) 'final failure did not preserve retry boundaries'
     Assert-UiTest ([Int64]$script:State.IntervalFinalRetry.EndRevision -eq 12L) 'final retry revision changed'
     Assert-UiTest ($script:State.IntervalResult -eq $preservedResult) 'final failure discarded the last result'
+
+    # Ready-state View Result must rerun a quota-aware query at the immutable
+    # ending instead of merely repainting the old cards. Appends after Stop are
+    # therefore excluded while repaired quota evidence can become visible.
+    $script:LifecycleIntervalStarted = $false
+    $script:LifecycleIntervalParameters = $null
+    $readyEndedAt = [DateTimeOffset]::Now
+    $script:State = @{
+        BackgroundJobs = @{}; MeasurementGeneration = 3L; IntervalComputeRequestId = 0L
+        IntervalComputing = $false; IntervalFinalRetry = $null; IntervalBaseline = $baseline
+        IntervalResult = $preservedResult; IntervalEnd = [pscustomobject]@{
+            EndOffsets = @{ synthetic = 25L }; EndRevision = 12L; EndedAt = $readyEndedAt
+        }
+        UiState = 'Ready'; IsMeasuring = $false
+    }
+    Update-IntervalView -Manual
+    Assert-UiTest $script:LifecycleIntervalStarted 'Ready-state View Result did not start a quota-aware frozen requery'
+    Assert-UiTest ([bool]$script:LifecycleIntervalParameters.Final) 'Ready-state requery was not a final frozen calculation'
+    Assert-UiTest ([bool]$script:LifecycleIntervalParameters.ScanRateLimits) 'Ready-state requery skipped quota evidence'
+    Assert-UiTest ([Int64]$script:LifecycleIntervalParameters.EndRevision -eq 12L) 'Ready-state requery changed the frozen revision'
+    Assert-UiTest ([Int64]$script:LifecycleIntervalParameters.EndOffsets['synthetic'] -eq 25L) 'Ready-state requery changed the frozen byte boundary'
 
     $script:State = @{ BackgroundJobs = @{} }
     $script:CompletionSeen = $false

@@ -510,14 +510,20 @@ try {
     $staleQuotaEnding = CaptureMeasurementEnd -Baseline $captureFreezeBaseline
     $staleQuotaResult = Get-TokenRaderIndexedIntervalResult -Baseline $captureFreezeBaseline -PricingDocument $prices `
         -EndOffsets $staleQuotaEnding.EndOffsets -EndRevision $staleQuotaEnding.EndRevision
-    Assert-Equal $false ([bool]$staleQuotaResult.QuotaEvidence.Weekly.BoundaryValid) 'end quota snapshot older than the final call was accepted'
+    Assert-Equal $true ([bool]$staleQuotaResult.QuotaEvidence.FiveHour.BoundaryValid) 'an internally aligned five-hour interval was rejected only because a later token-only call exists'
+    Assert-Equal $false ([bool]$staleQuotaResult.QuotaEvidence.FiveHour.CoverageComplete) 'five-hour coverage should disclose that the latest main call is newer than the ending quota snapshot'
+    Assert-Equal $true ([bool]$staleQuotaResult.QuotaEvidence.Weekly.BoundaryValid) 'an internally aligned quota interval was rejected only because a later token-only call exists'
+    Assert-Equal $false ([bool]$staleQuotaResult.QuotaEvidence.Weekly.CoverageComplete) 'quota coverage should disclose that the latest main call is newer than the ending quota snapshot'
     $staleQuotaEstimate = Get-TokenRaderQuotaEstimate `
         -StartRateLimits $staleQuotaResult.StartRateLimits `
         -EndRateLimits $staleQuotaResult.EndRateLimits `
         -IntervalCost ([double]$staleQuotaResult.TotalCost) `
         -CostComplete ([bool]$staleQuotaResult.CostComplete) `
         -QuotaEvidence $staleQuotaResult.QuotaEvidence
-    Assert-Equal $null $staleQuotaEstimate.Weekly 'stale indexed quota evidence generated a new estimate'
+    if ($null -eq $staleQuotaEstimate.FiveHour) { throw 'ASSERT FAILED: snapshot-aligned five-hour dollars were not available immediately after the query' }
+    if ($null -eq $staleQuotaEstimate.Weekly) { throw 'ASSERT FAILED: snapshot-aligned weekly dollars were not available immediately after the query' }
+    Assert-Near ([double]$staleQuotaResult.QuotaEvidence.FiveHour.EstimatedTotalUsd) ([double]$staleQuotaEstimate.FiveHour.TotalUsd) 0.0000001 'five-hour quota estimate mixed the newer main-interval cost into the older aligned snapshot interval'
+    Assert-Near ([double]$staleQuotaResult.QuotaEvidence.Weekly.EstimatedTotalUsd) ([double]$staleQuotaEstimate.Weekly.TotalUsd) 0.0000001 'quota estimate mixed the newer main-interval cost into the older aligned snapshot interval'
 
     # The compiled aggregator must remain numerically identical to the legacy
     # byte parser across multiple models, long-context pricing and an unknown
@@ -2131,6 +2137,19 @@ try {
         $viewMatch.Value -notmatch 'ScanRateLimits \$true') {
         throw 'UI CONTRACT FAILED: automatic and manual result refreshes must request quota snapshots before final settlement'
     }
+    if ($viewMatch.Value -notmatch "UiState\s+-eq\s+'Ready'" -or
+        $viewMatch.Value -notmatch 'IntervalEnd' -or
+        $viewMatch.Value -notmatch 'ConvertTo-TokenRaderOffsetHashtable') {
+        throw 'UI CONTRACT FAILED: Ready-state View Result must repeat a quota-aware query at the immutable end boundary'
+    }
+    $completeIntervalMatch = [regex]::Match($uiSource, '(?s)function Complete-TokenRaderIntervalCompute\b.*?(?=\r?\nfunction |\z)')
+    if (-not $completeIntervalMatch.Success -or
+        $completeIntervalMatch.Value.IndexOf('Update-QuotaEstimatesFromInterval', [StringComparison]::Ordinal) -lt 0 -or
+        $completeIntervalMatch.Value.IndexOf('Show-IntervalResult', [StringComparison]::Ordinal) -lt 0 -or
+        $completeIntervalMatch.Value.IndexOf('Update-QuotaEstimatesFromInterval', [StringComparison]::Ordinal) -gt
+            $completeIntervalMatch.Value.IndexOf('Show-IntervalResult', [StringComparison]::Ordinal)) {
+        throw 'UI CONTRACT FAILED: 5h and weekly dollars must be updated before a completed result is rendered'
+    }
     $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
     $indexedResultMatch = [regex]::Match($coreSource, '(?s)function Get-TokenRaderIndexedIntervalResult\b.*?(?=\r?\nfunction |\z)')
     if (-not $indexedResultMatch.Success -or $indexedResultMatch.Value -notmatch 'AggregateIntervalRecords' -or
@@ -2171,6 +2190,10 @@ try {
     if (-not $startMatch.Success -or $startMatch.Value -notmatch 'PendingMeasurementStart' -or
         $startMatch.Value -notmatch 'Start-TokenRaderIndexSyncAsync') {
         throw 'UI CONTRACT FAILED: Start must queue itself while the startup index is still preparing'
+    }
+    if ($uiSource -notmatch 'function Retain-TokenRaderQuotaEstimatesForCurrentWindow' -or
+        $startMatch.Value -match 'QuotaEstimates\s*=\s*\$null') {
+        throw 'UI CONTRACT FAILED: a new measurement must retain a valid same-window dollar estimate until replacement evidence is ready'
     }
     $stateMatch = [regex]::Match($uiSource, '(?s)function Set-TokenRaderUiState\b.*?(?=\r?\nfunction |\z)')
     if (-not $stateMatch.Success -or

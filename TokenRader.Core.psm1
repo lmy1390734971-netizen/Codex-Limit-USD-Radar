@@ -3233,10 +3233,15 @@ function Get-TokenRaderQuotaWindowEvidence {
     $startReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$StartWindow.WindowMinutes) -ResetsAt $StartWindow.ResetsAt
     $endReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$EndWindow.WindowMinutes) -ResetsAt $EndWindow.ResetsAt
     $sameReset = -not [string]::IsNullOrWhiteSpace($startReset) -and [string]::Equals($startReset, $endReset, [StringComparison]::Ordinal)
+    # BoundaryValid describes the quota evidence's own immutable interval.
+    # A token-only child/descendant record can legitimately be written after
+    # the latest record that carries rate_limits.  That means the evidence no
+    # longer covers the newest main-interval call, but it is still a strictly
+    # aligned (StartObservedAt, EndObservedAt] calibration and must remain
+    # usable.  Mixing the newer main-interval cost into it is still forbidden.
     $boundaryValid = $sameWindow -and $samePlan -and $sameReset -and $endObservedAt -gt $startObservedAt
-    if ($boundaryValid -and $null -ne $MainLastCountedAt) {
-        $boundaryValid = $endObservedAt -ge [DateTimeOffset]$MainLastCountedAt
-    }
+    $coverageComplete = $boundaryValid -and ($null -eq $MainLastCountedAt -or
+        $endObservedAt -ge [DateTimeOffset]$MainLastCountedAt)
     if (-not $boundaryValid) {
         return [pscustomobject]@{
             BoundaryValid = $false
@@ -3319,7 +3324,7 @@ function Get-TokenRaderQuotaWindowEvidence {
     }
     [pscustomobject]@{
         BoundaryValid = $true
-        CoverageComplete = $true
+        CoverageComplete = [bool]$coverageComplete
         StartObservedAt = $startObservedAt
         EndObservedAt = $endObservedAt
         Usage = $priced.Usage

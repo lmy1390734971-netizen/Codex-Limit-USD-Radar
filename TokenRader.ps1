@@ -38,6 +38,7 @@ $script:State = @{
     IntervalComputePendingRequest = $null
     IntervalLastError = ''
     IntervalFinalRetry = $null
+    IntervalEnd = $null
     IntervalCache = $null
     BackgroundJobs = @{}
     IndexReady = $false
@@ -56,6 +57,7 @@ $script:State = @{
     RateLimits = $null
     RateLimitSnapshotCache = @{}
     QuotaEstimates = $null
+    QuotaEstimateAccountIdentity = ''
     QuotaCalibrationMessage = '美元总额需通过一次使额度百分比上升的时间段测量进行反推。'
     Projects = @()
     ProjectCache = @{}
@@ -1362,8 +1364,14 @@ function Update-QuotaCards {
     $estimates = $script:State.QuotaEstimates
     $fiveWindow = if ($null -ne $rateLimits) { $rateLimits.FiveHour } else { $null }
     $weeklyWindow = if ($null -ne $rateLimits) { $rateLimits.Weekly } else { $null }
-    $fiveEstimate = if ($null -ne $estimates) { $estimates.FiveHour } else { $null }
-    $weeklyEstimate = if ($null -ne $estimates) { $estimates.Weekly } else { $null }
+    $fiveEstimate = if ($null -ne $estimates -and
+        (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $estimates.FiveHour -Window $fiveWindow)) {
+        $estimates.FiveHour
+    } else { $null }
+    $weeklyEstimate = if ($null -ne $estimates -and
+        (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $estimates.Weekly -Window $weeklyWindow)) {
+        $estimates.Weekly
+    } else { $null }
     Set-QuotaWindowCard -Window $fiveWindow -Estimate $fiveEstimate -UsageText $script:FiveHourUsageText -Progress $script:FiveHourProgress -DollarText $script:FiveHourDollarText -ResetText $script:FiveHourResetText
     Set-QuotaWindowCard -Window $weeklyWindow -Estimate $weeklyEstimate -UsageText $script:WeeklyUsageText -Progress $script:WeeklyProgress -DollarText $script:WeeklyDollarText -ResetText $script:WeeklyResetText
     $script:QuotaEstimateHintText.Text = [string]$script:State.QuotaCalibrationMessage
@@ -1393,6 +1401,38 @@ function Test-TokenRaderQuotaEstimateMatchesWindow {
         if ([string]::IsNullOrWhiteSpace($estimateReset) -or $estimateReset -ne $windowReset) { return $false }
     }
     return $true
+}
+
+function Retain-TokenRaderQuotaEstimatesForCurrentWindow {
+    param(
+        $RateLimits = $script:State.RateLimits,
+        [string]$AccountIdentity = [string]$script:State.AccountIdentity
+    )
+    $estimates = $script:State.QuotaEstimates
+    if ($null -eq $estimates) { return }
+    $estimateAccount = [string]$script:State.QuotaEstimateAccountIdentity
+    if (-not [string]::IsNullOrWhiteSpace($estimateAccount) -and
+        -not [string]::Equals($estimateAccount, $AccountIdentity, [StringComparison]::Ordinal)) {
+        $script:State.QuotaEstimates = $null
+        $script:State.QuotaEstimateAccountIdentity = ''
+        return
+    }
+    $fiveWindow = if ($null -ne $RateLimits) { $RateLimits.FiveHour } else { $null }
+    $weeklyWindow = if ($null -ne $RateLimits) { $RateLimits.Weekly } else { $null }
+    $five = if ($null -ne $estimates -and
+        (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $estimates.FiveHour -Window $fiveWindow)) {
+        $estimates.FiveHour
+    } else { $null }
+    $weekly = if ($null -ne $estimates -and
+        (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $estimates.Weekly -Window $weeklyWindow)) {
+        $estimates.Weekly
+    } else { $null }
+    if ($null -eq $five -and $null -eq $weekly) {
+        $script:State.QuotaEstimates = $null
+        $script:State.QuotaEstimateAccountIdentity = ''
+    } else {
+        $script:State.QuotaEstimates = [pscustomobject]@{ FiveHour = $five; Weekly = $weekly }
+    }
 }
 
 function Update-QuotaEstimatesFromInterval {
@@ -1445,6 +1485,11 @@ function Update-QuotaEstimatesFromInterval {
         FiveHour = $effectiveFive
         Weekly = $effectiveWeekly
     }
+    $script:State.QuotaEstimateAccountIdentity = if ($null -ne $effectiveFive -or $null -ne $effectiveWeekly) {
+        if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['AccountIdentity']) {
+            [string]$script:State.IntervalBaseline.AccountIdentity
+        } else { [string]$script:State.AccountIdentity }
+    } else { '' }
 
     $calibrated = @()
     if ($null -ne $newEstimates.FiveHour) {
@@ -1597,6 +1642,9 @@ function Complete-TokenRaderMeasurementBaseline {
     $script:State.IntervalResult = $null
     $script:State.IntervalCache = $null
     Merge-LatestRateLimits -Candidate $Baseline.StartRateLimits
+    Retain-TokenRaderQuotaEstimatesForCurrentWindow `
+        -RateLimits $Baseline.StartRateLimits `
+        -AccountIdentity $(if ($null -ne $Baseline.PSObject.Properties['AccountIdentity']) { [string]$Baseline.AccountIdentity } else { [string]$script:State.AccountIdentity })
     Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage '开始位置已冻结，正在等待 Codex 新消耗…'
     Show-EmptyIntervalMeasurement -Baseline $Baseline
 }
@@ -1816,7 +1864,9 @@ function Complete-TokenRaderIntervalCompute {
         Show-IntervalResult -Result $result -Running ([bool]$script:State.IsMeasuring)
         $succeeded = $true
     } catch {
-        $script:State.QuotaEstimates = $null
+        # A rendering/callback failure must not erase a quota calibration that
+        # is already valid for the current window. The token result remains
+        # available and a manual retry can refresh both quota cards.
         $script:State.QuotaCalibrationMessage = '时间段后台计算失败：' + $_.Exception.Message
         Set-TokenRaderUiState -NewState 'Error' -StatusMessage ([string]$script:State.QuotaCalibrationMessage)
         Update-QuotaCards
@@ -1898,6 +1948,24 @@ function Update-IntervalView {
             -Final $true `
             -ScanRateLimits ([bool]$retry.ScanRateLimits) `
             -Generation ([Int64]$retry.Generation)
+        return
+    }
+    if ($Manual -and $script:State.UiState -eq 'Ready' -and
+        -not [bool]$script:State.IntervalComputing -and $null -ne $script:State.IntervalEnd) {
+        # Re-run the quota-aware result query at the immutable ending captured
+        # by Stop.  This lets a second click pick up repaired/indexed quota
+        # evidence while guaranteeing that calls appended after Stop cannot
+        # change the frozen token or dollar result.
+        $frozenEnd = $script:State.IntervalEnd
+        Set-TokenRaderUiState -NewState 'ComputingFinal' -StatusMessage '正在按已冻结的结束边界重试结算…'
+        Start-TokenRaderIntervalComputeAsync `
+            -Baseline $script:State.IntervalBaseline `
+            -EndOffsets (ConvertTo-TokenRaderOffsetHashtable -Value $frozenEnd.EndOffsets) `
+            -EndRevision $frozenEnd.EndRevision `
+            -EndedAt $frozenEnd.EndedAt `
+            -Final $true `
+            -ScanRateLimits $true `
+            -Generation ([Int64]$script:State.MeasurementGeneration)
         return
     }
     if ($script:State.UiState -eq 'Measuring') {
@@ -2039,12 +2107,15 @@ function Start-IntervalMeasurement {
     $script:State.IntervalComputePendingRequest = $null
     $script:State.IntervalLastError = ''
     $script:State.IntervalFinalRetry = $null
+    $script:State.IntervalEnd = $null
     $script:State.IntervalBaseline = $null
     $script:State.IntervalResult = $null
     $script:State.IntervalCache = $null
     $script:State.PendingMeasurementStart = $waitForIndex
-    $script:State.QuotaEstimates = $null
-    $script:State.QuotaCalibrationMessage = '美元总额需通过一次使额度百分比上升的时间段测量进行反推。'
+    Retain-TokenRaderQuotaEstimatesForCurrentWindow
+    if ($null -eq $script:State.QuotaEstimates) {
+        $script:State.QuotaCalibrationMessage = '美元总额需通过一次使额度百分比上升的时间段测量进行反推。'
+    }
     $script:State.ViewMode = 'interval'
     Update-QuotaCards
     if ($waitForIndex) {
